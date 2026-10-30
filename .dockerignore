@@ -1,0 +1,14 @@
+node_modules
+.next
+release
+scripts
+app_data
+redis_data
+ssh_keys
+.git
+.env
+.env.local
+plan
+*.md
+*.zip
+*.tar.gz

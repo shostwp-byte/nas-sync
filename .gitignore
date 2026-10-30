@@ -1,0 +1,29 @@
+# Dependencies & Build Outputs
+node_modules/
+.next/
+out/
+tsconfig.tsbuildinfo
+next-env.d.ts
+
+# Runtime Data & Secrets
+app_data/
+redis_data/
+ssh_keys/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+.env
+.env.*
+!.env.example
+
+# Release Archives & Internal Drafts
+release/
+plan/
+
+# Logs & OS Metadata
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db

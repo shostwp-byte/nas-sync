@@ -1,0 +1,6 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 🔒 Báo cáo Lỗ hổng Bảo mật Riêng tư
+    url: https://github.com/shostwp-byte/nas-sync/security/advisories/new
+    about: Vui lòng gửi báo cáo riêng tư tại đây thay vì tạo Public Issue nếu liên quan tới bảo mật.
+

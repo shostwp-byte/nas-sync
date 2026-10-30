@@ -1,0 +1,20 @@
+name: ✨ Đề xuất Tính năng (Feature Request)
+description: Đề xuất thêm Control Panel mới hoặc cải tiến tính năng cho NAS-Sync
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Nhu cầu thực tế / Vấn đề bạn muốn giải quyết
+      placeholder: "Ví dụ: Tôi muốn hệ thống hỗ trợ thêm CyberPanel / CloudPanel..."
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Mô tả giải pháp mong muốn
+      placeholder: "Mô tả cách tính năng nên hoạt động..."
+    validations:
+      required: true
+

@@ -1,0 +1,26 @@
+# Chuẩn hóa ký tự xuống dòng LF cho toàn bộ mã nguồn để chạy trực tiếp trên Linux / Synology NAS
+* text=auto eol=lf
+*.sh text eol=lf
+*.ts text eol=lf
+*.tsx text eol=lf
+*.js text eol=lf
+*.mjs text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.md text eol=lf
+Dockerfile text eol=lf
+.env.example text eol=lf
+
+# File nhị phân
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.zip binary
+*.gz binary
+*.zst binary
+

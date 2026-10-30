@@ -1,0 +1,66 @@
+{
+  "name": "nas-sync",
+  "version": "1.1.0",
+  "private": false,
+  "license": "MIT",
+  "description": "Open-Source Agentless Multi-Panel VPS Backup & Cross-Panel Migration Platform for Synology NAS (DirectAdmin, cPanel, Plesk, aaPanel)",
+  "homepage": "https://github.com/shostwp-byte/nas-sync",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/shostwp-byte/nas-sync.git"
+  },
+  "bugs": {
+    "url": "https://github.com/shostwp-byte/nas-sync/issues"
+  },
+  "keywords": [
+    "synology",
+    "nas",
+    "backup",
+    "rsync",
+    "hardlink",
+    "directadmin",
+    "cpanel",
+    "plesk",
+    "aapanel",
+    "btrfs",
+    "worm",
+    "ransomware-protection"
+  ],
+  "scripts": {
+    "dev": "node --import tsx server.ts",
+    "build": "next build",
+    "start": "cross-env NODE_ENV=production node --import tsx server.ts",
+    "start:prod": "NODE_ENV=production node --import tsx server.ts",
+    "typecheck": "tsc --noEmit",
+    "pack:synology": "node scripts/package-synology.mjs"
+  },
+  "dependencies": {
+    "bullmq": "^5.40.0",
+    "diff": "^7.0.0",
+    "ioredis": "^5.5.0",
+    "jose": "^6.0.8",
+    "lucide-react": "^0.475.0",
+    "mysql2": "^3.12.0",
+    "next": "^15.2.4",
+    "node-cron": "^3.0.3",
+    "nodemailer": "^6.10.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "socket.io": "^4.8.1",
+    "socket.io-client": "^4.8.1",
+    "tsx": "^4.19.3"
+  },
+  "devDependencies": {
+    "@types/diff": "^7.0.0",
+    "@types/node": "^22.13.8",
+    "@types/node-cron": "^3.0.11",
+    "@types/nodemailer": "^6.4.17",
+    "@types/react": "^19.0.10",
+    "@types/react-dom": "^19.0.4",
+    "autoprefixer": "^10.4.20",
+    "cross-env": "^7.0.3",
+    "postcss": "^8.5.3",
+    "tailwindcss": "^3.4.17",
+    "typescript": "^5.8.2"
+  }
+}

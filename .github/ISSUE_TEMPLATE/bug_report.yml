@@ -1,0 +1,43 @@
+name: 🐛 Báo lỗi (Bug Report)
+description: Báo cáo lỗi phát sinh trong quá trình cài đặt hoặc sao lưu/khôi phục trên Synology NAS
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Cảm ơn bạn đã dành thời gian báo lỗi giúp cải thiện **NAS-Sync**! Vui lòng không đính kèm mật khẩu, Token hoặc Private Key trong nội dung báo cáo.
+  - type: input
+    id: version
+    attributes:
+      label: Phiên bản NAS-Sync & DSM
+      description: Ví dụ NAS-Sync v1.1.0 trên Synology DSM 7.2.2
+      placeholder: "v1.1.0 / DSM 7.2"
+    validations:
+      required: true
+  - type: dropdown
+    id: panel
+    attributes:
+      label: Loại Control Panel trên VPS liên quan
+      options:
+        - DirectAdmin
+        - cPanel / WHM
+        - Plesk Obsidian
+        - aaPanel / BT Panel
+        - Không liên quan tới VPS (Lỗi giao diện / Docker NAS)
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: Mô tả chi tiết hiện tượng lỗi & Các bước tái hiện
+      placeholder: "1. Vào mục...\n2. Nhấn nút...\n3. Hệ thống hiển thị lỗi..."
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Nhật ký lỗi (Logs)
+      description: Dán đoạn log liên quan từ giao diện NAS-Sync hoặc Container Manager
+      render: shell
+

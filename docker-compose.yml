@@ -1,0 +1,82 @@
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: nas_sync_redis
+    restart: unless-stopped
+    security_opt:
+      - seccomp:unconfined
+    entrypoint: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - nas_sync_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  db_sandbox:
+    image: mariadb:10.11
+    container_name: nas_sync_sandbox
+    restart: unless-stopped
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      - MYSQL_ROOT_PASSWORD=${SANDBOX_DB_PASSWORD:-sandbox_secret_pass}
+    tmpfs:
+      - /var/lib/mysql:rw,noexec,nosuid,size=1g
+
+  app:
+    build: .
+    container_name: nas_sync_core
+    restart: unless-stopped
+    security_opt:
+      - seccomp:unconfined
+    ports:
+      - "${APP_HOST_PORT:-3080}:3000"
+    environment:
+      - NODE_ENV=production
+      - TZ=Asia/Ho_Chi_Minh
+      - APP_URL=${APP_URL:-http://localhost:3080}
+      - DATA_DIR=/app/data
+      - SSH_KEYS_DIR=/root/.ssh
+      - REDIS_URL=redis://redis:6379
+      - SANDBOX_DB_HOST=db_sandbox
+      - SANDBOX_DB_PORT=3306
+      - SANDBOX_DB_USER=root
+      - SANDBOX_DB_PASSWORD=${SANDBOX_DB_PASSWORD:-sandbox_secret_pass}
+      - STORAGE_VOLUMES=${STORAGE_VOLUMES:-/mnt/vol1}
+      - VOLUME_MAX_USAGE_PERCENT=${VOLUME_MAX_USAGE_PERCENT:-85}
+      - VOLUME_MIN_FREE_GB=${VOLUME_MIN_FREE_GB:-200}
+      - ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-nas-sync@2026}
+      - JWT_SECRET=${JWT_SECRET:-nas-sync-open-source-change-this-secret-2026}
+      - GITHUB_REPO_OWNER=${GITHUB_REPO_OWNER:-shostwp-byte}
+      - GITHUB_REPO_NAME=${GITHUB_REPO_NAME:-nas-sync}
+      - GITHUB_REPO_BRANCH=${GITHUB_REPO_BRANCH:-main}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+      - SMTP_HOST=${SMTP_HOST:-}
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - SMTP_USER=${SMTP_USER:-}
+      - SMTP_PASS=${SMTP_PASS:-}
+      - SMTP_FROM=${SMTP_FROM:-noreply@example.com}
+      - ALERT_EMAIL_TO=${ALERT_EMAIL_TO:-}
+      - DSM_API_URL=${DSM_API_URL:-}
+      - DSM_USERNAME=${DSM_USERNAME:-}
+      - DSM_PASSWORD=${DSM_PASSWORD:-}
+      - DSM_BACKUP_SHARES=${DSM_BACKUP_SHARES:-VPS_Backups}
+    volumes:
+      - ./app_data:/app/data
+      - ./ssh_keys:/root/.ssh
+      - ${NAS_VOL1_PATH:-/volume1/VPS_Backups}:/mnt/vol1
+      # Bỏ dấu # dòng dưới nếu NAS có thêm phân vùng /volume2 thật sự:
+      # - ${NAS_VOL2_PATH:-/volume2/VPS_Backups}:/mnt/vol2
+    depends_on:
+      redis:
+        condition: service_healthy
+      db_sandbox:
+        condition: service_started
+
+volumes:
+  nas_sync_redis_data:
