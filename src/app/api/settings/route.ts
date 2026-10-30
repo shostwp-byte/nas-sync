@@ -1,7 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getAllSettings, getDb, setSettings } from '@/lib/db';
+import { getAllSettings, getDb, getSetting, setSettings } from '@/lib/db';
 import { reloadCronSchedules } from '@/lib/engine/queue';
-import { dispatchExternalNotifications } from '@/lib/notifications';
+import {
+  detectTelegramChatId,
+  dispatchExternalNotifications,
+} from '@/lib/notifications';
 
 export async function GET() {
   const settings = getAllSettings();
@@ -42,13 +45,30 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: true });
     }
 
+    if (action === 'detect_telegram_chat_id') {
+      const token = String(
+        body.botToken || getSetting('telegram_bot_token') || ''
+      );
+      const detected = await detectTelegramChatId(token);
+      if (!detected.ok) {
+        return NextResponse.json(detected, { status: 400 });
+      }
+      if (detected.chatId) {
+        setSettings({
+          telegram_bot_token: token.trim().replace(/^bot/i, ''),
+          telegram_chat_id: detected.chatId,
+        });
+      }
+      return NextResponse.json(detected);
+    }
+
     if (action === 'test_notification') {
       const res = await dispatchExternalNotifications({
         severity: 'INFO',
         category: 'SYSTEM',
-        title: 'Kiểm tra kết nối cảnh báo SHOST Backup Platform',
+        title: 'Kiểm tra kết nối cảnh báo NAS-Sync',
         message:
-          'Đây là tin nhắn kiểm tra từ hệ thống Sao lưu Tập trung SHOST Backup chạy trên Synology NAS.',
+          'Đây là tin nhắn kiểm tra thành công từ hệ thống Sao lưu Tập trung NAS-Sync đang chạy trên Synology NAS của bạn.',
       });
       return NextResponse.json({ ok: true, ...res });
     }
@@ -64,4 +84,3 @@ export async function POST(req: NextRequest) {
     );
   }
 }
-

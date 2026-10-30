@@ -14,6 +14,7 @@ import {
   Lock,
   RefreshCw,
   Save,
+  Search,
   Send,
   Settings,
   ShieldAlert,
@@ -28,7 +29,13 @@ export default function SettingsPage() {
   const [alerts, setAlerts] = useState<SystemAlert[]>([]);
   const [saving, setSaving] = useState(false);
   const [testingNotify, setTestingNotify] = useState(false);
+  const [detectingChatId, setDetectingChatId] = useState(false);
   const [feedback, setFeedback] = useState('');
+  const [notifyStatus, setNotifyStatus] = useState<{
+    ok: boolean;
+    summary: string;
+    details?: string[];
+  } | null>(null);
 
   // GitHub Updater State
   const [updateInfo, setUpdateInfo] = useState<SystemUpdateInfo | null>(null);
@@ -130,9 +137,51 @@ export default function SettingsPage() {
     }
   };
 
+  const handleDetectTelegramChatId = async () => {
+    setDetectingChatId(true);
+    setNotifyStatus(null);
+    try {
+      const resp = await fetch('/api/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'detect_telegram_chat_id',
+          botToken: settings.telegram_bot_token || '',
+        }),
+      });
+      const json = await resp.json().catch(() => ({}));
+      if (!resp.ok || !json.ok) {
+        setNotifyStatus({
+          ok: false,
+          summary:
+            json.error ||
+            'Không thể tự động lấy Chat ID. Hãy nhắn "/start" cho Bot trên Telegram trước.',
+        });
+        return;
+      }
+      if (json.chatId) {
+        updateField('telegram_chat_id', String(json.chatId));
+      }
+      setNotifyStatus({
+        ok: true,
+        summary: `✅ Đã tự động điền Chat ID: ${json.chatId} — ${
+          json.chatLabel || ''
+        } (Bot ${json.botUsername || ''}). Bấm "Gửi Tin nhắn Test" để kiểm tra!`,
+      });
+    } catch (err) {
+      setNotifyStatus({
+        ok: false,
+        summary: (err as Error).message || 'Lỗi kết nối khi dò Chat ID.',
+      });
+    } finally {
+      setDetectingChatId(false);
+    }
+  };
+
   const handleTestNotification = async () => {
     setTestingNotify(true);
     setFeedback('');
+    setNotifyStatus(null);
     try {
       await fetch('/api/settings', {
         method: 'PUT',
@@ -145,13 +194,27 @@ export default function SettingsPage() {
         body: JSON.stringify({ action: 'test_notification' }),
       });
       const json = await resp.json();
-      setFeedback(
-        `Đã gửi thử thông báo — Telegram: ${
-          json.telegramSent ? 'Thành công ✅' : 'Chưa cấu hình/Lỗi'
-        } | SMTP Email: ${
-          json.emailSent ? 'Thành công ✅' : 'Chưa cấu hình/Lỗi'
-        } ${json.errors?.length ? `(${json.errors.join('; ')})` : ''}`
-      );
+
+      const tgLabel = json.telegramSent
+        ? 'Thành công ✅'
+        : json.telegramConfigured
+        ? 'Gửi thất bại ❌'
+        : 'Bỏ qua (Chưa nhập)';
+
+      const mailLabel = json.emailSent
+        ? 'Thành công ✅'
+        : json.emailConfigured
+        ? 'Gửi thất bại ❌'
+        : 'Bỏ qua (Chưa nhập)';
+
+      const anySuccess = Boolean(json.telegramSent || json.emailSent);
+      const hasErrors = Array.isArray(json.errors) && json.errors.length > 0;
+
+      setNotifyStatus({
+        ok: anySuccess && !hasErrors,
+        summary: `Kết quả kiểm tra — Telegram: ${tgLabel} | SMTP Email: ${mailLabel}`,
+        details: hasErrors ? (json.errors as string[]) : undefined,
+      });
     } finally {
       setTestingNotify(false);
     }
@@ -398,7 +461,7 @@ export default function SettingsPage() {
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           {/* Telegram & SMTP */}
           <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-4">
-            <div className="flex items-center justify-between">
+            <div className="flex items-center justify-between gap-2 flex-wrap">
               <h3 className="text-sm font-bold text-white flex items-center gap-2">
                 <BellRing className="w-4 h-4 text-cyan-400" />
                 Cảnh báo Telegram & Báo cáo SMTP Email
@@ -407,12 +470,31 @@ export default function SettingsPage() {
                 type="button"
                 onClick={() => void handleTestNotification()}
                 disabled={testingNotify}
-                className="inline-flex items-center gap-1.5 px-3 py-1 rounded-lg bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 hover:bg-cyan-500/25"
+                className="inline-flex items-center gap-1.5 px-3 py-1 rounded-lg bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 hover:bg-cyan-500/25 disabled:opacity-50"
               >
                 <Send className="w-3.5 h-3.5" />
                 {testingNotify ? 'Đang gửi...' : 'Gửi Tin nhắn Test'}
               </button>
             </div>
+
+            {notifyStatus && (
+              <div
+                className={`p-3 rounded-xl border text-xs space-y-1.5 ${
+                  notifyStatus.ok
+                    ? 'bg-emerald-500/15 border-emerald-500/30 text-emerald-200'
+                    : 'bg-rose-500/15 border-rose-500/30 text-rose-200'
+                }`}
+              >
+                <div className="font-semibold">{notifyStatus.summary}</div>
+                {notifyStatus.details && notifyStatus.details.length > 0 && (
+                  <ul className="list-disc pl-4 space-y-1 text-[11px] text-rose-100/90">
+                    {notifyStatus.details.map((err, i) => (
+                      <li key={i}>{err}</li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            )}
 
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <div>
@@ -425,23 +507,39 @@ export default function SettingsPage() {
                     updateField('telegram_bot_token', e.target.value)
                   }
                   placeholder="123456789:AAH..."
+                  autoComplete="off"
                   className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white font-mono"
                 />
               </div>
               <div>
-                <label className="block text-slate-400 mb-1">
-                  Telegram Chat ID / Group ID
-                </label>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="text-slate-400">
+                    Telegram Chat ID / Group ID
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => void handleDetectTelegramChatId()}
+                    disabled={detectingChatId}
+                    className="inline-flex items-center gap-1 text-[11px] text-cyan-400 hover:text-cyan-300 font-medium disabled:opacity-50"
+                  >
+                    <Search className="w-3 h-3" />
+                    {detectingChatId ? 'Đang dò...' : 'Tự lấy Chat ID'}
+                  </button>
+                </div>
                 <input
                   value={settings.telegram_chat_id || ''}
                   onChange={(e) =>
                     updateField('telegram_chat_id', e.target.value)
                   }
-                  placeholder="-1001987654321"
+                  placeholder="VD: 987654321 hoặc -1001987654321"
+                  autoComplete="off"
                   className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white font-mono"
                 />
               </div>
             </div>
+            <p className="text-[11px] text-slate-500 -mt-1">
+              Mẹo: Nhập <b>Bot Token</b>, mở Telegram nhắn <code>/start</code> cho con Bot đó (không điền mã số đầu của Token vào Chat ID), rồi bấm <b>Tự lấy Chat ID</b>.
+            </p>
 
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-2 border-t border-slate-800">
               <div className="sm:col-span-2">
@@ -450,6 +548,7 @@ export default function SettingsPage() {
                   value={settings.smtp_host || ''}
                   onChange={(e) => updateField('smtp_host', e.target.value)}
                   placeholder="smtp.gmail.com"
+                  autoComplete="off"
                   className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white font-mono"
                 />
               </div>
@@ -458,6 +557,7 @@ export default function SettingsPage() {
                 <input
                   value={settings.smtp_port || '587'}
                   onChange={(e) => updateField('smtp_port', e.target.value)}
+                  autoComplete="off"
                   className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white font-mono"
                 />
               </div>
@@ -467,8 +567,11 @@ export default function SettingsPage() {
               <div>
                 <label className="block text-slate-400 mb-1">SMTP User</label>
                 <input
+                  name="smtp_auth_user"
+                  autoComplete="off"
                   value={settings.smtp_user || ''}
                   onChange={(e) => updateField('smtp_user', e.target.value)}
+                  placeholder="alerts@example.com"
                   className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white"
                 />
               </div>
@@ -477,9 +580,12 @@ export default function SettingsPage() {
                   SMTP Password
                 </label>
                 <input
+                  name="smtp_auth_pass"
                   type="password"
+                  autoComplete="new-password"
                   value={settings.smtp_pass || ''}
                   onChange={(e) => updateField('smtp_pass', e.target.value)}
+                  placeholder="App Password (16 ký tự)"
                   className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white"
                 />
               </div>

@@ -2,6 +2,14 @@
 
 Mọi thay đổi đáng chú ý của dự án **NAS-Sync** (<https://github.com/shostwp-byte/nas-sync>) đều được ghi nhận tại tài liệu này theo chuẩn [Keep a Changelog](https://keepachangelog.com/vi/1.1.0/) và [Semantic Versioning](https://semver.org/).
 
+## [1.1.3] - 2026-10-31
+
+### Added & Improved
+- **Nâng cấp Cảnh báo Telegram & SMTP Email (`src/lib/notifications.ts`, `src/app/api/settings/route.ts`, `src/app/settings/page.tsx`)**:
+  - Bổ sung nút **`Tự lấy Chat ID`** giúp tự động dò và điền `Telegram Chat ID / Group ID` chỉ với 1 click sau khi nhắn `/start` cho Bot.
+  - Tách biệt rõ ràng trạng thái **`Bỏ qua (Chưa nhập)`** và **`Gửi thất bại ❌`** thay vì gộp chung `"Chưa cấu hình/Lỗi"`, đồng thời hiển thị thông báo tiếng Việt chi tiết ngay bên trong thẻ cấu hình (phát hiện tự động lỗi điền nhầm ID của chính con Bot vào Chat ID).
+  - Chống trình duyệt tự động điền nhầm tài khoản đăng nhập Web vào ô `SMTP User` & `SMTP Password`.
+
 ## [1.1.2] - 2026-10-31
 
 ### Fixed & Improved
