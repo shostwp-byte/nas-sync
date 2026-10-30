@@ -7,6 +7,8 @@ import {
   CheckCheck,
   CheckCircle2,
   ExternalLink,
+  Eye,
+  EyeOff,
   GitBranch,
   KeyRound,
   Lock,
@@ -35,6 +37,12 @@ export default function SettingsPage() {
 
   const [currentPassword, setCurrentPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
+  const [showPasswords, setShowPasswords] = useState(false);
+  const [changingPwd, setChangingPwd] = useState(false);
+  const [pwdStatus, setPwdStatus] = useState<{
+    ok: boolean;
+    message: string;
+  } | null>(null);
 
   const loadData = useCallback(async () => {
     const resp = await fetch('/api/settings');
@@ -151,19 +159,36 @@ export default function SettingsPage() {
 
   const handleChangePassword = async (e: React.FormEvent) => {
     e.preventDefault();
-    const resp = await fetch('/api/auth/me', {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ currentPassword, newPassword }),
-    });
-    const json = await resp.json();
-    if (!resp.ok) {
-      alert(json.error || 'Đổi mật khẩu thất bại');
-      return;
+    setChangingPwd(true);
+    setPwdStatus(null);
+    try {
+      const resp = await fetch('/api/auth/me', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ currentPassword, newPassword }),
+      });
+      const json = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        setPwdStatus({
+          ok: false,
+          message: json.error || `Đổi mật khẩu thất bại (Mã ${resp.status}).`,
+        });
+        return;
+      }
+      setCurrentPassword('');
+      setNewPassword('');
+      setPwdStatus({
+        ok: true,
+        message: '✅ Đã đổi mật khẩu tài khoản Admin thành công!',
+      });
+    } catch (err) {
+      setPwdStatus({
+        ok: false,
+        message: (err as Error).message || 'Lỗi kết nối khi đổi mật khẩu.',
+      });
+    } finally {
+      setChangingPwd(false);
     }
-    setCurrentPassword('');
-    setNewPassword('');
-    setFeedback('✅ Đã đổi mật khẩu tài khoản Admin thành công!');
   };
 
   const markAlertsRead = async () => {
@@ -607,19 +632,50 @@ export default function SettingsPage() {
           onSubmit={handleChangePassword}
           className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-4"
         >
-          <h3 className="text-sm font-bold text-white flex items-center gap-2">
-            <KeyRound className="w-4 h-4 text-amber-400" />
-            Đổi Mật khẩu Quản trị Admin
-          </h3>
+          <div className="flex items-center justify-between">
+            <h3 className="text-sm font-bold text-white flex items-center gap-2">
+              <KeyRound className="w-4 h-4 text-amber-400" />
+              Đổi Mật khẩu Quản trị Admin
+            </h3>
+            <button
+              type="button"
+              onClick={() => setShowPasswords((v) => !v)}
+              className="inline-flex items-center gap-1 text-[11px] text-slate-400 hover:text-white"
+            >
+              {showPasswords ? (
+                <>
+                  <EyeOff className="w-3.5 h-3.5" /> Ẩn
+                </>
+              ) : (
+                <>
+                  <Eye className="w-3.5 h-3.5" /> Hiện
+                </>
+              )}
+            </button>
+          </div>
+
+          {pwdStatus && (
+            <div
+              className={`p-3 rounded-xl border text-xs ${
+                pwdStatus.ok
+                  ? 'bg-emerald-500/15 border-emerald-500/30 text-emerald-200'
+                  : 'bg-rose-500/15 border-rose-500/30 text-rose-200'
+              }`}
+            >
+              {pwdStatus.message}
+            </div>
+          )}
+
           <div>
             <label className="block text-slate-400 mb-1">
               Mật khẩu hiện tại
             </label>
             <input
-              type="password"
+              type={showPasswords ? 'text' : 'password'}
               required
               value={currentPassword}
               onChange={(e) => setCurrentPassword(e.target.value)}
+              placeholder="Nhập mật khẩu đang dùng..."
               className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white"
             />
           </div>
@@ -628,18 +684,21 @@ export default function SettingsPage() {
               Mật khẩu mới (tối thiểu 6 ký tự)
             </label>
             <input
-              type="password"
+              type={showPasswords ? 'text' : 'password'}
               required
+              minLength={6}
               value={newPassword}
               onChange={(e) => setNewPassword(e.target.value)}
+              placeholder="Tối thiểu 6 ký tự..."
               className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white"
             />
           </div>
           <button
             type="submit"
-            className="w-full py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-white font-semibold border border-slate-700"
+            disabled={changingPwd}
+            className="w-full py-2 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-white font-semibold border border-slate-700"
           >
-            Cập nhật Mật khẩu
+            {changingPwd ? 'Đang cập nhật...' : 'Cập nhật Mật khẩu'}
           </button>
         </form>
 

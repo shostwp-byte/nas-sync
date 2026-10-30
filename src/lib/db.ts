@@ -235,14 +235,19 @@ function initializeSchema(db: SqliteDatabase) {
 }
 
 function seedDefaults(db: SqliteDatabase) {
-  // 1. Seed Admin User
+  // 1. Seed Admin User (hỗ trợ đặt lại mật khẩu khẩn cấp qua biến môi trường FORCE_RESET_ADMIN_PASSWORD=true)
+  const adminUser = process.env.ADMIN_USERNAME || 'admin';
+  const adminPass = process.env.ADMIN_PASSWORD || 'nas-sync@2026';
   const userCount = db.prepare('SELECT COUNT(*) as cnt FROM users').get()?.cnt as number;
   if (!userCount) {
-    const adminUser = process.env.ADMIN_USERNAME || 'admin';
-    const adminPass = process.env.ADMIN_PASSWORD || 'shost@2026';
     db.prepare(
       'INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)'
     ).run(adminUser, hashPassword(adminPass), 'ADMIN');
+  } else if (process.env.FORCE_RESET_ADMIN_PASSWORD === 'true' && process.env.ADMIN_PASSWORD) {
+    db.prepare('UPDATE users SET password_hash = ? WHERE username = ?').run(
+      hashPassword(process.env.ADMIN_PASSWORD),
+      adminUser
+    );
   }
 
   // 2. Seed Storage Volumes
