@@ -47,7 +47,7 @@ services:
       - SANDBOX_DB_PASSWORD=${SANDBOX_DB_PASSWORD:-sandbox_secret_pass}
       - STORAGE_VOLUMES=${STORAGE_VOLUMES:-/mnt/vol1}
       - VOLUME_MAX_USAGE_PERCENT=${VOLUME_MAX_USAGE_PERCENT:-85}
-      - VOLUME_MIN_FREE_GB=${VOLUME_MIN_FREE_GB:-200}
+      - VOLUME_MIN_FREE_GB=${VOLUME_MIN_FREE_GB:-10}
       - ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
       - ADMIN_PASSWORD=${ADMIN_PASSWORD:-nas-sync@2026}
       - JWT_SECRET=${JWT_SECRET:-nas-sync-open-source-change-this-secret-2026}

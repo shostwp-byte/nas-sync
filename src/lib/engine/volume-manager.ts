@@ -60,13 +60,15 @@ function parsePosixDfOutput(
     .filter(Boolean);
   if (lines.length < 2) return null;
 
-  // Dòng cuối chuẩn POSIX (-P): <Filesystem> <Blocks> <Used> <Available> <Use%> <Mounted on>
-  const parts = lines[lines.length - 1].split(/\s+/);
-  if (parts.length < 6) return null;
+  // Chuẩn POSIX (-P): <Filesystem> <Blocks> <Used> <Available> <Use%> <Mounted on>
+  // Dùng regex bắt 3 cột số ngay trước cột <Use%> để an toàn tuyệt đối kể cả khi Filesystem hoặc Mount Path chứa khoảng trắng
+  const lastLine = lines[lines.length - 1];
+  const match = lastLine.match(/(\d+)\s+(\d+)\s+(\d+)\s+\d+%\s+/);
+  if (!match) return null;
 
-  const blocks = Number(parts[parts.length - 5]);
-  const used = Number(parts[parts.length - 4]);
-  const avail = Number(parts[parts.length - 3]);
+  const blocks = Number(match[1]);
+  const used = Number(match[2]);
+  const avail = Number(match[3]);
 
   if (
     Number.isFinite(blocks) &&
@@ -81,6 +83,46 @@ function parsePosixDfOutput(
     };
   }
   return null;
+}
+
+function evaluateVolumeFullState(
+  maxUsagePercent: number,
+  minFreeGb: number,
+  totalBytes: number,
+  usedBytes: number,
+  freeBytes: number
+): {
+  isFull: boolean;
+  reason: string | null;
+  usagePercent: number;
+  freeGb: number;
+} {
+  const usagePercent = totalBytes > 0 ? (usedBytes / totalBytes) * 100 : 0;
+  const freeGb = freeBytes / 1024 ** 3;
+
+  if (totalBytes <= 0) {
+    return { isFull: false, reason: null, usagePercent: 0, freeGb: 0 };
+  }
+
+  if (maxUsagePercent > 0 && usagePercent >= maxUsagePercent) {
+    return {
+      isFull: true,
+      reason: `đã dùng ${usagePercent.toFixed(1)}% (chạm ngưỡng đầy ${maxUsagePercent}%)`,
+      usagePercent,
+      freeGb,
+    };
+  }
+
+  if (minFreeGb > 0 && freeGb < minFreeGb) {
+    return {
+      isFull: true,
+      reason: `còn trống khả dụng ${freeGb.toFixed(2)} GB (thấp hơn ngưỡng trống tối thiểu ${minFreeGb} GB)`,
+      usagePercent,
+      freeGb,
+    };
+  }
+
+  return { isFull: false, reason: null, usagePercent, freeGb };
 }
 
 /**
@@ -167,17 +209,14 @@ export async function refreshAllVolumes(): Promise<StorageVolume[]> {
       );
       let nextStatus = vol.status;
       if (vol.status !== 'MAINTENANCE' && totalBytes > 0) {
-        const usagePercent = (usedBytes / totalBytes) * 100;
-        const freeGb = freeBytes / 1024 ** 3;
-        if (usagePercent >= vol.max_usage_percent || freeGb < vol.min_free_gb) {
-          nextStatus = 'FULL';
-        } else if (
-          vol.status === 'FULL' &&
-          usagePercent < vol.max_usage_percent - 3 &&
-          freeGb >= vol.min_free_gb
-        ) {
-          nextStatus = 'ACTIVE';
-        }
+        const evalState = evaluateVolumeFullState(
+          vol.max_usage_percent,
+          vol.min_free_gb,
+          totalBytes,
+          usedBytes,
+          freeBytes
+        );
+        nextStatus = evalState.isFull ? 'FULL' : 'ACTIVE';
       }
       updateStmt.run(totalBytes, usedBytes, freeBytes, nextStatus, vol.id);
     } catch (err) {
@@ -210,7 +249,7 @@ export async function ensureActiveVolumeForBackup(
     const firstActive = volumes.find((v) => v.status === 'ACTIVE');
     if (!firstActive) {
       throw new Error(
-        'Tất cả phân vùng lưu trữ (Storage Volumes) trên NAS đều đã ĐẦY hoặc đang BẢO TRÌ!'
+        'Tất cả phân vùng lưu trữ (Storage Volumes) trên NAS đều đã chạm ngưỡng đầy hoặc đang BẢO TRÌ!'
       );
     }
     db.prepare('UPDATE servers SET assigned_volume_id = ? WHERE id = ?').run(
@@ -223,18 +262,23 @@ export async function ensureActiveVolumeForBackup(
     return firstActive;
   }
 
-  const usagePercent =
-    currentVol.total_bytes > 0
-      ? (currentVol.used_bytes / currentVol.total_bytes) * 100
-      : 0;
-  const freeGb = currentVol.free_bytes / 1024 ** 3;
+  const evalState = evaluateVolumeFullState(
+    currentVol.max_usage_percent,
+    currentVol.min_free_gb,
+    currentVol.total_bytes,
+    currentVol.used_bytes,
+    currentVol.free_bytes
+  );
+  const { usagePercent, freeGb } = evalState;
+  const fullReasonText =
+    currentVol.status === 'MAINTENANCE'
+      ? 'đang ở chế độ BẢO TRÌ'
+      : evalState.reason || `đã dùng ${usagePercent.toFixed(1)}%, trống ${freeGb.toFixed(1)} GB`;
 
   const isOverflow =
     currentVol.status === 'FULL' ||
     currentVol.status === 'MAINTENANCE' ||
-    (currentVol.total_bytes > 0 &&
-      (usagePercent >= currentVol.max_usage_percent ||
-        freeGb < currentVol.min_free_gb));
+    evalState.isFull;
 
   if (!isOverflow) {
     onLog(
@@ -260,34 +304,24 @@ export async function ensureActiveVolumeForBackup(
     await createSystemAlert({
       severity: 'CRITICAL',
       category: 'VOLUME',
-      title: `Hết dung lượng lưu trữ trên toàn bộ phân vùng NAS!`,
-      message: `Phân vùng ${currentVol.name} (${currentVol.mount_path}) đã vượt ngưỡng an toàn (${usagePercent.toFixed(
-        1
-      )}%, còn trống ${freeGb.toFixed(
-        1
-      )} GB) và không còn phân vùng ACTIVE dự phòng nào cho ${server.hostname}.`,
+      title: `Không còn phân vùng lưu trữ khả dụng trên NAS!`,
+      message: `Phân vùng ${currentVol.name} (${currentVol.mount_path}) ${fullReasonText} và không còn phân vùng ACTIVE dự phòng nào cho ${server.hostname}.`,
       serverId: server.id,
     });
     throw new Error(
-      `Phân vùng ${currentVol.name} đã đầy (${usagePercent.toFixed(
-        1
-      )}%) và không tìm thấy Volume ACTIVE kế tiếp!`
+      `Phân vùng ${currentVol.name} ${fullReasonText} và không tìm thấy Volume ACTIVE kế tiếp!`
     );
   }
 
   onLog(
-    `[Multi-Volume Overflow] Cảnh báo: ${currentVol.name} đạt ngưỡng (${usagePercent.toFixed(
-      1
-    )}%). Đang chuyển hướng lưu trữ sang ${targetVol.name} (${targetVol.mount_path})...`
+    `[Multi-Volume Overflow] Cảnh báo: ${currentVol.name} ${fullReasonText}. Đang chuyển hướng lưu trữ sang ${targetVol.name} (${targetVol.mount_path})...`
   );
 
   await createSystemAlert({
     severity: 'WARNING',
     category: 'VOLUME',
     title: `Tự động chuyển đổi Volume: ${currentVol.name} ➔ ${targetVol.name}`,
-    message: `Phân vùng ${currentVol.name} đã chạm ngưỡng (${usagePercent.toFixed(
-      1
-    )}% / trống ${freeGb.toFixed(1)} GB). Hệ thống tự động thực hiện Local Seeding bản latest của ${
+    message: `Phân vùng ${currentVol.name} ${fullReasonText}. Hệ thống tự động thực hiện Local Seeding bản latest của ${
       server.hostname
     } sang ${targetVol.name} (${targetVol.mount_path}) để bảo toàn chuỗi Incremental Hard-Link.`,
     serverId: server.id,

@@ -21,7 +21,7 @@ export async function POST(req: NextRequest) {
     const name = String(body.name || '').trim();
     const mountPath = String(body.mount_path || '').trim();
     const maxUsage = Number(body.max_usage_percent ?? 85);
-    const minFreeGb = Number(body.min_free_gb ?? 200);
+    const minFreeGb = Number(body.min_free_gb ?? 10);
     const priority = Number(body.priority ?? 1);
     const btrfsEnabled = body.btrfs_immutable_enabled ? 1 : 0;
     const btrfsDays = Number(body.btrfs_retention_days ?? 7);

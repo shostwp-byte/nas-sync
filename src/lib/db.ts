@@ -92,7 +92,7 @@ function initializeSchema(db: SqliteDatabase) {
       name TEXT NOT NULL,
       mount_path TEXT NOT NULL UNIQUE,
       max_usage_percent INTEGER NOT NULL DEFAULT 85,
-      min_free_gb INTEGER NOT NULL DEFAULT 200,
+      min_free_gb INTEGER NOT NULL DEFAULT 10,
       status TEXT NOT NULL DEFAULT 'ACTIVE',
       priority INTEGER NOT NULL DEFAULT 1,
       btrfs_immutable_enabled INTEGER NOT NULL DEFAULT 0,
@@ -232,6 +232,27 @@ function initializeSchema(db: SqliteDatabase) {
       // Cột đã tồn tại
     }
   }
+
+  // Nâng cấp v1.1.2: Hạ ngưỡng min_free_gb mặc định cũ (200 GB) xuống 10 GB để tránh báo FULL sai trên ổ cứng / Quota < 2TB
+  try {
+    const migFlag = db
+      .prepare('SELECT value FROM system_settings WHERE key = ?')
+      .get('migrated_volume_min_free_v112');
+    if (!migFlag) {
+      db.prepare(
+        `UPDATE storage_volumes
+         SET min_free_gb = 10,
+             status = CASE WHEN status = 'FULL' THEN 'ACTIVE' ELSE status END
+         WHERE min_free_gb = 200`
+      ).run();
+      db.prepare(
+        `INSERT OR REPLACE INTO system_settings (key, value, updated_at)
+         VALUES ('migrated_volume_min_free_v112', 'true', datetime('now'))`
+      ).run();
+    }
+  } catch {
+    // Bỏ qua nếu bảng chưa sẵn sàng
+  }
 }
 
 function seedDefaults(db: SqliteDatabase) {
@@ -257,7 +278,9 @@ function seedDefaults(db: SqliteDatabase) {
   if (!volCount) {
     const isWindows = process.platform === 'win32';
     const maxPct = Number(process.env.VOLUME_MAX_USAGE_PERCENT || 85);
-    const minFreeGb = Number(process.env.VOLUME_MIN_FREE_GB || 200);
+    const parsedMinFree = Number(process.env.VOLUME_MIN_FREE_GB ?? 10);
+    const minFreeGb =
+      Number.isFinite(parsedMinFree) && parsedMinFree >= 0 ? parsedMinFree : 10;
 
     const rawVolumes = process.env.STORAGE_VOLUMES
       ? process.env.STORAGE_VOLUMES.split(',').map((s) => s.trim()).filter(Boolean)

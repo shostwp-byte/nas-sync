@@ -2,6 +2,14 @@
 
 Mọi thay đổi đáng chú ý của dự án **NAS-Sync** (<https://github.com/shostwp-byte/nas-sync>) đều được ghi nhận tại tài liệu này theo chuẩn [Keep a Changelog](https://keepachangelog.com/vi/1.1.0/) và [Semantic Versioning](https://semver.org/).
 
+## [1.1.2] - 2026-10-31
+
+### Fixed & Improved
+- **Sửa lỗi báo trạng thái `FULL` sai trên ổ cứng / phân vùng có dung lượng trống < 200 GB (`src/lib/engine/volume-manager.ts`, `src/lib/db.ts`, `src/app/volumes/page.tsx`)**:
+  - Hạ ngưỡng mặc định `VOLUME_MIN_FREE_GB` (`min_free_gb`) từ `200 GB` xuống `10 GB` (kèm migration tự động cho CSDL đang chạy từ phiên bản cũ) để tránh báo `FULL` sai khi tỷ lệ sử dụng mới ở mức thấp (VD: 52%) nhưng ổ cứng nhỏ hoặc bị giới hạn Shared Folder Quota trên DSM.
+  - Xóa độ trễ hysteresis `-3%` gây kẹt trạng thái `FULL` khi người dùng chỉnh lại ngưỡng đầy, hỗ trợ đặt `Trống tối thiểu (GB) = 0` để chỉ tính theo `%`.
+  - Hiển thị rõ nguyên nhân báo `FULL` và dung lượng bị giữ chỗ bởi Hạn ngạch DSM Quota / LUN ngay trên thẻ Phân vùng.
+
 ## [1.1.1] - 2026-10-31
 
 ### Fixed & Improved

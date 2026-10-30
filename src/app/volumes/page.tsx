@@ -24,7 +24,7 @@ export default function VolumesPage() {
     name: 'Synology Volume 3',
     mount_path: '/mnt/vol3',
     max_usage_percent: 85,
-    min_free_gb: 200,
+    min_free_gb: 10,
     priority: 3,
     btrfs_immutable_enabled: true,
     btrfs_retention_days: 7,
@@ -174,6 +174,17 @@ export default function VolumesPage() {
               vol.total_bytes > 0
                 ? Math.min(100, (vol.used_bytes / vol.total_bytes) * 100)
                 : 0;
+            const freeGb = vol.free_bytes / 1024 ** 3;
+            const reservedBytes = Math.max(
+              0,
+              vol.total_bytes - vol.used_bytes - vol.free_bytes
+            );
+            const hasQuotaOrReserve =
+              vol.total_bytes > 0 && reservedBytes > vol.total_bytes * 0.05;
+            const isFullByPct =
+              vol.max_usage_percent > 0 && pct >= vol.max_usage_percent;
+            const isFullByFreeGb =
+              vol.min_free_gb > 0 && freeGb < vol.min_free_gb;
 
             return (
               <div
@@ -227,13 +238,29 @@ export default function VolumesPage() {
                   <div className="w-full h-3 bg-slate-950 rounded-full overflow-hidden border border-slate-800">
                     <div
                       className={`h-full transition-all duration-500 ${
-                        pct >= vol.max_usage_percent
+                        vol.status === 'FULL'
                           ? 'bg-rose-500'
+                          : pct >= 75
+                          ? 'bg-amber-500'
                           : 'bg-gradient-to-r from-blue-500 to-cyan-400'
                       }`}
                       style={{ width: `${Math.max(2, pct)}%` }}
                     />
                   </div>
+                  {hasQuotaOrReserve && (
+                    <div className="text-[11px] text-slate-500">
+                      Lưu ý: Khoảng {formatBytes(reservedBytes)} trên ổ cứng đang bị giới hạn bởi Hạn ngạch (Shared Folder Quota), LUN hoặc phân vùng hệ thống DSM nên không tính vào dung lượng trống khả dụng.
+                    </div>
+                  )}
+                  {vol.status === 'FULL' && (
+                    <div className="p-2.5 rounded-lg bg-rose-500/10 border border-rose-500/30 text-[11px] text-rose-200">
+                      {isFullByPct
+                        ? `Phân vùng đang báo FULL do tỷ lệ sử dụng (${pct.toFixed(1)}%) đã chạm ngưỡng đầy (${vol.max_usage_percent}%).`
+                        : isFullByFreeGb
+                        ? `Phân vùng đang báo FULL do dung lượng trống khả dụng (${formatBytes(vol.free_bytes)}) nhỏ hơn ô "Trống tối thiểu" (${vol.min_free_gb} GB). Hãy hạ "Trống tối thiểu (GB)" xuống 10 (hoặc 0 để chỉ tính theo %).`
+                        : `Phân vùng đang ở trạng thái FULL.`}
+                    </div>
+                  )}
                 </div>
 
                 <div className="grid grid-cols-3 gap-3 pt-2 border-t border-slate-800 text-xs">
@@ -242,8 +269,14 @@ export default function VolumesPage() {
                       Ngưỡng đầy (%)
                     </label>
                     <input
+                      key={`max-${vol.id}-${vol.max_usage_percent}`}
                       type="number"
+                      min={1}
+                      max={99}
                       defaultValue={vol.max_usage_percent}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') (e.target as HTMLInputElement).blur();
+                      }}
                       onBlur={(e) =>
                         void updateThresholds(
                           vol,
@@ -260,8 +293,13 @@ export default function VolumesPage() {
                       Trống tối thiểu (GB)
                     </label>
                     <input
+                      key={`min-${vol.id}-${vol.min_free_gb}`}
                       type="number"
+                      min={0}
                       defaultValue={vol.min_free_gb}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') (e.target as HTMLInputElement).blur();
+                      }}
                       onBlur={(e) =>
                         void updateThresholds(
                           vol,
@@ -278,8 +316,13 @@ export default function VolumesPage() {
                       Độ ưu tiên
                     </label>
                     <input
+                      key={`prio-${vol.id}-${vol.priority}`}
                       type="number"
+                      min={1}
                       defaultValue={vol.priority}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') (e.target as HTMLInputElement).blur();
+                      }}
                       onBlur={(e) =>
                         void updateThresholds(
                           vol,
