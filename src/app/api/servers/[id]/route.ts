@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getDb } from '@/lib/db';
+import { validateServerConnectionFields } from '@/lib/engine/safe-names';
 
 export async function PATCH(
   req: NextRequest,
@@ -18,6 +19,15 @@ export async function PATCH(
         { error: 'Không tìm thấy máy chủ VPS.' },
         { status: 404 }
       );
+    }
+
+    const invalidField = validateServerConnectionFields({
+      hostname: String(body.hostname ?? curr.hostname).trim(),
+      ipAddress: String(body.ip_address ?? curr.ip_address).trim(),
+      sshUser: String(body.ssh_user ?? curr.ssh_user).trim(),
+    });
+    if (invalidField) {
+      return NextResponse.json({ error: invalidField }, { status: 400 });
     }
 
     db.prepare(

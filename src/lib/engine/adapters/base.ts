@@ -4,6 +4,12 @@ import type {
   PanelType,
   ServerRecord,
 } from '@/types';
+import {
+  isSafeDbName,
+  isSafeDomain,
+  isSafeSystemUser,
+  isSafeWebroot,
+} from '../safe-names';
 
 export interface PanelAdapter {
   readonly panelType: PanelType;
@@ -36,6 +42,44 @@ export function buildMysqlAuthFlags(creds: MysqlAdminCredentials): string {
   return `-u"${creds.user}"`;
 }
 
+/**
+ * Loại bỏ domain / DB có tên nguy hiểm do VPS trả về (khách hàng hosting kiểm soát được tên DB,
+ * VPS bị chiếm quyền có thể trả về domain "../../..."). Các tên này về sau được ghép vào lệnh
+ * shell root trên VPS, bash trên NAS và đường dẫn rsync --delete trên NAS.
+ * Bỏ qua thay vì throw để một khách hàng độc hại không làm hỏng backup của cả máy chủ.
+ */
+function filterUnsafeDiscoveredDomains(rawDomains: DiscoveredDomain[]): DiscoveredDomain[] {
+  const out: DiscoveredDomain[] = [];
+  for (const item of rawDomains) {
+    const domain = item.domain.trim();
+    const webroot = normalizePosixWebroot(item.webroot);
+    if (!domain) continue;
+    if (
+      !isSafeDomain(domain) ||
+      !isSafeSystemUser(item.systemUser) ||
+      !isSafeWebroot(webroot, 2)
+    ) {
+      console.warn(
+        `[NAS-Sync Security] Bỏ qua domain có định danh không an toàn: ${JSON.stringify({
+          domain: item.domain,
+          systemUser: item.systemUser,
+          webroot: item.webroot,
+        })}`
+      );
+      continue;
+    }
+    const databases = item.databases.filter((db) => {
+      if (isSafeDbName(db.name)) return true;
+      console.warn(
+        `[NAS-Sync Security] Bỏ qua database có tên không an toàn trên ${domain}: ${JSON.stringify(db.name)}`
+      );
+      return false;
+    });
+    out.push({ ...item, databases });
+  }
+  return out;
+}
+
 function normalizePosixWebroot(p: string): string {
   const trimmed = p.trim().replace(/\/+$/, '');
   return trimmed || '/';
@@ -50,8 +94,10 @@ function normalizePosixWebroot(p: string): string {
 export function finalizeDiscoveredDomains(
   rawDomains: DiscoveredDomain[]
 ): DiscoveredDomain[] {
+  const safeDomains = filterUnsafeDiscoveredDomains(rawDomains);
+
   // Sắp xếp Domain chính trước, Subdomain sau để khi trùng webroot vật lý thì ưu tiên tên miền chính/addon
-  const sorted = [...rawDomains].sort((a, b) => {
+  const sorted = [...safeDomains].sort((a, b) => {
     const aSub = a.isSubdomain ? 1 : 0;
     const bSub = b.isSubdomain ? 1 : 0;
     return aSub - bSub;

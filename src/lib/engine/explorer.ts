@@ -52,15 +52,26 @@ export function resolveSafeSnapshotRoot(jobId: number): {
   };
 }
 
+function isWithinRoot(root: string, target: string): boolean {
+  return target === root || target.startsWith(root + path.sep);
+}
+
 export function resolveSafeSubPath(snapshotRoot: string, relativeSubPath = ''): string {
   const normalizedRel = relativeSubPath.replace(/^[/\\]+/, '');
   const resolved = path.resolve(snapshotRoot, normalizedRel);
 
-  if (
-    resolved !== snapshotRoot &&
-    !resolved.startsWith(snapshotRoot + path.sep)
-  ) {
+  if (!isWithinRoot(snapshotRoot, resolved)) {
     throw new Error('Truy cập đường dẫn ngoài phạm vi Snapshot bị từ chối!');
+  }
+
+  // Snapshot chứa symlink sao chép nguyên vẹn từ VPS (rsync -a). Một khách hàng hosting có thể tạo
+  // symlink trỏ tới /root/.ssh/..., /app/data/... trong container NAS — phải kiểm tra đích thật.
+  if (fs.existsSync(resolved)) {
+    const realRoot = fs.realpathSync(snapshotRoot);
+    const realTarget = fs.realpathSync(resolved);
+    if (!isWithinRoot(realRoot, realTarget)) {
+      throw new Error('Symlink trỏ ra ngoài phạm vi Snapshot bị từ chối!');
+    }
   }
 
   return resolved;
@@ -93,7 +104,14 @@ export function listSnapshotDirectory(
   for (const d of dirents) {
     if (d.name === '.rsync-partial' || d.name === '.state.json') continue;
     const full = path.join(targetDir, d.name);
-    const stat = fs.statSync(full);
+    // Symlink hỏng (rất phổ biến trong webroot WordPress) làm statSync ném ENOENT
+    // và hỏng cả danh sách — fallback sang lstat để vẫn hiển thị mục đó.
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(full);
+    } catch {
+      stat = fs.lstatSync(full);
+    }
     const rel = path
       .relative(snapshotRoot, full)
       .split(path.sep)

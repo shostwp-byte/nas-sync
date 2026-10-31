@@ -359,9 +359,11 @@ function runSshStreamDatabaseDump(params: {
       const outPath = path.join(destDatabasesDir, fileName);
       const tmpOutPath = `${outPath}.part`;
 
-      // Sử dụng bash pipefail / PIPESTATUS trên VPS để đảm bảo mysqldump trả về đúng mã 0
+      // Sử dụng bash pipefail / PIPESTATUS trên VPS để đảm bảo mysqldump trả về đúng mã 0.
+      // dbName do khách hàng hosting đặt — PHẢI single-quote (dấu "..." vẫn cho $(...) chạy với quyền root).
+      const quotedDb = shellSingleQuote(dbName);
       const remoteDumpScript = `bash -o pipefail -c ${shellSingleQuote(
-        `(command -v ionice >/dev/null 2>&1 && ionice -c2 -n7 nice -n19 mysqldump ${authFlags} --single-transaction --quick --lock-tables=false --routines --triggers --events "${dbName}" || nice -n19 mysqldump ${authFlags} --single-transaction --quick --lock-tables=false --routines --triggers --events "${dbName}") | ${compCmd}`
+        `(command -v ionice >/dev/null 2>&1 && ionice -c2 -n7 nice -n19 mysqldump ${authFlags} --single-transaction --quick --lock-tables=false --routines --triggers --events ${quotedDb} || nice -n19 mysqldump ${authFlags} --single-transaction --quick --lock-tables=false --routines --triggers --events ${quotedDb}) | ${compCmd}`
       )}`;
 
       const sshArgs = [
@@ -376,9 +378,19 @@ function runSshStreamDatabaseDump(params: {
       });
 
       let stderr = '';
+      let writeFailed = false;
       child.stdout.pipe(outStream);
       child.stderr.on('data', (d: Buffer) => {
         stderr += d.toString('utf8');
+      });
+
+      // Thiếu listener 'error' thì ENOSPC (Volume NAS đầy) thành uncaught exception
+      // và làm sập toàn bộ tiến trình Node cùng mọi Job đang chạy.
+      outStream.on('error', (err) => {
+        writeFailed = true;
+        child.kill('SIGKILL');
+        fs.rmSync(tmpOutPath, { force: true });
+        reject(new Error(`Ghi file dump DB ${dbName} thất bại: ${err.message}`));
       });
 
       child.on('error', (err) => {
@@ -387,44 +399,54 @@ function runSshStreamDatabaseDump(params: {
       });
 
       child.on('close', (code) => {
+        if (writeFailed) return;
         outStream.end(() => {
-          if (isJobCancelled(jobId)) {
+          try {
+            finalizeDump(code);
+          } catch (err) {
             fs.rmSync(tmpOutPath, { force: true });
-            reject(new Error('Job đã bị hủy bởi quản trị viên.'));
-            return;
+            reject(err);
           }
-
-          if (code === 255) {
-            fs.rmSync(tmpOutPath, { force: true });
-            reject(
-              new RetryableNetworkError(
-                `Đứt kết nối SSH giữa chừng khi stream DB ${dbName}: ${stderr.trim()}`,
-                255
-              )
-            );
-            return;
-          }
-
-          if (code !== 0) {
-            fs.rmSync(tmpOutPath, { force: true });
-            reject(
-              new Error(
-                `mysqldump stream cho DB "${dbName}" thất bại (PIPESTATUS code ${code}): ${stderr.trim()}`
-              )
-            );
-            return;
-          }
-
-          fs.renameSync(tmpOutPath, outPath);
-          const sizeBytes = fs.statSync(outPath).size;
-          onLog(
-            `[DB Stream] Đã stream trực tiếp ${dbName} ➔ ${fileName} (${(
-              sizeBytes / 1024
-            ).toFixed(1)} KB, không tốn ổ cứng tạm VPS).`
-          );
-          resolve({ fileName, sizeBytes });
         });
       });
+
+      const finalizeDump = (code: number | null) => {
+        if (isJobCancelled(jobId)) {
+          fs.rmSync(tmpOutPath, { force: true });
+          reject(new Error('Job đã bị hủy bởi quản trị viên.'));
+          return;
+        }
+
+        if (code === 255) {
+          fs.rmSync(tmpOutPath, { force: true });
+          reject(
+            new RetryableNetworkError(
+              `Đứt kết nối SSH giữa chừng khi stream DB ${dbName}: ${stderr.trim()}`,
+              255
+            )
+          );
+          return;
+        }
+
+        if (code !== 0) {
+          fs.rmSync(tmpOutPath, { force: true });
+          reject(
+            new Error(
+              `mysqldump stream cho DB "${dbName}" thất bại (PIPESTATUS code ${code}): ${stderr.trim()}`
+            )
+          );
+          return;
+        }
+
+        fs.renameSync(tmpOutPath, outPath);
+        const sizeBytes = fs.statSync(outPath).size;
+        onLog(
+          `[DB Stream] Đã stream trực tiếp ${dbName} ➔ ${fileName} (${(
+            sizeBytes / 1024
+          ).toFixed(1)} KB, không tốn ổ cứng tạm VPS).`
+        );
+        resolve({ fileName, sizeBytes });
+      };
     });
   });
 }

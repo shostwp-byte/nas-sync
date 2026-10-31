@@ -50,7 +50,8 @@ services:
       - VOLUME_MIN_FREE_GB=${VOLUME_MIN_FREE_GB:-10}
       - ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
       - ADMIN_PASSWORD=${ADMIN_PASSWORD:-nas-sync@2026}
-      - JWT_SECRET=${JWT_SECRET:-nas-sync-open-source-change-this-secret-2026}
+      # Để trống: tự sinh khóa ngẫu nhiên lưu tại /app/data/.jwt_secret
+      - JWT_SECRET=${JWT_SECRET:-}
       - GITHUB_REPO_OWNER=${GITHUB_REPO_OWNER:-shostwp-byte}
       - GITHUB_REPO_NAME=${GITHUB_REPO_NAME:-nas-sync}
       - GITHUB_REPO_BRANCH=${GITHUB_REPO_BRANCH:-main}

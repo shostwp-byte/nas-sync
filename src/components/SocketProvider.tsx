@@ -68,6 +68,17 @@ export function SocketProvider({ children }: { children: React.ReactNode }) {
     socket.on('connect', () => setConnected(true));
     socket.on('disconnect', () => setConnected(false));
 
+    // Server từ chối bắt tay khi chưa đăng nhập (VD: đang ở trang /login) — Socket.IO không tự
+    // kết nối lại sau lỗi middleware, nên thử lại định kỳ để nhận cookie phiên sau khi đăng nhập.
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+    socket.on('connect_error', () => {
+      if (socket.active || retryTimer) return;
+      retryTimer = setTimeout(() => {
+        retryTimer = null;
+        socket.connect();
+      }, 3000);
+    });
+
     socket.on('job:progress', (payload: ProgressEventPayload) => {
       setProgressMap((prev) => ({
         ...prev,
@@ -114,6 +125,7 @@ export function SocketProvider({ children }: { children: React.ReactNode }) {
     });
 
     return () => {
+      if (retryTimer) clearTimeout(retryTimer);
       socket.disconnect();
     };
   }, []);
