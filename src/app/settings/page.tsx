@@ -42,6 +42,8 @@ export default function SettingsPage() {
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [triggeringUpdate, setTriggeringUpdate] = useState(false);
 
+  const [adminUsername, setAdminUsername] = useState('admin');
+  const [newUsername, setNewUsername] = useState('admin');
   const [currentPassword, setCurrentPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [showPasswords, setShowPasswords] = useState(false);
@@ -52,11 +54,21 @@ export default function SettingsPage() {
   } | null>(null);
 
   const loadData = useCallback(async () => {
-    const resp = await fetch('/api/settings');
-    if (resp.ok) {
-      const json = await resp.json();
+    const [settingsResp, meResp] = await Promise.all([
+      fetch('/api/settings'),
+      fetch('/api/auth/me'),
+    ]);
+    if (settingsResp.ok) {
+      const json = await settingsResp.json();
       setSettings(json.settings || {});
       setAlerts(json.alerts || []);
+    }
+    if (meResp.ok) {
+      const meJson = await meResp.json();
+      if (meJson?.user?.username) {
+        setAdminUsername(String(meJson.user.username));
+        setNewUsername(String(meJson.user.username));
+      }
     }
   }, []);
 
@@ -228,26 +240,36 @@ export default function SettingsPage() {
       const resp = await fetch('/api/auth/me', {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ currentPassword, newPassword }),
+        body: JSON.stringify({
+          currentPassword,
+          newUsername: newUsername.trim(),
+          newPassword,
+        }),
       });
       const json = await resp.json().catch(() => ({}));
       if (!resp.ok) {
         setPwdStatus({
           ok: false,
-          message: json.error || `Đổi mật khẩu thất bại (Mã ${resp.status}).`,
+          message:
+            json.error || `Cập nhật tài khoản thất bại (Mã ${resp.status}).`,
         });
         return;
+      }
+      if (json.username) {
+        setAdminUsername(String(json.username));
+        setNewUsername(String(json.username));
       }
       setCurrentPassword('');
       setNewPassword('');
       setPwdStatus({
         ok: true,
-        message: '✅ Đã đổi mật khẩu tài khoản Admin thành công!',
+        message:
+          json.message || '✅ Đã cập nhật thông tin tài khoản Admin thành công!',
       });
     } catch (err) {
       setPwdStatus({
         ok: false,
-        message: (err as Error).message || 'Lỗi kết nối khi đổi mật khẩu.',
+        message: (err as Error).message || 'Lỗi kết nối khi cập nhật tài khoản.',
       });
     } finally {
       setChangingPwd(false);
@@ -741,7 +763,7 @@ export default function SettingsPage() {
           <div className="flex items-center justify-between">
             <h3 className="text-sm font-bold text-white flex items-center gap-2">
               <KeyRound className="w-4 h-4 text-amber-400" />
-              Đổi Mật khẩu Quản trị Admin
+              Tài khoản & Mật khẩu Quản trị
             </h3>
             <button
               type="button"
@@ -774,7 +796,23 @@ export default function SettingsPage() {
 
           <div>
             <label className="block text-slate-400 mb-1">
-              Mật khẩu hiện tại
+              Tên đăng nhập (Username) — hiện tại:{' '}
+              <span className="text-cyan-400 font-mono">{adminUsername}</span>
+            </label>
+            <input
+              type="text"
+              required
+              minLength={3}
+              maxLength={32}
+              value={newUsername}
+              onChange={(e) => setNewUsername(e.target.value)}
+              placeholder="VD: dungtran"
+              className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white font-mono"
+            />
+          </div>
+          <div>
+            <label className="block text-slate-400 mb-1">
+              Mật khẩu hiện tại (bắt buộc để xác nhận)
             </label>
             <input
               type={showPasswords ? 'text' : 'password'}
@@ -787,15 +825,14 @@ export default function SettingsPage() {
           </div>
           <div>
             <label className="block text-slate-400 mb-1">
-              Mật khẩu mới (tối thiểu 6 ký tự)
+              Mật khẩu mới (để trống nếu chỉ đổi Username)
             </label>
             <input
               type={showPasswords ? 'text' : 'password'}
-              required
               minLength={6}
               value={newPassword}
               onChange={(e) => setNewPassword(e.target.value)}
-              placeholder="Tối thiểu 6 ký tự..."
+              placeholder="Để trống hoặc nhập tối thiểu 6 ký tự..."
               className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white"
             />
           </div>
@@ -804,7 +841,7 @@ export default function SettingsPage() {
             disabled={changingPwd}
             className="w-full py-2 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-white font-semibold border border-slate-700"
           >
-            {changingPwd ? 'Đang cập nhật...' : 'Cập nhật Mật khẩu'}
+            {changingPwd ? 'Đang cập nhật...' : 'Cập nhật Tài khoản Quản trị'}
           </button>
         </form>
 

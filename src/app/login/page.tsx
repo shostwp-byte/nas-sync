@@ -6,7 +6,7 @@ import { GitBranch, Lock, ShieldCheck, User } from 'lucide-react';
 
 export default function LoginPage() {
   const router = useRouter();
-  const [username, setUsername] = useState('admin');
+  const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -68,11 +68,12 @@ export default function LoginPage() {
               <User className="w-4 h-4 text-slate-500 absolute left-3.5 top-1/2 -translate-y-1/2" />
               <input
                 type="text"
+                autoComplete="username"
                 value={username}
                 onChange={(e) => setUsername(e.target.value)}
                 required
                 className="w-full bg-slate-950 border border-slate-800 focus:border-blue-500 rounded-lg pl-10 pr-3.5 py-2.5 text-sm text-white outline-none transition-colors"
-                placeholder="admin"
+                placeholder="Nhập tên đăng nhập..."
               />
             </div>
           </div>
@@ -113,7 +114,7 @@ export default function LoginPage() {
             <GitBranch className="w-3.5 h-3.5 text-blue-400" />
             shostwp-byte/nas-sync (MIT)
           </a>
-          <span>v1.1.0 • Free & Open Source</span>
+          <span>Free & Open Source</span>
         </div>
       </div>
     </div>

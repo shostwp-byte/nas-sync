@@ -265,10 +265,16 @@ function seedDefaults(db: SqliteDatabase) {
       'INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)'
     ).run(adminUser, hashPassword(adminPass), 'ADMIN');
   } else if (process.env.FORCE_RESET_ADMIN_PASSWORD === 'true' && process.env.ADMIN_PASSWORD) {
-    db.prepare('UPDATE users SET password_hash = ? WHERE username = ?').run(
-      hashPassword(process.env.ADMIN_PASSWORD),
-      adminUser
-    );
+    const firstAdmin = db
+      .prepare("SELECT id FROM users WHERE role = 'ADMIN' ORDER BY id ASC LIMIT 1")
+      .get();
+    if (firstAdmin) {
+      db.prepare('UPDATE users SET username = ?, password_hash = ? WHERE id = ?').run(
+        adminUser,
+        hashPassword(process.env.ADMIN_PASSWORD),
+        Number(firstAdmin.id)
+      );
+    }
   }
 
   // 2. Seed Storage Volumes

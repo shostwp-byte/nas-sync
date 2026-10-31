@@ -2,6 +2,13 @@
 
 Mọi thay đổi đáng chú ý của dự án **NAS-Sync** (<https://github.com/shostwp-byte/nas-sync>) đều được ghi nhận tại tài liệu này theo chuẩn [Keep a Changelog](https://keepachangelog.com/vi/1.1.0/) và [Semantic Versioning](https://semver.org/).
 
+## [1.1.4] - 2026-10-31
+
+### Added & Improved
+- **Đổi Tên đăng nhập (Username) Admin trực tiếp trên giao diện Web (`src/app/api/auth/me/route.ts`, `src/app/settings/page.tsx`, `src/app/login/page.tsx`)**:
+  - Cho phép đổi `Username` quản trị độc lập (chỉ cần xác nhận mật khẩu hiện tại, không bắt buộc đổi mật khẩu) hoặc đổi đồng thời cả `Username` & `Mật khẩu` ngay tại trang **Cấu hình & Cập nhật (`/settings`)**, tự động cấp mới phiên JWT mà không bị đăng xuất.
+  - Hỗ trợ đặt lại đồng thời cả `ADMIN_USERNAME` và `ADMIN_PASSWORD` khi bật `FORCE_RESET_ADMIN_PASSWORD=true` trong `.env`.
+
 ## [1.1.3] - 2026-10-31
 
 ### Added & Improved
