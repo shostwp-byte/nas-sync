@@ -3,11 +3,6 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { getDataDir } from './db';
 
-// Các giá trị mẫu từng được phát hành công khai trong repo — coi như KHÔNG bí mật
-const KNOWN_PUBLIC_SECRETS = new Set([
-  'nas-sync-open-source-change-this-secret-2026',
-  'please-change-this-to-a-random-64-character-secret-string',
-  'shost-backup-enterprise-secret-change-me-2026',
 // Mã băm SHA-256 của các giá trị mẫu từng xuất hiện công khai — coi như KHÔNG bí mật
 const KNOWN_PUBLIC_SECRET_HASHES = new Set([
   '4054e3ab738be4a1e26ce88d728935bd3f5c3640c9957d906f32933e4313da12',
@@ -30,7 +25,6 @@ function isKnownSampleSecret(val: string): boolean {
  */
 export function ensureJwtSecret(): void {
   const fromEnv = (process.env.JWT_SECRET || '').trim();
-  if (fromEnv.length >= MIN_SECRET_LENGTH && !KNOWN_PUBLIC_SECRETS.has(fromEnv)) {
   if (fromEnv.length >= MIN_SECRET_LENGTH && !isKnownSampleSecret(fromEnv)) {
     return;
   }
