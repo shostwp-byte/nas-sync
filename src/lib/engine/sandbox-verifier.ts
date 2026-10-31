@@ -45,20 +45,19 @@ function streamDumpIntoMariaDb(
 
     const ext = path.extname(dumpFilePath).toLowerCase();
     const decompCmd =
-      ext === '.zst'
-        ? `zstd -dc "${dumpFilePath}"`
-        : ext === '.gz'
-        ? `gzip -dc "${dumpFilePath}"`
-        : `cat "${dumpFilePath}"`;
+      ext === '.zst' ? 'zstd -dc' : ext === '.gz' ? 'gzip -dc' : 'cat';
 
-    const fullShell = `set -o pipefail; ${decompCmd} | mariadb -h "${host}" -P "${port}" -u "${user}" -p'${pass.replace(
-      /'/g,
-      `'\\''`
-    )}' "${tempDbName}"`;
+    // Truyền đường dẫn & thông số qua tham số vị trí ($1..$6) thay vì nội suy vào chuỗi bash:
+    // tên file dump lấy từ tên DB trên VPS (không tin cậy).
+    const fullShell = `set -o pipefail; ${decompCmd} -- "$1" | mariadb -h "$2" -P "$3" -u "$4" -p"$5" "$6"`;
 
-    const child = spawn('bash', ['-c', fullShell], {
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
+    const child = spawn(
+      'bash',
+      ['-c', fullShell, 'sandbox-verify', dumpFilePath, host, port, user, pass, tempDbName],
+      {
+        stdio: ['ignore', 'pipe', 'pipe'],
+      }
+    );
 
     let stderr = '';
     child.stderr.on('data', (d: Buffer) => {

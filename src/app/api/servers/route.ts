@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getDb } from '@/lib/db';
+import { validateServerConnectionFields } from '@/lib/engine/safe-names';
 
 export async function GET() {
   const servers = getDb()
@@ -37,6 +38,11 @@ export async function POST(req: NextRequest) {
         { error: 'Hostname và địa chỉ IP máy chủ VPS là bắt buộc.' },
         { status: 400 }
       );
+    }
+
+    const invalidField = validateServerConnectionFields({ hostname, ipAddress, sshUser });
+    if (invalidField) {
+      return NextResponse.json({ error: invalidField }, { status: 400 });
     }
 
     const db = getDb();

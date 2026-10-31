@@ -9,8 +9,12 @@ export interface SessionPayload {
 }
 
 function getJwtSecret(): Uint8Array {
-  const secret =
-    process.env.JWT_SECRET || 'shost-backup-enterprise-secret-change-me-2026';
+  // Không có giá trị mặc định cứng: server.ts gọi ensureJwtSecret() lúc khởi động.
+  // Thiếu secret thì từ chối ký/xác thực (fail-closed) thay vì dùng khóa công khai.
+  const secret = process.env.JWT_SECRET;
+  if (!secret) {
+    throw new Error('JWT_SECRET chưa được cấu hình.');
+  }
   return new TextEncoder().encode(secret);
 }
 

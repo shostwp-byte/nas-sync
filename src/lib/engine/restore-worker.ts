@@ -21,6 +21,13 @@ import type {
 } from '@/types';
 import { getPanelAdapter } from './adapters';
 import { buildMysqlAuthFlags } from './adapters/base';
+import {
+  assertSafe,
+  isSafeDbName,
+  isSafeDomain,
+  isSafeSystemUser,
+  isSafeWebroot,
+} from './safe-names';
 
 function pushFilesViaRsync(params: {
   targetServer: ServerRecord;
@@ -94,24 +101,28 @@ function streamRestoreDatabaseOverSsh(params: {
   return new Promise((resolve, reject) => {
     const ext = path.extname(dumpFilePath).toLowerCase();
     const decompCmd =
-      ext === '.zst'
-        ? `zstdcat "${dumpFilePath}"`
-        : ext === '.gz'
-        ? `gzip -dc "${dumpFilePath}"`
-        : `cat "${dumpFilePath}"`;
+      ext === '.zst' ? 'zstdcat' : ext === '.gz' ? 'gzip -dc' : 'cat';
 
-    const sshArgs = buildSshBaseArgs(targetServer)
-      .map((a) => (a.includes(' ') ? `"${a}"` : a))
-      .join(' ');
+    // Không nội suy đường dẫn / tham số ssh vào chuỗi bash cục bộ: truyền qua "$@".
+    // Lệnh phía VPS là 1 tham số duy nhất, tên DB được single-quote cho shell từ xa.
+    const remoteMysqlCmd = `mysql ${authFlags} ${shellSingleQuote(targetDbName)}`;
+    const pipeline = `set -o pipefail; dump="$1"; shift; ${decompCmd} -- "$dump" | ssh "$@"`;
 
-    const remoteMysqlCmd = `mysql ${authFlags} "${targetDbName}"`;
-    const pipeline = `set -o pipefail; ${decompCmd} | ssh ${sshArgs} ${
-      targetServer.ssh_user || 'root'
-    }@${targetServer.ip_address} ${shellSingleQuote(remoteMysqlCmd)}`;
-
-    const child = spawn('bash', ['-c', pipeline], {
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
+    const child = spawn(
+      'bash',
+      [
+        '-c',
+        pipeline,
+        'restore-db',
+        dumpFilePath,
+        ...buildSshBaseArgs(targetServer),
+        `${targetServer.ssh_user || 'root'}@${targetServer.ip_address}`,
+        remoteMysqlCmd,
+      ],
+      {
+        stdio: ['ignore', 'pipe', 'pipe'],
+      }
+    );
 
     let stderr = '';
     child.stderr.on('data', (d: Buffer) => {
@@ -218,17 +229,30 @@ export async function executeRestoreJob(jobId: number): Promise<void> {
   emitJobUpdated(jobId);
 
   try {
-    const targetDomain = (payload.targetDomainName || item.domain_name).trim();
-    const targetUser = (payload.targetSystemUser || item.system_user).trim();
+    const targetDomain = assertSafe(
+      isSafeDomain,
+      (payload.targetDomainName || item.domain_name).trim(),
+      'Tên miền đích'
+    );
+    const targetUser = assertSafe(
+      isSafeSystemUser,
+      (payload.targetSystemUser || item.system_user).trim(),
+      'User hệ thống đích'
+    );
+    assertSafe(isSafeDomain, item.domain_name, 'Tên miền nguồn trong bản sao lưu');
     const targetAdapter = getPanelAdapter(targetServer);
 
-    const resolvedWebroot =
+    // Webroot đích nhận rsync --delete và chown -R với quyền root: chặn "/", "/home", ".."...
+    const resolvedWebroot = assertSafe(
+      (v) => isSafeWebroot(v.replace(/\/+$/, '')),
       payload.targetWebrootOverride?.trim() ||
-      (await targetAdapter.resolveTargetWebroot(
-        targetServer,
-        targetUser,
-        targetDomain
-      ));
+        (await targetAdapter.resolveTargetWebroot(
+          targetServer,
+          targetUser,
+          targetDomain
+        )),
+      'Webroot đích'
+    );
 
     const sourceDomainDir = path.join(
       sourceVolume.mount_path,
@@ -353,8 +377,11 @@ export async function executeRestoreJob(jobId: number): Promise<void> {
 
         for (let i = 0; i < dbsToRestore.length; i++) {
           const dbInfo = dbsToRestore[i];
-          const targetDbName =
-            payload.targetDbMap?.[dbInfo.name]?.trim() || dbInfo.name;
+          const targetDbName = assertSafe(
+            isSafeDbName,
+            payload.targetDbMap?.[dbInfo.name]?.trim() || dbInfo.name,
+            'Tên database đích'
+          );
           const dumpPath = path.join(localDatabasesDir, dbInfo.file);
 
           if (!fs.existsSync(dumpPath)) {

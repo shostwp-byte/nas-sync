@@ -37,6 +37,14 @@ export async function POST(req: NextRequest) {
       }
       const safeName = name.replace(/[^a-zA-Z0-9_-]/g, '_');
       const privPath = path.join(getSshKeysDir(), safeName);
+      // SSH_KEYS_DIR là /root/.ssh trong container — không cho ghi đè file sẵn có
+      // (authorized_keys, known_hosts, config, khóa đang dùng cho máy chủ khác...)
+      if (fs.existsSync(privPath)) {
+        return NextResponse.json(
+          { error: `Đã tồn tại file "${safeName}" trong thư mục SSH Keys. Vui lòng chọn tên khác.` },
+          { status: 400 }
+        );
+      }
       fs.writeFileSync(privPath, privateKeyContent + '\n', { mode: 0o600 });
       if (publicKeyContent) {
         fs.writeFileSync(`${privPath}.pub`, publicKeyContent + '\n', {
