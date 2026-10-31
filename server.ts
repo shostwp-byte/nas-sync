@@ -42,7 +42,7 @@ async function bootstrap() {
   // Khởi tạo Database SQLite & kiểm tra Volume ban đầu
   getDb();
   await refreshAllVolumes().catch((err) => {
-    console.warn('[SHOST Startup] Cảnh báo kiểm tra Volume:', err);
+    console.warn('[NAS-Sync Startup] Cảnh báo kiểm tra Volume:', err);
   });
 
   const httpServer = createServer((req, res) => {
@@ -82,7 +82,7 @@ async function bootstrap() {
       `==================================================================`
     );
     console.log(
-      `🚀 SHOST Backup Platform sẵn sàng tại: http://localhost:${port}`
+      `🚀 NAS-Sync Platform sẵn sàng tại: http://localhost:${port}`
     );
     console.log(
       `📡 WebSocket Real-time Progress: ws://localhost:${port}/socket.io`
@@ -94,6 +94,6 @@ async function bootstrap() {
 }
 
 bootstrap().catch((err) => {
-  console.error('[SHOST Fatal] Lỗi khởi động hệ thống:', err);
+  console.error('[NAS-Sync Fatal] Lỗi khởi động hệ thống:', err);
   process.exit(1);
 });

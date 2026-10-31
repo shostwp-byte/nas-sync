@@ -8,31 +8,31 @@ import type {
 
 declare global {
   // eslint-disable-next-line no-var
-  var __shostEventBus: EventEmitter | undefined;
+  var __nasSyncEventBus: EventEmitter | undefined;
   // eslint-disable-next-line no-var
-  var __shostIo: SocketIOServer | undefined;
+  var __nasSyncIo: SocketIOServer | undefined;
 }
 
 export function getEventBus(): EventEmitter {
-  if (!globalThis.__shostEventBus) {
+  if (!globalThis.__nasSyncEventBus) {
     const bus = new EventEmitter();
     bus.setMaxListeners(100);
-    globalThis.__shostEventBus = bus;
+    globalThis.__nasSyncEventBus = bus;
   }
-  return globalThis.__shostEventBus;
+  return globalThis.__nasSyncEventBus;
 }
 
 export function attachSocketIO(io: SocketIOServer) {
-  globalThis.__shostIo = io;
+  globalThis.__nasSyncIo = io;
 }
 
 export function getSocketIO(): SocketIOServer | undefined {
-  return globalThis.__shostIo;
+  return globalThis.__nasSyncIo;
 }
 
 export function emitJobProgress(payload: ProgressEventPayload) {
   getEventBus().emit('job:progress', payload);
-  globalThis.__shostIo?.emit('job:progress', payload);
+  globalThis.__nasSyncIo?.emit('job:progress', payload);
 }
 
 export function emitJobLog(data: {
@@ -43,26 +43,25 @@ export function emitJobLog(data: {
   timestamp: string;
 }) {
   getEventBus().emit('job:log', data);
-  globalThis.__shostIo?.emit('job:log', data);
+  globalThis.__nasSyncIo?.emit('job:log', data);
 }
 
 export function emitJobUpdated(jobId: number) {
   getEventBus().emit('job:updated', { jobId });
-  globalThis.__shostIo?.emit('job:updated', { jobId });
+  globalThis.__nasSyncIo?.emit('job:updated', { jobId });
 }
 
 export function emitVolumeUpdated() {
   getEventBus().emit('volume:updated', {});
-  globalThis.__shostIo?.emit('volume:updated', {});
+  globalThis.__nasSyncIo?.emit('volume:updated', {});
 }
 
 export function emitNewAlert(alert: SystemAlert) {
   getEventBus().emit('alert:new', alert);
-  globalThis.__shostIo?.emit('alert:new', alert);
+  globalThis.__nasSyncIo?.emit('alert:new', alert);
 }
 
 export function emitSystemUpdateProgress(payload: UpdateProgressEvent) {
   getEventBus().emit('system:update_progress', payload);
-  globalThis.__shostIo?.emit('system:update_progress', payload);
+  globalThis.__nasSyncIo?.emit('system:update_progress', payload);
 }
-

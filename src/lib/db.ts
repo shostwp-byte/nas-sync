@@ -16,7 +16,7 @@ export interface SqliteDatabase {
 
 declare global {
   // eslint-disable-next-line no-var
-  var __shostDb: SqliteDatabase | undefined;
+  var __nasSyncDb: SqliteDatabase | undefined;
 }
 
 export function getDataDir(): string {
@@ -38,19 +38,43 @@ export function getSshKeysDir(): string {
 export function getDbFilePath(): string {
   const dir = getDataDir();
   const preferred = path.join(dir, 'nas-sync.db');
-  const legacy = path.join(dir, 'shost-backup.db');
   if (fs.existsSync(preferred)) {
     return preferred;
   }
-  if (fs.existsSync(legacy)) {
-    return legacy;
+
+  // Tự động phát hiện và chuẩn hóa tên file CSDL thế hệ cũ (nếu có) sang nas-sync.db
+  try {
+    const legacyFile = fs
+      .readdirSync(dir)
+      .find(
+        (f) =>
+          f.endsWith('.db') &&
+          !f.startsWith('nas-sync') &&
+          !f.includes('.bak')
+      );
+    if (legacyFile) {
+      const legacyPath = path.join(dir, legacyFile);
+      try {
+        for (const ext of ['', '-wal', '-shm']) {
+          if (fs.existsSync(legacyPath + ext)) {
+            fs.renameSync(legacyPath + ext, preferred + ext);
+          }
+        }
+        return preferred;
+      } catch {
+        return legacyPath;
+      }
+    }
+  } catch {
+    // Bỏ qua nếu chưa đọc được thư mục
   }
+
   return preferred;
 }
 
 export function getDb(): SqliteDatabase {
-  if (globalThis.__shostDb) {
-    return globalThis.__shostDb;
+  if (globalThis.__nasSyncDb) {
+    return globalThis.__nasSyncDb;
   }
 
   const sqliteModule = (
@@ -72,7 +96,7 @@ export function getDb(): SqliteDatabase {
   initializeSchema(db);
   seedDefaults(db);
 
-  globalThis.__shostDb = db;
+  globalThis.__nasSyncDb = db;
   return db;
 }
 
@@ -327,7 +351,7 @@ function seedDefaults(db: SqliteDatabase) {
     smtp_port: process.env.SMTP_PORT || '587',
     smtp_user: process.env.SMTP_USER || '',
     smtp_pass: process.env.SMTP_PASS || '',
-    smtp_from: process.env.SMTP_FROM || 'backup@shost.vn',
+    smtp_from: process.env.SMTP_FROM || 'noreply@example.com',
     alert_email_to: process.env.ALERT_EMAIL_TO || '',
     anomaly_max_changed_percent: '50',
     anomaly_max_delta_gb: '10',
@@ -361,7 +385,7 @@ function seedDefaults(db: SqliteDatabase) {
     );
 
     const s1 = insServer.run(
-      'vps-da01.shost.vn',
+      'vps-da01.example.com',
       '103.221.220.101',
       2222,
       'DIRECTADMIN',
@@ -370,7 +394,7 @@ function seedDefaults(db: SqliteDatabase) {
       'Máy chủ Hosting DirectAdmin mẫu (Chế độ Demo mô phỏng để chạy thử trên Windows)'
     );
     const s2 = insServer.run(
-      'vps-cp02.shost.vn',
+      'vps-cp02.example.com',
       '103.221.220.102',
       22,
       'CPANEL',
@@ -379,7 +403,7 @@ function seedDefaults(db: SqliteDatabase) {
       'Máy chủ Hosting cPanel mẫu (Chế độ Demo mô phỏng)'
     );
     insServer.run(
-      'vps-plesk03.shost.vn',
+      'vps-plesk03.example.com',
       '103.221.220.103',
       22,
       'PLESK',
@@ -388,7 +412,7 @@ function seedDefaults(db: SqliteDatabase) {
       'Máy chủ Plesk Obsidian mẫu (Hỗ trợ test Cross-Panel Restore)'
     );
     insServer.run(
-      'vps-aa04.shost.vn',
+      'vps-aa04.example.com',
       '103.221.220.104',
       22,
       'AAPANEL',

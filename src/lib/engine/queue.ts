@@ -34,12 +34,12 @@ interface EngineState {
 
 declare global {
   // eslint-disable-next-line no-var
-  var __shostQueueEngine: EngineState | undefined;
+  var __nasSyncQueueEngine: EngineState | undefined;
 }
 
 function getEngineState(): EngineState {
-  if (!globalThis.__shostQueueEngine) {
-    globalThis.__shostQueueEngine = {
+  if (!globalThis.__nasSyncQueueEngine) {
+    globalThis.__nasSyncQueueEngine = {
       initialized: false,
       mode: 'LOCAL_MEMORY',
       redisUrl: null,
@@ -49,7 +49,7 @@ function getEngineState(): EngineState {
       localMaxConcurrency: 3,
     };
   }
-  return globalThis.__shostQueueEngine;
+  return globalThis.__nasSyncQueueEngine;
 }
 
 /**
@@ -192,12 +192,12 @@ export async function initializeQueueAndScheduler(): Promise<{
       maxRetriesPerRequest: null,
     });
 
-    state.bullQueue = new Queue<QueuedTaskPayload>('shost-backup-jobs', {
+    state.bullQueue = new Queue<QueuedTaskPayload>('nas-sync-backup-jobs', {
       connection,
       defaultJobOptions: {
         attempts: 10,
         backoff: {
-          type: 'shost-exponential',
+          type: 'nas-sync-exponential',
         },
         removeOnComplete: 200,
         removeOnFail: 200,
@@ -209,7 +209,7 @@ export async function initializeQueueAndScheduler(): Promise<{
     });
 
     state.bullWorker = new Worker<QueuedTaskPayload>(
-      'shost-backup-jobs',
+      'nas-sync-backup-jobs',
       async (bullJob) => {
         await processJobPayload(bullJob.data);
       },
@@ -225,11 +225,11 @@ export async function initializeQueueAndScheduler(): Promise<{
 
     state.mode = 'BULLMQ_REDIS';
     state.redisUrl = redisUrl;
-    console.log(`[SHOST Engine] Hàng đợi BullMQ đã kết nối Redis (${redisUrl})`);
+    console.log(`[NAS-Sync Engine] Hàng đợi BullMQ đã kết nối Redis (${redisUrl})`);
   } else {
     state.mode = 'LOCAL_MEMORY';
     console.log(
-      `[SHOST Engine] Chạy ở chế độ Local Queue Engine (Tương thích chạy trực tiếp không cần Redis)`
+      `[NAS-Sync Engine] Chạy ở chế độ Local Queue Engine (Tương thích chạy trực tiếp không cần Redis)`
     );
   }
 
@@ -351,7 +351,7 @@ export async function dispatchExistingJob(
 
   if (state.mode === 'BULLMQ_REDIS' && state.bullQueue) {
     await state.bullQueue.add(`job-${jobId}`, payload, {
-      jobId: `shost-job-${jobId}-${Date.now()}`,
+      jobId: `nas-sync-job-${jobId}-${Date.now()}`,
     });
   } else {
     state.localPending.push(payload);

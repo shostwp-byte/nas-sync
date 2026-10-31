@@ -620,7 +620,7 @@ export default function SettingsPage() {
               <input
                 value={settings.alert_email_to || ''}
                 onChange={(e) => updateField('alert_email_to', e.target.value)}
-                placeholder="noc@shost.vn"
+                placeholder="admin@example.com"
                 className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white"
               />
             </div>
@@ -806,7 +806,7 @@ export default function SettingsPage() {
               maxLength={32}
               value={newUsername}
               onChange={(e) => setNewUsername(e.target.value)}
-              placeholder="VD: dungtran"
+              placeholder="VD: sysadmin"
               className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white font-mono"
             />
           </div>

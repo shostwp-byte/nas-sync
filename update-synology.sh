@@ -20,7 +20,7 @@ fi
 # 1. Sao lưu an toàn CSDL SQLite hiện tại
 mkdir -p ./app_data/db_backups
 STAMP=$(date +%Y%m%d_%H%M%S)
-for dbf in ./app_data/nas-sync.db ./app_data/shost-backup.db; do
+for dbf in ./app_data/*.db; do
   if [ -f "$dbf" ]; then
     cp -f "$dbf" "./app_data/db_backups/$(basename "$dbf").bak_$STAMP"
     echo "✅ Đã sao lưu an toàn CSDL tại ./app_data/db_backups/$(basename "$dbf").bak_$STAMP"

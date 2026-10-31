@@ -1,6 +1,6 @@
 import { SignJWT, jwtVerify } from 'jose';
 
-export const SESSION_COOKIE_NAME = 'shost_session';
+export const SESSION_COOKIE_NAME = 'nas_sync_session';
 
 export interface SessionPayload {
   userId: number;

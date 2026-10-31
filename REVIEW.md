@@ -82,3 +82,4 @@ quyền root trên các VPS đó, nên một lỗ hổng ở đây là chiếm q
 - Các route API trả thẳng `err.message` cho client, có thể lộ đường dẫn nội bộ. Nên log chi tiết ở server và trả thông báo chung.
 - `Dockerfile` dùng `npm install` thay vì `npm ci` và copy cả `devDependencies` vào image runtime.
 - Tên "SHOST" và "NAS-Sync" lẫn lộn trong log, tên cookie và biến global.
+- [Đã chuẩn hóa tại v1.1.5] Đồng bộ hoàn toàn tên định danh hệ thống, log, tên cookie phiên và biến global sang chuẩn `NAS-Sync` / `nas_sync`.

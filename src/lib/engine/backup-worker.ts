@@ -490,7 +490,7 @@ async function simulateMockDomainSync(params: {
   fs.mkdirSync(destDatabasesDir, { recursive: true });
 
   const staticFiles: Record<string, string> = {
-    '.htaccess': `# BEGIN SHOST Optimized Rewrite\nRewriteEngine On\nRewriteBase /\nRewriteCond %{REQUEST_FILENAME} !-f\nRewriteCond %{REQUEST_FILENAME} !-d\nRewriteRule . /index.php [L]\n# END Rewrite\n`,
+    '.htaccess': `# BEGIN NAS-Sync Optimized Rewrite\nRewriteEngine On\nRewriteBase /\nRewriteCond %{REQUEST_FILENAME} !-f\nRewriteCond %{REQUEST_FILENAME} !-d\nRewriteRule . /index.php [L]\n# END Rewrite\n`,
     'assets/style.css': `/* Theme stylesheet for ${domainInfo.domain} */\nbody { font-family: system-ui, sans-serif; margin: 0; background: #f8fafc; color: #0f172a; }\n.container { max-width: 1200px; margin: 0 auto; padding: 2rem; }\n`,
     'includes/bootstrap.php': `<?php\n// Core bootstrapper for ${domainInfo.domain}\ndefine('APP_ENV', 'production');\ndefine('PANEL_ORIGIN', '${server.panel_type}');\ndefine('SYS_USER', '${domainInfo.systemUser}');\n`,
     'robots.txt': `User-agent: *\nAllow: /\nSitemap: https://${domainInfo.domain}/sitemap.xml\n`,
@@ -505,7 +505,7 @@ async function simulateMockDomainSync(params: {
       domainInfo.databases[0]?.name || 'app_db'
     }');\ndefine('DB_USER', '${
       domainInfo.databases[0]?.user || domainInfo.systemUser
-    }');\ndefine('DB_HOST', 'localhost');\ndefine('WP_CACHE', true);\ndefine('SHOST_LAST_SYNC', '${new Date().toISOString()}');\n`,
+    }');\ndefine('DB_HOST', 'localhost');\ndefine('WP_CACHE', true);\ndefine('NAS_SYNC_LAST_RUN', '${new Date().toISOString()}');\n`,
   };
 
   let filesTotal = 0;
@@ -572,7 +572,7 @@ async function simulateMockDomainSync(params: {
   // Tạo file dump SQL nén chuẩn .sql.gz hợp lệ
   const dbResults: DatabaseBackupInfo[] = [];
   for (const dbItem of domainInfo.databases) {
-    const sqlContent = `-- SHOST Backup Platform SQL Stream Dump
+    const sqlContent = `-- NAS-Sync SQL Stream Dump
 -- Host: ${server.hostname}    Database: ${dbItem.name}
 -- Panel: ${server.panel_type}    Snapshot: ${snapshotName}
 SET NAMES utf8mb4;
