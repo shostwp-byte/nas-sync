@@ -2,6 +2,15 @@
 
 Mọi thay đổi đáng chú ý của dự án **NAS-Sync** (<https://github.com/shostwp-byte/nas-sync>) đều được ghi nhận tại tài liệu này theo chuẩn [Keep a Changelog](https://keepachangelog.com/vi/1.1.0/) và [Semantic Versioning](https://semver.org/).
 
+## [1.1.5] - 2026-10-31
+
+### Security & Changed
+- **Hợp nhất bản vá bảo mật từ PR #1 (`19e6269`)**:
+  - Tự sinh khóa `JWT_SECRET` ngẫu nhiên lưu bền vững tại `app_data/.jwt_secret`, xác thực phiên cho Socket.IO Realtime và giới hạn dò mật khẩu đăng nhập (`HTTP 429`).
+  - Kiểm duyệt chặt tên Domain, System User, Database, Hostname/IP chống Shell Injection & Path Traversal; bảo vệ Symlink trong File Explorer và tải file lớn bằng Stream.
+- **Chuẩn hóa toàn diện định danh `NAS-Sync` / `nas_sync` trên toàn bộ mã nguồn**:
+  - Đồng bộ 100% tên Cookie phiên (`nas_sync_session`), tên hàng đợi BullMQ (`nas-sync-backup-jobs`), biến global runtime, khóa SSH tạm, phiên Synology DSM WORM API (`NasSyncWORM`), dữ liệu mô phỏng Demo, `package-lock.json` và toàn bộ chuỗi hiển thị trên giao diện/log sang `NAS-Sync` (tự động đổi tên file CSDL thế hệ cũ sang `nas-sync.db` không mất dữ liệu).
+
 ## [1.1.4] - 2026-10-31
 
 ### Added & Improved

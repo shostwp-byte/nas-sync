@@ -417,7 +417,7 @@ export default function ServersPage() {
                     onChange={(e) =>
                       setForm({ ...form, hostname: e.target.value })
                     }
-                    placeholder="vps01.shost.vn"
+                    placeholder="vps01.example.com"
                     className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white"
                   />
                 </div>
@@ -610,7 +610,7 @@ export default function ServersPage() {
                 required
                 value={keyName}
                 onChange={(e) => setKeyName(e.target.value)}
-                placeholder="Tên file key (VD: shost_nas_ed25519)"
+                placeholder="Tên file key (VD: nas_sync_ed25519)"
                 className="flex-1 bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-white font-mono"
               />
               <select

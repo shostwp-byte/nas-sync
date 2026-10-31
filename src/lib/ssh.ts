@@ -65,7 +65,7 @@ function resolveServerKeyPath(server: ServerRecord): string | null {
 
     // Nếu thư mục bind-mount trên Synology Btrfs dính Windows ACL (0777 hoặc UID 1026),
     // sao chép sang tmpfs nội bộ container với chuẩn quyền 0600 để OpenSSH không từ chối key
-    const safeDir = path.join(os.tmpdir(), '.shost_ssh_keys');
+    const safeDir = path.join(os.tmpdir(), '.nas_sync_ssh_keys');
     fs.mkdirSync(safeDir, { recursive: true, mode: 0o700 });
     fs.chmodSync(safeDir, 0o700);
     const stagedPath = path.join(safeDir, path.basename(candidate));
@@ -266,8 +266,8 @@ export async function generateSshKeyPair(
 
   const args =
     keyType === 'rsa'
-      ? ['-t', 'rsa', '-b', '4096', '-N', '', '-C', `shost-backup-${safeName}`, '-f', privateKeyPath]
-      : ['-t', 'ed25519', '-N', '', '-C', `shost-backup-${safeName}`, '-f', privateKeyPath];
+      ? ['-t', 'rsa', '-b', '4096', '-N', '', '-C', `nas-sync-${safeName}`, '-f', privateKeyPath]
+      : ['-t', 'ed25519', '-N', '', '-C', `nas-sync-${safeName}`, '-f', privateKeyPath];
 
   const res = await execLocalCommand('ssh-keygen', args, 20000);
   if (res.code !== 0) {

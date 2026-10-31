@@ -159,10 +159,14 @@ for (const emptyDir of ['app_data', 'ssh_keys']) {
 
 fs.mkdirSync(releaseDir, { recursive: true });
 
-// Xóa gói tên cũ nếu còn tồn tại
-for (const legacyName of ['shost-backup-synology.zip', 'shost-backup-synology.tar.gz']) {
-  const lp = path.join(releaseDir, legacyName);
-  if (fs.existsSync(lp)) fs.unlinkSync(lp);
+// Dọn các gói nén tên cũ nếu còn tồn tại trong thư mục release/
+for (const entry of fs.readdirSync(releaseDir)) {
+  if (
+    (entry.endsWith('.zip') || entry.endsWith('.tar.gz')) &&
+    !entry.startsWith('nas-sync-synology')
+  ) {
+    fs.unlinkSync(path.join(releaseDir, entry));
+  }
 }
 
 const zipOut = path.join(releaseDir, 'nas-sync-synology.zip');

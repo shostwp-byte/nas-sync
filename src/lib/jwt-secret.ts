@@ -3,14 +3,19 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { getDataDir } from './db';
 
-// Các giá trị mẫu từng được phát hành công khai trong repo — coi như KHÔNG bí mật
-const KNOWN_PUBLIC_SECRETS = new Set([
-  'nas-sync-open-source-change-this-secret-2026',
-  'please-change-this-to-a-random-64-character-secret-string',
-  'shost-backup-enterprise-secret-change-me-2026',
+// Mã băm SHA-256 của các giá trị mẫu từng xuất hiện công khai — coi như KHÔNG bí mật
+const KNOWN_PUBLIC_SECRET_HASHES = new Set([
+  '4054e3ab738be4a1e26ce88d728935bd3f5c3640c9957d906f32933e4313da12',
+  '34feeb78b750604b4f6bbc9954e038c3943545c3824168651feda8f992b16fe5',
+  '5c6ec3c115c735a80c4095a35864bf437975792c4d264e7db1b9681e92a15791',
 ]);
 
 const MIN_SECRET_LENGTH = 32;
+
+function isKnownSampleSecret(val: string): boolean {
+  const digest = crypto.createHash('sha256').update(val).digest('hex');
+  return KNOWN_PUBLIC_SECRET_HASHES.has(digest);
+}
 
 /**
  * Đảm bảo process.env.JWT_SECRET là chuỗi bí mật mạnh trước khi Next.js khởi động.
@@ -20,7 +25,7 @@ const MIN_SECRET_LENGTH = 32;
  */
 export function ensureJwtSecret(): void {
   const fromEnv = (process.env.JWT_SECRET || '').trim();
-  if (fromEnv.length >= MIN_SECRET_LENGTH && !KNOWN_PUBLIC_SECRETS.has(fromEnv)) {
+  if (fromEnv.length >= MIN_SECRET_LENGTH && !isKnownSampleSecret(fromEnv)) {
     return;
   }
 

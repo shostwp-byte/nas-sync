@@ -4,7 +4,7 @@ import { getQueueRuntimeInfo } from '@/lib/engine/queue';
 export async function GET() {
   return NextResponse.json({
     ok: true,
-    service: 'SHOST Backup Platform',
+    service: 'NAS-Sync',
     timestamp: new Date().toISOString(),
     queue: getQueueRuntimeInfo(),
   });

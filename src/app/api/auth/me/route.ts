@@ -96,8 +96,7 @@ export async function PATCH(req: NextRequest) {
     if (!isMatch) {
       return NextResponse.json(
         {
-          error:
-            'Mật khẩu hiện tại không đúng. (Lưu ý: Nếu nâng cấp từ v1.0.0 và chưa từng đổi mật khẩu, mật khẩu gốc là "shost@2026").',
+          error: 'Mật khẩu hiện tại không đúng. Vui lòng kiểm tra lại.',
         },
         { status: 400 }
       );

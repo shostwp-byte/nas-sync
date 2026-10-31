@@ -123,7 +123,7 @@ export default function DashboardPage() {
             • {data?.runtime.activeSchedulesCount || 0} lịch Cron đang bật
           </div>
           <h2 className="text-lg font-bold text-white">
-            Trung tâm Giám sát Sao lưu Tập trung SHOST
+            Trung tâm Giám sát Sao lưu Tập trung NAS-Sync
           </h2>
           <p className="text-xs text-slate-400 mt-0.5">
             Tự động hóa Incremental Hard-Link, Stream nén SQL qua SSH không tốn ổ cứng VPS & Tự động chuyển Volume khi đầy.
@@ -459,7 +459,7 @@ export default function DashboardPage() {
           <div className="flex-1 bg-slate-950 border border-slate-800 rounded-xl p-3.5 font-mono text-xs h-56 overflow-y-auto space-y-1">
             {liveLogs.length === 0 ? (
               <div className="text-slate-600">
-                shost-worker@synology-nas:~$ Đang lắng nghe luồng sự kiện thời gian thực từ Worker...
+                nas-sync-worker@synology-nas:~$ Đang lắng nghe luồng sự kiện thời gian thực từ Worker...
               </div>
             ) : (
               liveLogs.map((item, i) => (

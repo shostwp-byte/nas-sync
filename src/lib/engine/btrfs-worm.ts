@@ -56,7 +56,7 @@ export async function triggerSynologyBtrfsImmutableSnapshot(
       method: 'login',
       account: username,
       passwd: password,
-      session: 'ShostBackupWORM',
+      session: 'NasSyncWORM',
       format: 'sid',
     });
 
@@ -86,7 +86,7 @@ export async function triggerSynologyBtrfsImmutableSnapshot(
           version: '2',
           method: 'create',
           name: share,
-          desc: `SHOST Backup Auto Immutable WORM (${retentionDays}d)`,
+          desc: `NAS-Sync Auto Immutable WORM (${retentionDays}d)`,
           is_locked: 'true',
           immutable: 'true',
           immutable_days: String(retentionDays),
@@ -116,7 +116,7 @@ export async function triggerSynologyBtrfsImmutableSnapshot(
         api: 'SYNO.API.Auth',
         version: '6',
         method: 'logout',
-        session: 'ShostBackupWORM',
+        session: 'NasSyncWORM',
         _sid: sid,
       });
       await fetch(`${dsmUrl}/webapi/auth.cgi?${logoutParams.toString()}`).catch(

@@ -1,7 +1,7 @@
 # 🛡️ NAS-Sync — Open-Source Agentless Multi-Panel Backup Platform for Synology NAS
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-emerald.svg)](https://github.com/shostwp-byte/nas-sync/blob/main/LICENSE)
-[![Version](https://img.shields.io/badge/version-1.1.0-blue.svg)](https://github.com/shostwp-byte/nas-sync/releases)
+[![Version](https://img.shields.io/badge/version-1.1.5-blue.svg)](https://github.com/shostwp-byte/nas-sync/releases)
 [![Node.js](https://img.shields.io/badge/Node.js-24%20Alpine-339933.svg)](https://nodejs.org/)
 [![Docker](https://img.shields.io/badge/Synology-Container%20Manager-2496ED.svg)](https://www.synology.com/)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/shostwp-byte/nas-sync/pulls)
