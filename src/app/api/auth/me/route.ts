@@ -3,6 +3,7 @@ import {
   SESSION_COOKIE_NAME,
   getCurrentSession,
   hashPassword,
+  sessionCookieOptions,
   signSessionToken,
   verifyPassword,
 } from '@/lib/auth';
@@ -177,12 +178,7 @@ export async function PATCH(req: NextRequest) {
       message: `✅ Đã cập nhật thành công (${changedParts.join(' & ')})!`,
     });
 
-    res.cookies.set(SESSION_COOKIE_NAME, freshToken, {
-      httpOnly: true,
-      sameSite: 'lax',
-      path: '/',
-      maxAge: 7 * 24 * 3600,
-    });
+    res.cookies.set(SESSION_COOKIE_NAME, freshToken, sessionCookieOptions(req));
 
     return res;
   } catch (err) {

@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { Readable } from 'node:stream';
 import { NextRequest, NextResponse } from 'next/server';
 import {
   resolveSafeSnapshotRoot,
@@ -29,17 +30,20 @@ export async function GET(req: NextRequest) {
       );
     }
 
-    const fileBuf = fs.readFileSync(fullPath);
+    const { size } = fs.statSync(fullPath);
     const fileName = path.basename(fullPath);
+    // Stream thay vì readFileSync: file backup (SQL dump, archive) có thể nhiều GB — đọc
+    // toàn bộ vào RAM sẽ làm sập tiến trình Node trên NAS (Buffer tối đa ~2-4 GB).
+    const body = Readable.toWeb(fs.createReadStream(fullPath)) as ReadableStream<Uint8Array>;
 
-    return new NextResponse(fileBuf, {
+    return new NextResponse(body, {
       status: 200,
       headers: {
         'Content-Type': 'application/octet-stream',
-        'Content-Disposition': `attachment; filename="${encodeURIComponent(
+        'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(
           fileName
-        )}"`,
-        'Content-Length': String(fileBuf.length),
+        )}`,
+        'Content-Length': String(size),
       },
     });
   } catch (err) {
@@ -49,4 +53,3 @@ export async function GET(req: NextRequest) {
     );
   }
 }
-
