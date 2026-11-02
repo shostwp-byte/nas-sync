@@ -22,8 +22,8 @@ export class CyberPanelAdapter implements PanelAdapter {
         P=$(tr -d '\\r\\n' < /etc/cyberpanel/mysqlPassword)
         printf "CYBER|%s\\n" "$P"
       elif [ -f /root/.my.cnf ]; then
-        U=$(grep -E '^user\\s*=' /root/.my.cnf | head -n1 | cut -d= -f2- | tr -d ' "'\''')
-        P=$(grep -E '^password\\s*=' /root/.my.cnf | head -n1 | cut -d= -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+        U=$(grep -E '^user[[:space:]]*=' /root/.my.cnf | head -n1 | cut -d= -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+        P=$(grep -E '^password[[:space:]]*=' /root/.my.cnf | head -n1 | cut -d= -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
         printf "MYCNF|%s|%s\\n" "\${U:-root}" "$P"
       else
         echo "ERR_NO_CRED"

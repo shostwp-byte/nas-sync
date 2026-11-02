@@ -1,6 +1,6 @@
 {
   "name": "nas-sync",
-  "version": "1.5.5",
+  "version": "1.5.6",
   "private": false,
   "license": "MIT",
   "description": "Open-Source Agentless Multi-Panel VPS Backup & Cross-Panel Migration Platform for Synology NAS (DirectAdmin, cPanel, Plesk, aaPanel)",

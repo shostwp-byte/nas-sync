@@ -216,12 +216,19 @@ export async function streamRestorePostgresOverSsh(params: {
       )
     : '';
 
+  const checkAndCreateDbCmd = `psql -tc ${shellSingleQuote(
+    `SELECT 1 FROM pg_database WHERE datname = '${safeTargetDb}'`
+  )} | grep -q 1 || createdb ${shellSingleQuote(safeTargetDb)}`;
+  const grantRoleCmd = safeTargetUser
+    ? `psql -tc ${shellSingleQuote(
+        `SELECT 1 FROM pg_roles WHERE rolname = '${safeTargetUser}'`
+      )} | grep -q 1 && psql -c ${shellSingleQuote(
+        `GRANT ALL PRIVILEGES ON DATABASE "${safeTargetDb}" TO "${safeTargetUser}";`
+      )} || true`
+    : '';
   const ensureScript = safeTargetUser
-    ? `
-      su - postgres -c "psql -tc \\"SELECT 1 FROM pg_database WHERE datname = '${safeTargetDb}'\\" | grep -q 1 || createdb '${safeTargetDb}'"
-      su - postgres -c "psql -tc \\"SELECT 1 FROM pg_roles WHERE rolname = '${safeTargetUser}'\\" | grep -q 1 && psql -c \\"GRANT ALL PRIVILEGES ON DATABASE \\\\\\"${safeTargetDb}\\\\\\" TO \\\\\\"${safeTargetUser}\\\\\\";\\" || true"
-    `
-    : `su - postgres -c "psql -tc \\"SELECT 1 FROM pg_database WHERE datname = '${safeTargetDb}'\\" | grep -q 1 || createdb '${safeTargetDb}'"`;
+    ? `su - postgres -c ${shellSingleQuote(checkAndCreateDbCmd)}\nsu - postgres -c ${shellSingleQuote(grantRoleCmd)}`
+    : `su - postgres -c ${shellSingleQuote(checkAndCreateDbCmd)}`;
 
   const ensureRes = await execRemoteSSH(targetServer, ensureScript, {
     zeroImpact: true,

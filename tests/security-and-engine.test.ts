@@ -36,6 +36,7 @@ import {
   validateServerConnectionFields,
 } from '@/lib/engine/safe-names';
 import { getPanelAdapter } from '@/lib/engine/adapters';
+import { verifyRemoteWebrootSafety } from '@/lib/engine/adapters/base';
 import { executeBackupJob } from '@/lib/engine/backup-worker';
 import { syncExtendedHostingExtras } from '@/lib/engine/extended-hosting-backup';
 import {
@@ -57,6 +58,8 @@ import {
   computeOpenSshKeyFingerprint,
   ensureServerHostKeyPinned,
   materializeServerKnownHostsFile,
+  setSshInterceptorForTests,
+  wrapZeroImpact,
 } from '@/lib/ssh';
 import {
   buildOtpAuthUrl,
@@ -1195,6 +1198,333 @@ describe('7. v1.5.0 Offsite AES-256-GCM Crypto, Cloud SigV4/GDrive JWT, New Pane
     } finally {
       setSettings({ offsite_provider: 'NONE' });
       await new Promise<void>((resolve) => mockS3Server.close(() => resolve()));
+    }
+  });
+});
+
+describe('8. v1.5.6 POSIX sh -n syntax validation across all 7 live Panel Adapters & wrapZeroImpact single-run safety', () => {
+  it('validates every emitted SSH script across all 7 live adapters with POSIX sh -n and ensures wrapZeroImpact never double-runs failing commands', async () => {
+    const { execFileSync, spawnSync } = await import('node:child_process');
+    const shCandidates =
+      process.platform === 'win32'
+        ? [
+            'C:\\Program Files\\Git\\bin\\sh.exe',
+            'C:\\Program Files\\Git\\usr\\bin\\sh.exe',
+            'sh',
+          ]
+        : ['/bin/sh', 'sh'];
+
+    const shBin = shCandidates.find((cand) => {
+      try {
+        const res = spawnSync(cand, ['-c', 'exit 0'], { stdio: 'ignore' });
+        return res.status === 0;
+      } catch {
+        return false;
+      }
+    });
+    assert.ok(shBin, 'POSIX sh binary must be available to validate remote SSH scripts');
+
+    const assertValidPosixSh = (script: string, label: string) => {
+      try {
+        execFileSync(shBin, ['-n'], {
+          input: script,
+          encoding: 'utf8',
+          stdio: ['pipe', 'pipe', 'pipe'],
+        });
+      } catch (err) {
+        const stderr = String((err as { stderr?: string }).stderr || (err as Error).message);
+        assert.fail(`POSIX sh -n failed for [${label}]: ${stderr}\n--- SCRIPT ---\n${script}`);
+      }
+    };
+
+    // 1. Xác nhận `sh -n` thực sự bắt được lỗi ngoặc đơn như sự cố DirectAdmin trước đây
+    const brokenRegressionSample =
+      'ALL_PG_DBS=$(su - postgres -c "psql -Atc "SELECT datname FROM pg_database WHERE datname NOT IN (\'postgres\')"")';
+    const brokenCheck = spawnSync(shBin, ['-n'], {
+      input: brokenRegressionSample,
+      encoding: 'utf8',
+    });
+    assert.notEqual(
+      brokenCheck.status,
+      0,
+      'sh -n must reject unescaped inner double-quotes around parentheses'
+    );
+
+    // 2. Xác nhận wrapZeroImpact chỉ chạy câu lệnh thất bại ĐÚNG 1 LẦN (không lặp 2 lần do && ... || ...)
+    const wrappedFail = wrapZeroImpact('printf "FAIL_ONCE_MARKER\\n" >&2; exit 2');
+    assertValidPosixSh(wrappedFail, 'wrapZeroImpact(fail)');
+    const failRun = spawnSync(shBin, ['-c', wrappedFail], { encoding: 'utf8' });
+    assert.equal(failRun.status, 2);
+    const markerMatches = (failRun.stderr || '').match(/FAIL_ONCE_MARKER/g) || [];
+    assert.equal(
+      markerMatches.length,
+      1,
+      `Expected failing command inside wrapZeroImpact to execute once, got ${markerMatches.length}: ${failRun.stderr}`
+    );
+
+    // 3. Chặn bắt mọi lệnh execRemoteSSH sinh ra từ cả 7 Production Panel Adapters (is_mock = 0) và kiểm định bằng `sh -n`
+    const capturedCountByPanel: Record<string, number> = {};
+    const allPanels = [
+      'DIRECTADMIN',
+      'CPANEL',
+      'PLESK',
+      'AAPANEL',
+      'CYBERPANEL',
+      'HESTIACP',
+      'CLOUDPANEL',
+    ] as const;
+
+    try {
+      for (const panel of allPanels) {
+        capturedCountByPanel[panel] = 0;
+        const liveServer: ServerRecord = {
+          id: 500,
+          hostname: `live-${panel.toLowerCase()}.example.com`,
+          ip_address: '103.221.220.99',
+          ssh_port: 22,
+          ssh_user: 'root',
+          ssh_key_path: '',
+          panel_type: panel,
+          assigned_volume_id: null,
+          bw_limit_kbps: 0,
+          status: 'ONLINE',
+          is_mock: 0,
+          last_connected_at: null,
+          notes: '',
+          created_at: new Date().toISOString(),
+        };
+
+        setSshInterceptorForTests((srv, remoteCommand, finalCmd) => {
+          capturedCountByPanel[srv.panel_type] =
+            (capturedCountByPanel[srv.panel_type] || 0) + 1;
+          assertValidPosixSh(remoteCommand, `${srv.panel_type}:remoteCommand`);
+          assertValidPosixSh(finalCmd, `${srv.panel_type}:finalCmd`);
+
+          if (remoteCommand.includes('MUST_EXIST=')) {
+            return {
+              code: 0,
+              stdout: 'OK|/home/testuser/domains/portal.vn/public_html\n',
+              stderr: '',
+            };
+          }
+
+          switch (srv.panel_type) {
+            case 'DIRECTADMIN':
+              if (remoteCommand.includes('/usr/local/directadmin/conf/mysql.conf') && !remoteCommand.includes('USERDBS|')) {
+                return { code: 0, stdout: 'da_admin\ns3cr3t_da\n', stderr: '' };
+              }
+              if (remoteCommand.includes('USERDBS|')) {
+                return {
+                  code: 0,
+                  stdout: [
+                    'USERDBS|dauser|dauser_wp,dauser_crm',
+                    'USERPGDBS|dauser|dauser_pg',
+                    'ROW|portal.vn|dauser|/home/dauser/domains/portal.vn/public_html|PHP-Select-1|0||dauser_wp',
+                    'ROW|sub.portal.vn|dauser|/home/dauser/domains/sub.portal.vn/public_html|PHP-Select-1|1|portal.vn|',
+                  ].join('\n'),
+                  stderr: '',
+                };
+              }
+              return {
+                code: 0,
+                stdout: '/home/dauser/domains/portal.vn/public_html\n',
+                stderr: '',
+              };
+
+            case 'CPANEL':
+              if (remoteCommand.includes('ERR_NO_MYCNF')) {
+                return { code: 0, stdout: 'OK|root|cpanel_pw\n', stderr: '' };
+              }
+              if (remoteCommand.includes('USERDBS|')) {
+                return {
+                  code: 0,
+                  stdout: [
+                    'USERDBS|cpuser|cpuser_shop',
+                    'USERPGDBS|cpuser|cpuser_pg',
+                    'ROW|shop.vn|cpuser|/home/cpuser/public_html|ea-php82|0||cpuser_shop',
+                  ].join('\n'),
+                  stderr: '',
+                };
+              }
+              return { code: 0, stdout: '/home/cpuser/public_html\n', stderr: '' };
+
+            case 'PLESK':
+              if (remoteCommand.includes('cat /etc/psa/.psa.shadow')) {
+                return { code: 0, stdout: '$AES-128-CBC$plesk_pw\n', stderr: '' };
+              }
+              if (remoteCommand.includes('SET SESSION group_concat_max_len')) {
+                return {
+                  code: 0,
+                  stdout:
+                    'plesk.vn\tpleskusr\t/var/www/vhosts/plesk.vn/httpdocs\tplesk-php82\t0\t\tplesk_db:mysql,plesk_pg:postgresql\n',
+                  stderr: '',
+                };
+              }
+              return {
+                code: 0,
+                stdout: '/var/www/vhosts/plesk.vn/httpdocs\n',
+                stderr: '',
+              };
+
+            case 'AAPANEL':
+              if (remoteCommand.includes('SELECT mysql_root FROM config')) {
+                return { code: 0, stdout: 'aa_pw\n', stderr: '' };
+              }
+              if (remoteCommand.includes('SELECT id, name, path FROM sites')) {
+                return {
+                  code: 0,
+                  stdout: JSON.stringify([
+                    {
+                      domain: 'aa.vn',
+                      systemUser: 'www',
+                      webroot: '/www/wwwroot/aa.vn',
+                      phpVersion: 'aaPanel-PHP',
+                      isSubdomain: false,
+                      databases: [{ name: 'aa_db', user: 'aa_db' }],
+                    },
+                  ]),
+                  stderr: '',
+                };
+              }
+              return { code: 0, stdout: '/www/wwwroot/aa.vn\n', stderr: '' };
+
+            case 'CYBERPANEL':
+              if (remoteCommand.includes('ERR_NO_CRED')) {
+                return { code: 0, stdout: 'MYCNF|root|cyber_pw\n', stderr: '' };
+              }
+              if (remoteCommand.includes('websiteFunctions_websites')) {
+                return {
+                  code: 0,
+                  stdout:
+                    'MAIN\t1\tcyber.vn\tcyberusr\t/home/cyber.vn/public_html\tPHP 8.2\t\tcyber_db:cyber_u\n',
+                  stderr: '',
+                };
+              }
+              return { code: 0, stdout: '/home/cyber.vn/public_html\n', stderr: '' };
+
+            case 'HESTIACP':
+              if (remoteCommand.includes('ERR_NO_CONF')) {
+                return { code: 0, stdout: 'HESTIA|root|hestia_pw\n', stderr: '' };
+              }
+              if (remoteCommand.includes('parse_hestia_conf')) {
+                return {
+                  code: 0,
+                  stdout: JSON.stringify([
+                    {
+                      domain: 'hestia.vn',
+                      systemUser: 'huser',
+                      webroot: '/home/huser/web/hestia.vn/public_html',
+                      phpVersion: 'PHP-8_2',
+                      isSubdomain: false,
+                      databases: [
+                        { name: 'huser_db', user: 'huser', engine: 'MYSQL' },
+                      ],
+                    },
+                  ]),
+                  stderr: '',
+                };
+              }
+              return {
+                code: 0,
+                stdout: '/home/huser/web/hestia.vn/public_html\n',
+                stderr: '',
+              };
+
+            case 'CLOUDPANEL':
+              if (remoteCommand.includes('ERR_NO_MYSQL_AUTH')) {
+                return { code: 0, stdout: 'MODE_ROOT_CNF\n', stderr: '' };
+              }
+              if (remoteCommand.includes('ERR_NO_CLP_DB')) {
+                return {
+                  code: 0,
+                  stdout: JSON.stringify([
+                    {
+                      domain: 'cloud.vn',
+                      systemUser: 'clpuser',
+                      webroot: '/home/clpuser/htdocs/cloud.vn',
+                      phpVersion: 'CloudPanel PHP 8.3',
+                      isSubdomain: false,
+                      databases: [
+                        { name: 'clp_db', user: 'clp_u', engine: 'MYSQL' },
+                      ],
+                    },
+                  ]),
+                  stderr: '',
+                };
+              }
+              return {
+                code: 0,
+                stdout: '/home/clpuser/htdocs/cloud.vn\n',
+                stderr: '',
+              };
+          }
+        });
+
+        const adapter = getPanelAdapter(liveServer);
+        const creds = await adapter.getMysqlAdminCredentials(liveServer);
+        assert.ok(creds.user.length > 0);
+        if (creds.remoteAuthPrelude) {
+          assertValidPosixSh(
+            creds.remoteAuthPrelude,
+            `${panel}:remoteAuthPrelude`
+          );
+        }
+
+        const discovered = await adapter.discoverDomains(liveServer);
+        assert.ok(
+          discovered.length >= 1,
+          `Expected ${panel} live adapter discovery to parse >= 1 domain`
+        );
+
+        if (panel === 'DIRECTADMIN') {
+          const primary = discovered.find((d) => d.domain === 'portal.vn')!;
+          assert.ok(primary);
+          // Phải gộp đủ cả DB khớp wp-config (dauser_wp), DB chưa khớp (dauser_crm) và PostgreSQL (dauser_pg)
+          assert.deepEqual(
+            primary.databases.map((d) => `${d.name}:${d.engine || 'MYSQL'}`),
+            ['dauser_wp:MYSQL', 'dauser_crm:MYSQL', 'dauser_pg:POSTGRESQL']
+          );
+        }
+
+        if (panel === 'CPANEL') {
+          const primary = discovered.find((d) => d.domain === 'shop.vn')!;
+          assert.ok(primary);
+          assert.deepEqual(
+            primary.databases.map((d) => `${d.name}:${d.engine || 'MYSQL'}`),
+            ['cpuser_shop:MYSQL', 'cpuser_pg:POSTGRESQL']
+          );
+        }
+
+        const resolvedWebroot = await adapter.resolveTargetWebroot(
+          liveServer,
+          'testuser',
+          'portal.vn'
+        );
+        assert.ok(resolvedWebroot.startsWith('/'));
+
+        const permCmd = adapter.buildPermissionFixCommand(
+          'testuser',
+          'portal.vn',
+          resolvedWebroot
+        );
+        assertValidPosixSh(permCmd, `${panel}:buildPermissionFixCommand`);
+
+        const jailRes = await verifyRemoteWebrootSafety(
+          liveServer,
+          panel,
+          'testuser',
+          '/home/testuser/domains/portal.vn/public_html',
+          { mustExist: true }
+        );
+        assert.equal(jailRes.ok, true);
+
+        assert.ok(
+          capturedCountByPanel[panel] >= 4,
+          `Expected >= 4 SSH scripts captured & validated for ${panel}`
+        );
+      }
+    } finally {
+      setSshInterceptorForTests(null);
     }
   });
 });

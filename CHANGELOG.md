@@ -2,6 +2,15 @@
 
 Mọi thay đổi đáng chú ý của dự án **NAS-Sync** (<https://github.com/shostwp-byte/nas-sync>) đều được ghi nhận tại tài liệu này theo chuẩn [Keep a Changelog](https://keepachangelog.com/vi/1.1.0/) và [Semantic Versioning](https://semver.org/).
 
+## [1.5.6] - 2026-11-03
+
+### Fixed
+- **Khắc phục lỗi cú pháp Shell POSIX (`sh: 6: Syntax error: "(" unexpected`) khi quét Domain/Database trên DirectAdmin, cPanel & CyberPanel (`directadmin.ts`, `cpanel.ts`, `cyberpanel.ts`, `postgres-streamer.ts`, `ssh.ts`)**:
+  - Sửa lỗi thoát chuỗi `\"` bên trong template literal của TypeScript ở lệnh truy vấn danh sách PostgreSQL (`ALL_PG_DBS=...`) trên `DirectAdminAdapter` và `CPanelAdapter` — chuyển toàn bộ sang cơ chế đóng gói một chiều `shellSingleQuote(...)` chuẩn POSIX `sh` (`dash` / `bash`), loại bỏ hoàn toàn lồng ngoặc kép phức tạp.
+  - Chuẩn hóa bộ lọc `sed` đọc thông tin `/root/.my.cnf` trên `CPanelAdapter` và `CyberPanelAdapter`, tránh lỗi thoát dấu nháy đơn trong template literal.
+  - Cải tiến hàm bọc `wrapZeroImpact` trong `src/lib/ssh.ts` sang cấu trúc điều kiện `if ...; then ...; else ...; fi` kèm kiểm tra quyền `ionice -c 2 -n 7 true`, đảm bảo câu lệnh từ xa chỉ thực thi đúng 1 lần duy nhất thay vì chạy lặp lần thứ hai khi trả về mã lỗi khác `0`.
+  - Bổ sung bộ kiểm thử hồi quy tự động chạy `sh -n` kiểm tra cú pháp POSIX Shell cho toàn bộ script SSH sinh ra bởi cả 7 Control Panel Adapter trong `tests/security-and-engine.test.ts`.
+
 ## [1.5.5] - 2026-11-02
 
 ### Changed

@@ -22,9 +22,8 @@ export const MOCK_HOST_KEY_FINGERPRINT =
  * Nếu hệ điều hành VPS container (OpenVZ/LXC) không có ionice thì tự động fallback sang nice -n 19.
  */
 export function wrapZeroImpact(remoteCommand: string): string {
-  return `(command -v ionice >/dev/null 2>&1 && ionice -c 2 -n 7 nice -n 19 sh -c ${shellSingleQuote(
-    remoteCommand
-  )} || nice -n 19 sh -c ${shellSingleQuote(remoteCommand)})`;
+  const quoted = shellSingleQuote(remoteCommand);
+  return `if command -v ionice >/dev/null 2>&1 && ionice -c 2 -n 7 true 2>/dev/null; then ionice -c 2 -n 7 nice -n 19 sh -c ${quoted}; else nice -n 19 sh -c ${quoted}; fi`;
 }
 
 export function shellSingleQuote(str: string): string {
@@ -713,6 +712,20 @@ export function execLocalCommand(
   });
 }
 
+export type SshCommandInterceptor = (
+  server: ServerRecord,
+  remoteCommand: string,
+  finalCmd: string
+) => Promise<CommandResult> | CommandResult;
+
+let testSshInterceptor: SshCommandInterceptor | null = null;
+
+export function setSshInterceptorForTests(
+  interceptor: SshCommandInterceptor | null
+): void {
+  testSshInterceptor = interceptor;
+}
+
 export async function execRemoteSSH(
   server: ServerRecord,
   remoteCommand: string,
@@ -734,6 +747,10 @@ export async function execRemoteSSH(
   const finalCmd = options.zeroImpact
     ? wrapZeroImpact(remoteCommand)
     : remoteCommand;
+
+  if (testSshInterceptor) {
+    return await testSshInterceptor(server, remoteCommand, finalCmd);
+  }
 
   const args = [
     ...buildSshBaseArgs(server),

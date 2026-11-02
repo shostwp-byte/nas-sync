@@ -45,13 +45,18 @@ export class DirectAdminAdapter implements PanelAdapter {
   async discoverDomains(server: ServerRecord): Promise<DiscoveredDomain[]> {
     const creds = await this.getMysqlAdminCredentials(server);
     const quotedMysqlUser = shellSingleQuote(creds.user);
+    const pgListCmd = shellSingleQuote(
+      `psql -Atc ${shellSingleQuote(
+        "SELECT datname FROM pg_database WHERE datistemplate = false AND datname <> 'postgres'"
+      )}`
+    );
 
     const script = `
       DA_MYSQL_CONF="/usr/local/directadmin/conf/mysql.conf"
       DA_MYSQL_PWD=$(grep -E '^passwd=' "$DA_MYSQL_CONF" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d '\\r\\n')
       ALL_DBS=$(MYSQL_PWD="$DA_MYSQL_PWD" mysql -u ${quotedMysqlUser} -N -B -e "SHOW DATABASES;" 2>/dev/null | grep -Ev '^(information_schema|performance_schema|mysql|sys)$' || true)
       unset DA_MYSQL_PWD
-      ALL_PG_DBS=$(command -v psql >/dev/null 2>&1 && su - postgres -c "psql -Atc \"SELECT datname FROM pg_database WHERE datistemplate = false AND datname NOT IN ('postgres')\"" 2>/dev/null || true)
+      ALL_PG_DBS=$(command -v psql >/dev/null 2>&1 && su - postgres -c ${pgListCmd} 2>/dev/null || true)
       DA_SUB_IN_DOMAINS=$(grep -E '^(create_subdomain_docroot_in_domains_dir|subdomain_docroot_in_domains_dir)=1' /usr/local/directadmin/conf/directadmin.conf 2>/dev/null | head -n1 || true)
 
       detect_dbs_in_webroot() {
@@ -84,8 +89,8 @@ $(head -n 120 "$cf" 2>/dev/null || true)"
         [ -f "$dlist" ] || continue
         user_dir=$(dirname "$dlist")
         sys_user=$(basename "$user_dir")
-        user_dbs=$(printf "%s\\n" "$ALL_DBS" | grep -E "^$\{sys_user}_" | paste -sd "," - || true)
-        user_pg_dbs=$(printf "%s\\n" "$ALL_PG_DBS" | grep -E "^$\{sys_user}_" | paste -sd "," - || true)
+        user_dbs=$(printf "%s\\n" "$ALL_DBS" | grep -E "^\${sys_user}_" | paste -sd "," - || true)
+        user_pg_dbs=$(printf "%s\\n" "$ALL_PG_DBS" | grep -E "^\${sys_user}_" | paste -sd "," - || true)
         printf "USERDBS|%s|%s\\n" "$sys_user" "$user_dbs"
         [ -n "$user_pg_dbs" ] && printf "USERPGDBS|%s|%s\\n" "$sys_user" "$user_pg_dbs"
 
@@ -118,12 +123,12 @@ $(head -n 120 "$cf" 2>/dev/null || true)"
             while IFS= read -r sub || [ -n "$sub" ]; do
               sub=$(printf "%s" "$sub" | tr -d '\\r\\n ')
               [ -z "$sub" ] && continue
-              full_sub="$\{sub}.$\{dom}"
+              full_sub="\${sub}.\${dom}"
               sub_webroot=""
               sub_php="$php_ver"
 
               if [ -f "$ov_file" ]; then
-                ov_line=$(grep -E "^$\{sub}=" "$ov_file" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d '\\r\\n' || true)
+                ov_line=$(grep -E "^\${sub}=" "$ov_file" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d '\\r\\n' || true)
                 if [ -n "$ov_line" ]; then
                   pub_raw=$(printf "%s" "$ov_line" | tr '&' '\\n' | grep -E '^public_html=' | head -n1 | cut -d= -f2- || true)
                   p1_raw=$(printf "%s" "$ov_line" | tr '&' '\\n' | grep -E '^php1_select=' | head -n1 | cut -d= -f2- || true)

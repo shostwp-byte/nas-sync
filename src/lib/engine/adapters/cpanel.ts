@@ -19,8 +19,8 @@ export class CPanelAdapter implements PanelAdapter {
   ): Promise<MysqlAdminCredentials> {
     const script = `
       if [ -f /root/.my.cnf ]; then
-        U=$(grep -E '^user\\s*=' /root/.my.cnf | head -n1 | cut -d= -f2- | tr -d ' "'\''')
-        P=$(grep -E '^password\\s*=' /root/.my.cnf | head -n1 | cut -d= -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+        U=$(grep -E '^user[[:space:]]*=' /root/.my.cnf | head -n1 | cut -d= -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+        P=$(grep -E '^password[[:space:]]*=' /root/.my.cnf | head -n1 | cut -d= -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
         printf "OK|%s|%s\\n" "\${U:-root}" "$P"
       else
         echo "ERR_NO_MYCNF"
@@ -50,9 +50,15 @@ export class CPanelAdapter implements PanelAdapter {
   }
 
   async discoverDomains(server: ServerRecord): Promise<DiscoveredDomain[]> {
+    const pgListCmd = shellSingleQuote(
+      `psql -Atc ${shellSingleQuote(
+        "SELECT datname FROM pg_database WHERE datistemplate = false AND datname <> 'postgres'"
+      )}`
+    );
+
     const script = `
       ALL_DBS=$(mysql --defaults-extra-file=/root/.my.cnf -N -B -e "SHOW DATABASES;" 2>/dev/null | grep -Ev '^(information_schema|performance_schema|mysql|sys|cphulkd|eximstats|leechprotect|modsec|roundcube)$' || true)
-      ALL_PG_DBS=$(command -v psql >/dev/null 2>&1 && su - postgres -c "psql -Atc \"SELECT datname FROM pg_database WHERE datistemplate = false AND datname NOT IN ('postgres')\"" 2>/dev/null || true)
+      ALL_PG_DBS=$(command -v psql >/dev/null 2>&1 && su - postgres -c ${pgListCmd} 2>/dev/null || true)
 
       detect_dbs_in_webroot() {
         wroot="$1"
@@ -93,19 +99,19 @@ $(head -n 120 "$cf" 2>/dev/null || true)"
           fallback_doc=$(printf "%s" "$rest" | cut -d= -f9 | tr -d '\\r\\n')
           [ "$dtype" = "parked" ] && continue
 
-          user_dbs=$(printf "%s\\n" "$ALL_DBS" | grep -E "^$\{sys_user}_" | paste -sd "," - || true)
-          user_pg_dbs=$(printf "%s\\n" "$ALL_PG_DBS" | grep -E "^$\{sys_user}_" | paste -sd "," - || true)
+          user_dbs=$(printf "%s\\n" "$ALL_DBS" | grep -E "^\${sys_user}_" | paste -sd "," - || true)
+          user_pg_dbs=$(printf "%s\\n" "$ALL_PG_DBS" | grep -E "^\${sys_user}_" | paste -sd "," - || true)
           case "$SEEN_USERS" in
             *,"$sys_user",*) ;;
             *)
               printf "USERDBS|%s|%s\\n" "$sys_user" "$user_dbs"
               [ -n "$user_pg_dbs" ] && printf "USERPGDBS|%s|%s\\n" "$sys_user" "$user_pg_dbs"
-              SEEN_USERS="$\{SEEN_USERS}$\{sys_user},"
+              SEEN_USERS="\${SEEN_USERS}\${sys_user},"
               ;;
           esac
 
           udata="/var/cpanel/userdata/$sys_user/$dom"
-          webroot="$\{fallback_doc:-/home/$sys_user/public_html}"
+          webroot="\${fallback_doc:-/home/$sys_user/public_html}"
           php_ver="ea-php81"
           if [ -f "$udata" ]; then
             doc=$(grep -E '^documentroot:' "$udata" | head -n1 | awk '{print $2}')
