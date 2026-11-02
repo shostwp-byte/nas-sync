@@ -2,6 +2,13 @@
 
 Mọi thay đổi đáng chú ý của dự án **NAS-Sync** (<https://github.com/shostwp-byte/nas-sync>) đều được ghi nhận tại tài liệu này theo chuẩn [Keep a Changelog](https://keepachangelog.com/vi/1.1.0/) và [Semantic Versioning](https://semver.org/).
 
+## [1.5.3] - 2026-11-02
+
+### Added & Improved
+- **Tách riêng Tab `Cập nhật` trong trang `Cấu hình & Cập nhật` (`src/app/settings/page.tsx`, `src/components/AppShell.tsx`)**:
+  - Đưa toàn bộ mục **Cập nhật Hệ thống Trực tiếp từ GitHub (1-Click Self-Update)** ra khỏi tab cấu hình chung thành tab độc lập **Cập nhật** đặt ở cuối cùng (sau tab **Nhật ký Kiểm toán - Audit Logs**), đồng thời đổi tên tab đầu tiên thành **Cấu hình Hệ thống**.
+  - Hỗ trợ điều hướng trực tiếp qua tham số `?tab=update` và `?tab=account` kèm huy hiệu báo phiên bản mới ngay trên nút tab **Cập nhật**.
+
 ## [1.5.2] - 2026-11-02
 
 ### Added & Improved

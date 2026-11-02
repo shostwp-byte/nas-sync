@@ -333,8 +333,15 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                   </span>
                 ) : (
                   <Link
-                    href="/settings"
-                    onClick={() => setMobileOpen(false)}
+                    href="/settings?tab=account"
+                    onClick={() => {
+                      setMobileOpen(false);
+                      window.dispatchEvent(
+                        new CustomEvent('nas-sync:settings-tab', {
+                          detail: 'account',
+                        })
+                      );
+                    }}
                     title="Nhấn để bật bảo mật 2 lớp (2FA TOTP)"
                     className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-slate-800 hover:bg-amber-500/20 border border-slate-700 hover:border-amber-500/40 text-[10px] font-medium text-slate-300 hover:text-amber-300 transition-colors shrink-0"
                   >
@@ -386,7 +393,14 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             {versionInfo.hasUpdate &&
               (!currentUser || currentUser.role === 'ADMIN') && (
                 <Link
-                  href="/settings"
+                  href="/settings?tab=update"
+                  onClick={() => {
+                    window.dispatchEvent(
+                      new CustomEvent('nas-sync:settings-tab', {
+                        detail: 'update',
+                      })
+                    );
+                  }}
                   className="hidden md:inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium bg-amber-500/15 border border-amber-500/40 text-amber-300 hover:bg-amber-500/25 whitespace-nowrap"
                 >
                   <ArrowUpCircle className="w-3.5 h-3.5 shrink-0" />

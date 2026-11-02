@@ -44,7 +44,7 @@ import type {
   UserRole,
 } from '@/types';
 
-type SettingsTab = 'config' | 'account' | 'rbac' | 'audit';
+type SettingsTab = 'config' | 'account' | 'rbac' | 'audit' | 'update';
 
 const EMERGENCY_DECRYPT_CMD =
   'node scripts/decrypt-offsite-backup.mjs <file.tar.gz.enc> <out.tar.gz> "<passphrase>"';
@@ -428,11 +428,21 @@ export default function SettingsPage() {
     };
   }, [loadTwoFaStatus, loadAdminSettings, loadOffsiteJobs, handleCheckUpdate]);
 
-  // Detect Google Drive OAuth2 callback query params (?gdrive=connected or ?gdrive_error=...)
+  // Detect query params (?tab=update|account|... and Google Drive OAuth2 callback ?gdrive=...)
   useEffect(() => {
     if (typeof window === 'undefined') return;
     setAppOrigin(window.location.origin);
     const params = new URLSearchParams(window.location.search);
+    const tabParam = params.get('tab');
+    if (
+      tabParam === 'config' ||
+      tabParam === 'account' ||
+      tabParam === 'rbac' ||
+      tabParam === 'audit' ||
+      tabParam === 'update'
+    ) {
+      setActiveTab(tabParam);
+    }
     const gdrive = params.get('gdrive');
     const gdriveError = params.get('gdrive_error');
     if (gdrive === 'connected') {
@@ -450,6 +460,17 @@ export default function SettingsPage() {
       setActiveTab('config');
       window.history.replaceState({}, '', window.location.pathname);
     }
+
+    const handleTabEvent = (ev: Event) => {
+      const detail = (ev as CustomEvent<SettingsTab>).detail;
+      if (detail) {
+        setActiveTab(detail);
+      }
+    };
+    window.addEventListener('nas-sync:settings-tab', handleTabEvent);
+    return () => {
+      window.removeEventListener('nas-sync:settings-tab', handleTabEvent);
+    };
   }, []);
 
   // Auto-refresh Offsite sync transfers when realtime events arrive or while an upload is active
@@ -1236,7 +1257,7 @@ export default function SettingsPage() {
           <Settings className="w-5 h-5 text-blue-400 shrink-0" />
           <span>
             {isAdmin
-              ? 'Cấu hình Hệ thống, Bảo mật 2FA, Phân quyền RBAC & Kiểm toán'
+              ? 'Cấu hình Hệ thống, Bảo mật 2FA, Phân quyền RBAC, Kiểm toán & Cập nhật'
               : 'Tài khoản Cá nhân & Bảo mật 2 lớp (2FA TOTP)'}
           </span>
         </h2>
@@ -1259,7 +1280,7 @@ export default function SettingsPage() {
                 : 'text-slate-400 hover:text-white hover:bg-slate-800/70'
             }`}
           >
-            <span>⚙️ Cấu hình &amp; Cập nhật</span>
+            <span>⚙️ Cấu hình Hệ thống</span>
           </button>
         )}
 
@@ -1305,12 +1326,30 @@ export default function SettingsPage() {
             >
               <span>📜 Nhật ký Kiểm toán (Audit Logs)</span>
             </button>
+
+            <button
+              type="button"
+              onClick={() => setActiveTab('update')}
+              className={`flex-1 sm:flex-initial min-h-[42px] px-3.5 py-2 rounded-xl font-semibold inline-flex items-center justify-center gap-1.5 transition-all ${
+                activeTab === 'update'
+                  ? 'bg-blue-600 text-white shadow-lg shadow-blue-600/20'
+                  : 'text-slate-400 hover:text-white hover:bg-slate-800/70'
+              }`}
+            >
+              <ArrowUpCircle className="w-3.5 h-3.5 shrink-0" />
+              <span>Cập nhật</span>
+              {updateInfo?.hasUpdate && (
+                <span className="px-1.5 py-0.5 text-[10px] rounded bg-amber-500/20 text-amber-200 border border-amber-400/30 font-mono">
+                  v{updateInfo.latestVersion}
+                </span>
+              )}
+            </button>
           </>
         )}
       </div>
 
       {/* =====================================================================
-          TAB 1: CẤU HÌNH HỆ THỐNG & CẬP NHẬT GITHUB (ADMIN ONLY)
+          TAB 1: CẤU HÌNH HỆ THỐNG (ADMIN ONLY)
          ===================================================================== */}
       {isAdmin && activeTab === 'config' && (
         <div className="space-y-6">
@@ -1345,210 +1384,6 @@ export default function SettingsPage() {
               {feedback}
             </div>
           )}
-
-          {/* 1-Click GitHub Self-Updater + Prebuilt + Rollback Card */}
-          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-6 space-y-4 text-xs">
-            <div className="flex flex-col xl:flex-row xl:items-center justify-between gap-4">
-              <div className="min-w-0 space-y-1">
-                <div className="flex flex-wrap items-center gap-2">
-                  <h3 className="text-sm font-bold text-white flex items-center gap-2">
-                    <GitBranch className="w-4 h-4 text-emerald-400 shrink-0" />
-                    <span>
-                      Cập nhật Hệ thống Trực tiếp từ GitHub (1-Click Self-Update)
-                    </span>
-                  </h3>
-                  {updateInfo?.prebuiltAvailable && (
-                    <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
-                      ⚡ Hỗ trợ gói Prebuilt SHA-256 (Cập nhật ~5 giây)
-                    </span>
-                  )}
-                </div>
-                <p className="text-slate-400 flex items-center gap-1.5 flex-wrap">
-                  <span>Kho mã nguồn chính thức:</span>
-                  <a
-                    href={
-                      updateInfo?.repoUrl ||
-                      'https://github.com/shostwp-byte/nas-sync'
-                    }
-                    target="_blank"
-                    rel="noreferrer"
-                    className="text-cyan-400 hover:underline inline-flex items-center gap-1 font-mono break-all"
-                  >
-                    github.com/shostwp-byte/nas-sync
-                    <ExternalLink className="w-3 h-3 shrink-0" />
-                  </a>
-                  <span className="text-slate-500">
-                    • Giấy phép MIT (Miễn phí 100%)
-                  </span>
-                </p>
-              </div>
-
-              <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto shrink-0">
-                <button
-                  type="button"
-                  onClick={() => void handleCheckUpdate()}
-                  disabled={checkingUpdate || isUpdatingNow}
-                  className="flex-1 sm:flex-initial justify-center min-h-[40px] whitespace-nowrap inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 disabled:opacity-50 transition-colors"
-                >
-                  <RefreshCw
-                    className={`w-3.5 h-3.5 shrink-0 ${
-                      checkingUpdate ? 'animate-spin' : ''
-                    }`}
-                  />
-                  {checkingUpdate ? 'Đang kiểm tra...' : 'Kiểm tra bản mới'}
-                </button>
-
-                {updateInfo?.canRollback && (
-                  <button
-                    type="button"
-                    onClick={() => void handleStartRollback()}
-                    disabled={isUpdatingNow || !updateInfo.canUpdateNow}
-                    className="flex-1 sm:flex-initial justify-center min-h-[40px] whitespace-nowrap inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-amber-500/15 hover:bg-amber-500 text-amber-300 hover:text-slate-950 border border-amber-500/40 font-semibold disabled:opacity-50 transition-colors"
-                  >
-                    <RotateCcw className="w-3.5 h-3.5 shrink-0" />
-                    <span>
-                      ↩ Quay lại v{updateInfo.rollbackVersion || 'trước'}
-                    </span>
-                  </button>
-                )}
-
-                <button
-                  type="button"
-                  onClick={() => void handleStartGitHubUpdate()}
-                  disabled={
-                    isUpdatingNow ||
-                    (updateInfo !== null && !updateInfo.canUpdateNow)
-                  }
-                  className={`w-full sm:w-auto flex-1 sm:flex-initial justify-center min-h-[40px] inline-flex items-center gap-1.5 px-4 py-2 rounded-lg font-semibold transition-all disabled:opacity-50 ${
-                    updateInfo?.hasUpdate
-                      ? 'bg-emerald-600 hover:bg-emerald-500 text-white shadow-lg shadow-emerald-600/20'
-                      : 'bg-blue-600/20 hover:bg-blue-600 text-blue-300 hover:text-white border border-blue-500/30'
-                  }`}
-                >
-                  <ArrowUpCircle className="w-4 h-4 shrink-0" />
-                  <span>
-                    {isUpdatingNow
-                      ? 'Đang xử lý...'
-                      : updateInfo?.hasUpdate
-                      ? `Cập nhật ngay lên v${updateInfo.latestVersion}`
-                      : 'Đồng bộ lại từ GitHub (main)'}
-                  </span>
-                </button>
-              </div>
-            </div>
-
-            {updateInfo && (
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-3.5 sm:gap-4 pt-2">
-                <div className="p-3.5 rounded-xl bg-slate-950 border border-slate-800">
-                  <div className="text-slate-400">
-                    Phiên bản đang chạy trên NAS
-                  </div>
-                  <div className="text-sm font-bold text-white mt-1 font-mono flex flex-wrap items-center gap-2">
-                    <span>v{updateInfo.currentVersion}</span>
-                    {updateInfo.currentCommit && (
-                      <span className="text-[11px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-300">
-                        #{updateInfo.currentCommit}
-                      </span>
-                    )}
-                  </div>
-                </div>
-
-                <div className="p-3.5 rounded-xl bg-slate-950 border border-slate-800">
-                  <div className="text-slate-400">
-                    Phiên bản mới nhất trên GitHub
-                  </div>
-                  <div className="text-sm font-bold text-cyan-300 mt-1 font-mono flex flex-wrap items-center gap-2">
-                    <span>v{updateInfo.latestVersion}</span>
-                    {updateInfo.latestCommit && (
-                      <span className="text-[11px] px-1.5 py-0.5 rounded bg-cyan-500/15 text-cyan-300">
-                        #{updateInfo.latestCommit}
-                      </span>
-                    )}
-                  </div>
-                </div>
-
-                <div className="p-3.5 rounded-xl bg-slate-950 border border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-                  <div>
-                    <div className="text-slate-400">Trạng thái đồng bộ</div>
-                    {updateInfo.hasUpdate ? (
-                      <div className="text-amber-300 font-semibold mt-1">
-                        🚀 Có bản cập nhật mới sẵn sàng!
-                      </div>
-                    ) : (
-                      <div className="text-emerald-400 font-semibold mt-1 flex items-center gap-1.5">
-                        <CheckCircle2 className="w-4 h-4 shrink-0" />
-                        <span>Đang ở bản mới nhất</span>
-                      </div>
-                    )}
-                  </div>
-                  {updateInfo.latestPublishedAt && (
-                    <div className="text-[11px] text-slate-500 sm:text-right">
-                      Cập nhật cuối:
-                      <br className="hidden sm:inline" />{' '}
-                      {formatDateTime(updateInfo.latestPublishedAt)}
-                    </div>
-                  )}
-                </div>
-              </div>
-            )}
-
-            {updateInfo?.blockingReason && (
-              <div className="p-3 rounded-lg bg-amber-500/15 border border-amber-500/30 text-amber-200 break-words">
-                ⚠️ {updateInfo.blockingReason}
-              </div>
-            )}
-
-            {updateInfo?.changelog && (
-              <div className="p-3.5 rounded-xl bg-slate-950/70 border border-slate-800/80 space-y-1">
-                <div className="text-[11px] font-semibold text-slate-300 break-words">
-                  {updateInfo.releaseTitle ||
-                    'Ghi chú Commit / Phiên bản mới nhất trên GitHub:'}
-                </div>
-                <pre className="text-[11px] text-slate-400 whitespace-pre-wrap break-words font-mono max-h-28 overflow-y-auto">
-                  {updateInfo.changelog}
-                </pre>
-              </div>
-            )}
-
-            {updateProgress && (
-              <div className="p-4 rounded-xl bg-slate-950 border border-blue-500/30 space-y-3">
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <span
-                    className={`font-semibold break-words ${
-                      updateProgress.status === 'FAILED'
-                        ? 'text-rose-400'
-                        : updateProgress.status === 'COMPLETED' ||
-                          updateProgress.status === 'RESTARTING'
-                        ? 'text-emerald-400'
-                        : 'text-blue-300'
-                    }`}
-                  >
-                    {updateProgress.message}
-                  </span>
-                  <span className="font-mono text-slate-300 shrink-0">
-                    {updateProgress.percent}%
-                  </span>
-                </div>
-
-                <div className="w-full h-2 rounded-full bg-slate-800 overflow-hidden">
-                  <div
-                    className={`h-full transition-all duration-300 ${
-                      updateProgress.status === 'FAILED'
-                        ? 'bg-rose-500'
-                        : 'bg-gradient-to-r from-blue-500 to-emerald-400'
-                    }`}
-                    style={{ width: `${Math.max(4, updateProgress.percent)}%` }}
-                  />
-                </div>
-
-                {updateLogs.length > 0 && (
-                  <pre className="p-3 rounded-lg bg-black/70 border border-slate-800 text-[11px] text-slate-300 font-mono max-h-44 overflow-y-auto whitespace-pre-wrap break-words">
-                    {updateLogs.join('\n')}
-                  </pre>
-                )}
-              </div>
-            )}
-          </div>
 
           <form onSubmit={handleSaveSettings} className="space-y-6 text-xs">
             {/* ===============================================================
@@ -4210,6 +4045,214 @@ export default function SettingsPage() {
               </tbody>
             </table>
           </div>
+        </div>
+      )}
+
+      {/* =====================================================================
+          TAB 5: CẬP NHẬT HỆ THỐNG TỪ GITHUB (1-CLICK SELF-UPDATE) — ADMIN ONLY
+         ===================================================================== */}
+      {isAdmin && activeTab === 'update' && (
+        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-6 space-y-4 text-xs">
+          <div className="flex flex-col xl:flex-row xl:items-center justify-between gap-4">
+            <div className="min-w-0 space-y-1">
+              <div className="flex flex-wrap items-center gap-2">
+                <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                  <GitBranch className="w-4 h-4 text-emerald-400 shrink-0" />
+                  <span>
+                    Cập nhật Hệ thống Trực tiếp từ GitHub (1-Click Self-Update)
+                  </span>
+                </h3>
+                {updateInfo?.prebuiltAvailable && (
+                  <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
+                    ⚡ Hỗ trợ gói Prebuilt SHA-256 (Cập nhật ~5 giây)
+                  </span>
+                )}
+              </div>
+              <p className="text-slate-400 flex items-center gap-1.5 flex-wrap">
+                <span>Kho mã nguồn chính thức:</span>
+                <a
+                  href={
+                    updateInfo?.repoUrl ||
+                    'https://github.com/shostwp-byte/nas-sync'
+                  }
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-cyan-400 hover:underline inline-flex items-center gap-1 font-mono break-all"
+                >
+                  github.com/shostwp-byte/nas-sync
+                  <ExternalLink className="w-3 h-3 shrink-0" />
+                </a>
+                <span className="text-slate-500">
+                  • Giấy phép MIT (Miễn phí 100%)
+                </span>
+              </p>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto shrink-0">
+              <button
+                type="button"
+                onClick={() => void handleCheckUpdate()}
+                disabled={checkingUpdate || isUpdatingNow}
+                className="flex-1 sm:flex-initial justify-center min-h-[40px] whitespace-nowrap inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 disabled:opacity-50 transition-colors"
+              >
+                <RefreshCw
+                  className={`w-3.5 h-3.5 shrink-0 ${
+                    checkingUpdate ? 'animate-spin' : ''
+                  }`}
+                />
+                {checkingUpdate ? 'Đang kiểm tra...' : 'Kiểm tra bản mới'}
+              </button>
+
+              {updateInfo?.canRollback && (
+                <button
+                  type="button"
+                  onClick={() => void handleStartRollback()}
+                  disabled={isUpdatingNow || !updateInfo.canUpdateNow}
+                  className="flex-1 sm:flex-initial justify-center min-h-[40px] whitespace-nowrap inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-amber-500/15 hover:bg-amber-500 text-amber-300 hover:text-slate-950 border border-amber-500/40 font-semibold disabled:opacity-50 transition-colors"
+                >
+                  <RotateCcw className="w-3.5 h-3.5 shrink-0" />
+                  <span>
+                    ↩ Quay lại v{updateInfo.rollbackVersion || 'trước'}
+                  </span>
+                </button>
+              )}
+
+              <button
+                type="button"
+                onClick={() => void handleStartGitHubUpdate()}
+                disabled={
+                  isUpdatingNow ||
+                  (updateInfo !== null && !updateInfo.canUpdateNow)
+                }
+                className={`w-full sm:w-auto flex-1 sm:flex-initial justify-center min-h-[40px] inline-flex items-center gap-1.5 px-4 py-2 rounded-lg font-semibold transition-all disabled:opacity-50 ${
+                  updateInfo?.hasUpdate
+                    ? 'bg-emerald-600 hover:bg-emerald-500 text-white shadow-lg shadow-emerald-600/20'
+                    : 'bg-blue-600/20 hover:bg-blue-600 text-blue-300 hover:text-white border border-blue-500/30'
+                }`}
+              >
+                <ArrowUpCircle className="w-4 h-4 shrink-0" />
+                <span>
+                  {isUpdatingNow
+                    ? 'Đang xử lý...'
+                    : updateInfo?.hasUpdate
+                    ? `Cập nhật ngay lên v${updateInfo.latestVersion}`
+                    : 'Đồng bộ lại từ GitHub (main)'}
+                </span>
+              </button>
+            </div>
+          </div>
+
+          {updateInfo && (
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3.5 sm:gap-4 pt-2">
+              <div className="p-3.5 rounded-xl bg-slate-950 border border-slate-800">
+                <div className="text-slate-400">
+                  Phiên bản đang chạy trên NAS
+                </div>
+                <div className="text-sm font-bold text-white mt-1 font-mono flex flex-wrap items-center gap-2">
+                  <span>v{updateInfo.currentVersion}</span>
+                  {updateInfo.currentCommit && (
+                    <span className="text-[11px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-300">
+                      #{updateInfo.currentCommit}
+                    </span>
+                  )}
+                </div>
+              </div>
+
+              <div className="p-3.5 rounded-xl bg-slate-950 border border-slate-800">
+                <div className="text-slate-400">
+                  Phiên bản mới nhất trên GitHub
+                </div>
+                <div className="text-sm font-bold text-cyan-300 mt-1 font-mono flex flex-wrap items-center gap-2">
+                  <span>v{updateInfo.latestVersion}</span>
+                  {updateInfo.latestCommit && (
+                    <span className="text-[11px] px-1.5 py-0.5 rounded bg-cyan-500/15 text-cyan-300">
+                      #{updateInfo.latestCommit}
+                    </span>
+                  )}
+                </div>
+              </div>
+
+              <div className="p-3.5 rounded-xl bg-slate-950 border border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                <div>
+                  <div className="text-slate-400">Trạng thái đồng bộ</div>
+                  {updateInfo.hasUpdate ? (
+                    <div className="text-amber-300 font-semibold mt-1">
+                      🚀 Có bản cập nhật mới sẵn sàng!
+                    </div>
+                  ) : (
+                    <div className="text-emerald-400 font-semibold mt-1 flex items-center gap-1.5">
+                      <CheckCircle2 className="w-4 h-4 shrink-0" />
+                      <span>Đang ở bản mới nhất</span>
+                    </div>
+                  )}
+                </div>
+                {updateInfo.latestPublishedAt && (
+                  <div className="text-[11px] text-slate-500 sm:text-right">
+                    Cập nhật cuối:
+                    <br className="hidden sm:inline" />{' '}
+                    {formatDateTime(updateInfo.latestPublishedAt)}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {updateInfo?.blockingReason && (
+            <div className="p-3 rounded-lg bg-amber-500/15 border border-amber-500/30 text-amber-200 break-words">
+              ⚠️ {updateInfo.blockingReason}
+            </div>
+          )}
+
+          {updateInfo?.changelog && (
+            <div className="p-3.5 rounded-xl bg-slate-950/70 border border-slate-800/80 space-y-1">
+              <div className="text-[11px] font-semibold text-slate-300 break-words">
+                {updateInfo.releaseTitle ||
+                  'Ghi chú Commit / Phiên bản mới nhất trên GitHub:'}
+              </div>
+              <pre className="text-[11px] text-slate-400 whitespace-pre-wrap break-words font-mono max-h-64 overflow-y-auto">
+                {updateInfo.changelog}
+              </pre>
+            </div>
+          )}
+
+          {updateProgress && (
+            <div className="p-4 rounded-xl bg-slate-950 border border-blue-500/30 space-y-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span
+                  className={`font-semibold break-words ${
+                    updateProgress.status === 'FAILED'
+                      ? 'text-rose-400'
+                      : updateProgress.status === 'COMPLETED' ||
+                        updateProgress.status === 'RESTARTING'
+                      ? 'text-emerald-400'
+                      : 'text-blue-300'
+                  }`}
+                >
+                  {updateProgress.message}
+                </span>
+                <span className="font-mono text-slate-300 shrink-0">
+                  {updateProgress.percent}%
+                </span>
+              </div>
+
+              <div className="w-full h-2 rounded-full bg-slate-800 overflow-hidden">
+                <div
+                  className={`h-full transition-all duration-300 ${
+                    updateProgress.status === 'FAILED'
+                      ? 'bg-rose-500'
+                      : 'bg-gradient-to-r from-blue-500 to-emerald-400'
+                  }`}
+                  style={{ width: `${Math.max(4, updateProgress.percent)}%` }}
+                />
+              </div>
+
+              {updateLogs.length > 0 && (
+                <pre className="p-3 rounded-lg bg-black/70 border border-slate-800 text-[11px] text-slate-300 font-mono max-h-56 overflow-y-auto whitespace-pre-wrap break-words">
+                  {updateLogs.join('\n')}
+                </pre>
+              )}
+            </div>
+          )}
         </div>
       )}
     </div>
