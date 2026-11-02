@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import {
   ArrowUpCircle,
   BellRing,
@@ -12,7 +12,6 @@ import {
   ExternalLink,
   Eye,
   EyeOff,
-  FileText,
   Filter,
   GitBranch,
   KeyRound,
@@ -34,7 +33,6 @@ import {
 import { useRealtime } from '@/components/SocketProvider';
 import { formatBytes, formatDateTime, formatEta } from '@/lib/format';
 import type {
-  AuditLogRecord,
   MorningDigestSummary,
   OffsiteProviderType,
   OffsiteSyncJob,
@@ -44,13 +42,7 @@ import type {
   UserRole,
 } from '@/types';
 
-type SettingsTab =
-  | 'config'
-  | 'backup'
-  | 'account'
-  | 'rbac'
-  | 'audit'
-  | 'update';
+type SettingsTab = 'config' | 'backup' | 'account' | 'rbac' | 'update';
 
 const EMERGENCY_DECRYPT_CMD =
   'node scripts/decrypt-offsite-backup.mjs <file.tar.gz.enc> <out.tar.gz> "<passphrase>"';
@@ -102,42 +94,6 @@ function getRoleBadgeClass(role: UserRole): string {
     default:
       return 'bg-blue-500/15 text-blue-300 border-blue-500/30';
   }
-}
-
-function getAuditActionBadgeClass(action: string): string {
-  const upper = (action || '').toUpperCase();
-  if (
-    upper.includes('FAIL') ||
-    upper.includes('DELETE') ||
-    upper.includes('REMOVE') ||
-    upper.includes('DISABLE')
-  ) {
-    return 'bg-rose-500/15 text-rose-300 border-rose-500/30';
-  }
-  if (
-    upper.includes('CREATE') ||
-    upper.includes('ADD') ||
-    upper.includes('ENABLE')
-  ) {
-    return 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30';
-  }
-  if (
-    upper.includes('RESTORE') ||
-    upper.includes('ROLLBACK') ||
-    upper.includes('UPDATE') ||
-    upper.includes('PATCH')
-  ) {
-    return 'bg-amber-500/15 text-amber-300 border-amber-500/30';
-  }
-  if (
-    upper.includes('LOGIN') ||
-    upper.includes('LOGOUT') ||
-    upper.includes('2FA') ||
-    upper.includes('AUTH')
-  ) {
-    return 'bg-cyan-500/15 text-cyan-300 border-cyan-500/30';
-  }
-  return 'bg-blue-500/15 text-blue-300 border-blue-500/30';
 }
 
 function getOffsiteStatusMeta(status: OffsiteSyncStatus | string): {
@@ -301,12 +257,6 @@ export default function SettingsPage() {
   const [resetPassValue, setResetPassValue] = useState('');
   const [resettingPass, setResettingPass] = useState(false);
 
-  // Audit Logs State (Tab 4)
-  const [auditLogs, setAuditLogs] = useState<AuditLogRecord[]>([]);
-  const [auditLoading, setAuditLoading] = useState(false);
-  const [auditQuery, setAuditQuery] = useState('');
-  const [auditActionFilter, setAuditActionFilter] = useState('ALL');
-
   const isAdmin = !currentUser || currentUser.role === 'ADMIN';
 
   const loadTwoFaStatus = useCallback(async () => {
@@ -373,21 +323,6 @@ export default function SettingsPage() {
     }
   }, []);
 
-  const loadAuditLogs = useCallback(async () => {
-    setAuditLoading(true);
-    try {
-      const resp = await fetch('/api/audit-logs?limit=100', {
-        cache: 'no-store',
-      });
-      if (resp.ok) {
-        const json = await resp.json();
-        setAuditLogs(json.logs || []);
-      }
-    } finally {
-      setAuditLoading(false);
-    }
-  }, []);
-
   useEffect(() => {
     let active = true;
     const init = async () => {
@@ -445,7 +380,6 @@ export default function SettingsPage() {
       tabParam === 'backup' ||
       tabParam === 'account' ||
       tabParam === 'rbac' ||
-      tabParam === 'audit' ||
       tabParam === 'update'
     ) {
       setActiveTab(tabParam);
@@ -505,10 +439,8 @@ export default function SettingsPage() {
       void loadOffsiteJobs();
     } else if (activeTab === 'rbac') {
       void loadUsers();
-    } else if (activeTab === 'audit') {
-      void loadAuditLogs();
     }
-  }, [activeTab, currentUser, loadOffsiteJobs, loadUsers, loadAuditLogs]);
+  }, [activeTab, currentUser, loadOffsiteJobs, loadUsers]);
 
   // Tự động kiểm tra dịch vụ và tải lại trình duyệt sau khi container khởi động lại hoàn tất
   useEffect(() => {
@@ -1234,32 +1166,6 @@ export default function SettingsPage() {
     (updateProgress !== null &&
       !['IDLE', 'COMPLETED', 'FAILED'].includes(updateProgress.status));
 
-  const uniqueAuditActions = useMemo(() => {
-    const set = new Set<string>();
-    for (const item of auditLogs) {
-      if (item.action) set.add(item.action);
-    }
-    return Array.from(set).sort();
-  }, [auditLogs]);
-
-  const filteredAuditLogs = useMemo(() => {
-    const q = auditQuery.trim().toLowerCase();
-    return auditLogs.filter((log) => {
-      if (auditActionFilter !== 'ALL' && log.action !== auditActionFilter) {
-        return false;
-      }
-      if (!q) return true;
-      return (
-        (log.username || '').toLowerCase().includes(q) ||
-        (log.action || '').toLowerCase().includes(q) ||
-        (log.resource_type || '').toLowerCase().includes(q) ||
-        (log.resource_id || '').toLowerCase().includes(q) ||
-        (log.detail || '').toLowerCase().includes(q) ||
-        (log.ip_address || '').toLowerCase().includes(q)
-      );
-    });
-  }, [auditLogs, auditActionFilter, auditQuery]);
-
   return (
     <div className="space-y-5 sm:space-y-6 min-w-0">
       <div className="min-w-0">
@@ -1267,13 +1173,13 @@ export default function SettingsPage() {
           <Settings className="w-5 h-5 text-blue-400 shrink-0" />
           <span>
             {isAdmin
-              ? 'Cấu hình Hệ thống, Bảo mật 2FA, Phân quyền RBAC, Kiểm toán & Cập nhật'
+              ? 'Cấu hình Hệ thống, Sao lưu Offsite, Bảo mật 2FA, Phân quyền RBAC & Cập nhật'
               : 'Tài khoản Cá nhân & Bảo mật 2 lớp (2FA TOTP)'}
           </span>
         </h2>
         <p className="text-xs text-slate-400 mt-0.5">
           {isAdmin
-            ? 'Quản lý cập nhật Prebuilt 1-Click từ GitHub (shostwp-byte/nas-sync), Sao lưu Đám mây Offsite chuẩn 3-2-1 (AES-256-GCM), Bộ lọc file toàn cục, Bảo mật 2FA, Phân quyền RBAC và Nhật ký kiểm toán.'
+            ? 'Quản lý cấu hình thông báo & Btrfs WORM, Sao lưu Đám mây Offsite chuẩn 3-2-1 (AES-256-GCM), Bộ lọc file toàn cục, Bảo mật 2FA, Phân quyền RBAC và Cập nhật Prebuilt 1-Click từ GitHub (shostwp-byte/nas-sync).'
             : 'Quản lý mật khẩu đăng nhập và thiết lập xác thực 2 lớp (Google Authenticator / Authy) cho tài khoản của bạn.'}
         </p>
       </div>
@@ -1356,21 +1262,6 @@ export default function SettingsPage() {
               }`}
             >
               <span>👥 Phân quyền Người dùng (RBAC)</span>
-            </button>
-
-            <button
-              type="button"
-              onClick={() => {
-                setFeedback('');
-                setActiveTab('audit');
-              }}
-              className={`flex-1 sm:flex-initial min-h-[42px] px-3.5 py-2 rounded-xl font-semibold inline-flex items-center justify-center gap-1.5 transition-all ${
-                activeTab === 'audit'
-                  ? 'bg-blue-600 text-white shadow-lg shadow-blue-600/20'
-                  : 'text-slate-400 hover:text-white hover:bg-slate-800/70'
-              }`}
-            >
-              <span>📜 Nhật ký Kiểm toán (Audit Logs)</span>
             </button>
 
             <button
@@ -3969,181 +3860,7 @@ export default function SettingsPage() {
       )}
 
       {/* =====================================================================
-          TAB 4: NHẬT KÝ KIỂM TOÁN (AUDIT LOGS) — ADMIN ONLY
-         ===================================================================== */}
-      {isAdmin && activeTab === 'audit' && (
-        <div className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden text-xs">
-          <div className="p-4 sm:p-5 border-b border-slate-800 flex flex-col lg:flex-row lg:items-center justify-between gap-3">
-            <div className="min-w-0">
-              <h3 className="text-sm font-bold text-white flex items-center gap-2">
-                <FileText className="w-4 h-4 text-amber-400 shrink-0" />
-                <span>
-                  Nhật ký Kiểm toán Bảo mật (Audit Logs — 100 sự kiện gần nhất)
-                </span>
-              </h3>
-              <p className="text-[11px] text-slate-400 mt-0.5">
-                Ghi vết đầy đủ tài khoản, hành động, đối tượng tác động và địa
-                chỉ IP thực thi.
-              </p>
-            </div>
-
-            <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 w-full lg:w-auto">
-              <div className="relative flex-1 sm:w-60">
-                <Search className="w-3.5 h-3.5 text-slate-500 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
-                <input
-                  value={auditQuery}
-                  onChange={(e) => setAuditQuery(e.target.value)}
-                  placeholder="Lọc user, hành động, IP..."
-                  className="w-full min-h-[40px] bg-slate-950 border border-slate-700 rounded-lg pl-8 pr-3 py-2 text-white"
-                />
-              </div>
-
-              <select
-                value={auditActionFilter}
-                onChange={(e) => setAuditActionFilter(e.target.value)}
-                className="min-h-[40px] bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-200 font-mono"
-              >
-                <option value="ALL">Tất cả hành động</option>
-                {uniqueAuditActions.map((act) => (
-                  <option key={act} value={act}>
-                    {act}
-                  </option>
-                ))}
-              </select>
-
-              <button
-                type="button"
-                onClick={() => void loadAuditLogs()}
-                disabled={auditLoading}
-                className="min-h-[40px] justify-center inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 whitespace-nowrap transition-colors"
-              >
-                <RefreshCw
-                  className={`w-3.5 h-3.5 shrink-0 ${
-                    auditLoading ? 'animate-spin' : ''
-                  }`}
-                />
-                <span>Làm mới</span>
-              </button>
-            </div>
-          </div>
-
-          {/* Mobile Audit Cards (< md) */}
-          <div className="md:hidden divide-y divide-slate-800">
-            {auditLoading ? (
-              <div className="p-8 text-center text-slate-500">
-                Đang tải nhật ký kiểm toán...
-              </div>
-            ) : filteredAuditLogs.length === 0 ? (
-              <div className="p-8 text-center text-slate-500">
-                Không có bản ghi kiểm toán nào khớp bộ lọc.
-              </div>
-            ) : (
-              filteredAuditLogs.map((log) => (
-                <div key={log.id} className="p-4 space-y-2">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <span
-                      className={`px-2 py-0.5 rounded border font-mono text-[10px] font-bold ${getAuditActionBadgeClass(
-                        log.action
-                      )}`}
-                    >
-                      {log.action}
-                    </span>
-                    <span className="text-[11px] text-slate-500">
-                      {formatDateTime(log.created_at)}
-                    </span>
-                  </div>
-
-                  <div className="flex flex-wrap items-center justify-between gap-2 text-[11px]">
-                    <span className="font-mono font-semibold text-cyan-300 break-all">
-                      👤 {log.username || 'system'}
-                    </span>
-                    <span className="font-mono text-slate-400">
-                      IP: {log.ip_address || '—'}
-                    </span>
-                  </div>
-
-                  {(log.resource_type || log.resource_id) && (
-                    <div className="font-mono text-[11px] text-slate-300 break-all">
-                      Tài nguyên: {log.resource_type}
-                      {log.resource_id ? ` #${log.resource_id}` : ''}
-                    </div>
-                  )}
-
-                  {log.detail && (
-                    <div className="p-2.5 rounded-lg bg-slate-950 border border-slate-800/80 text-slate-300 break-words">
-                      {log.detail}
-                    </div>
-                  )}
-                </div>
-              ))
-            )}
-          </div>
-
-          {/* Desktop Audit Table (>= md) */}
-          <div className="hidden md:block overflow-x-auto">
-            <table className="w-full min-w-[860px] text-left text-xs">
-              <thead className="bg-slate-950/70 text-slate-400 border-b border-slate-800">
-                <tr>
-                  <th className="p-3.5 font-medium">Thời gian</th>
-                  <th className="p-3.5 font-medium">Người dùng</th>
-                  <th className="p-3.5 font-medium">Hành động</th>
-                  <th className="p-3.5 font-medium">Tài nguyên</th>
-                  <th className="p-3.5 font-medium">Chi tiết</th>
-                  <th className="p-3.5 font-medium">Địa chỉ IP</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-800/70">
-                {auditLoading ? (
-                  <tr>
-                    <td colSpan={6} className="p-8 text-center text-slate-500">
-                      Đang tải nhật ký kiểm toán...
-                    </td>
-                  </tr>
-                ) : filteredAuditLogs.length === 0 ? (
-                  <tr>
-                    <td colSpan={6} className="p-8 text-center text-slate-500">
-                      Không có bản ghi kiểm toán nào khớp bộ lọc.
-                    </td>
-                  </tr>
-                ) : (
-                  filteredAuditLogs.map((log) => (
-                    <tr key={log.id} className="hover:bg-slate-800/30">
-                      <td className="p-3.5 whitespace-nowrap text-slate-400">
-                        {formatDateTime(log.created_at)}
-                      </td>
-                      <td className="p-3.5 font-mono font-semibold text-cyan-300 whitespace-nowrap">
-                        {log.username || 'system'}
-                      </td>
-                      <td className="p-3.5 whitespace-nowrap">
-                        <span
-                          className={`px-2 py-0.5 rounded border font-mono text-[10px] font-bold ${getAuditActionBadgeClass(
-                            log.action
-                          )}`}
-                        >
-                          {log.action}
-                        </span>
-                      </td>
-                      <td className="p-3.5 font-mono text-slate-300 whitespace-nowrap">
-                        {log.resource_type || '—'}
-                        {log.resource_id ? ` #${log.resource_id}` : ''}
-                      </td>
-                      <td className="p-3.5 text-slate-300 max-w-md break-words">
-                        {log.detail || '—'}
-                      </td>
-                      <td className="p-3.5 font-mono text-slate-400 whitespace-nowrap">
-                        {log.ip_address || '—'}
-                      </td>
-                    </tr>
-                  ))
-                )}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      )}
-
-      {/* =====================================================================
-          TAB 5: CẬP NHẬT HỆ THỐNG TỪ GITHUB (1-CLICK SELF-UPDATE) — ADMIN ONLY
+          TAB CẬP NHẬT: 1-CLICK GITHUB SELF-UPDATE — ADMIN ONLY
          ===================================================================== */}
       {isAdmin && activeTab === 'update' && (
         <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-6 space-y-4 text-xs">

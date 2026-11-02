@@ -2,6 +2,12 @@
 
 Mọi thay đổi đáng chú ý của dự án **NAS-Sync** (<https://github.com/shostwp-byte/nas-sync>) đều được ghi nhận tại tài liệu này theo chuẩn [Keep a Changelog](https://keepachangelog.com/vi/1.1.0/) và [Semantic Versioning](https://semver.org/).
 
+## [1.5.5] - 2026-11-02
+
+### Changed
+- **Lược bỏ Tab `Nhật ký Kiểm toán (Audit Logs)` trùng lặp trong trang `Cấu hình & Cập nhật` (`src/app/settings/page.tsx`)**:
+  - Gỡ bỏ tab **Nhật ký Kiểm toán (Audit Logs)** tại `/settings` để quy tụ toàn bộ nhật ký sự kiện và kiểm toán bảo mật về một nơi duy nhất tại menu **Nhật ký & Cảnh báo** (`/alerts`), giúp thanh điều hướng của `/settings` gọn gàng còn đúng 5 tab chức năng (`Cấu hình Hệ thống`, `Sao lưu`, `Tài khoản & Bảo mật 2FA`, `Phân quyền Người dùng (RBAC)`, `Cập nhật`).
+
 ## [1.5.4] - 2026-11-02
 
 ### Added & Improved
