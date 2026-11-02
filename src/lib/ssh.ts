@@ -162,6 +162,43 @@ export function getKnownHostsDir(): string {
   return dir;
 }
 
+const SSH_MUX_DIR = '/tmp/.nas_ssh_mux';
+
+const PERMANENT_SSH_ERROR_RE =
+  /Permission denied|REMOTE HOST IDENTIFICATION HAS CHANGED|Host key verification failed|\[SECURITY\]|Bad configuration option|Identity file .* not accessible/i;
+
+const TRANSIENT_SSH_TRANSPORT_RE =
+  /kex_exchange_identification|Connection reset by peer|Connection reset by |Connection closed by |Connection timed out|Operation timed out|Banner exchange|Broken pipe|No route to host|Temporary failure in name resolution|Network is unreachable|Connection refused|mux_client_request_session/i;
+
+export function isTransientSshTransportError(
+  code: number,
+  stderrOrMessage: string
+): boolean {
+  const text = String(stderrOrMessage || '');
+  if (PERMANENT_SSH_ERROR_RE.test(text)) {
+    return false;
+  }
+  if (TRANSIENT_SSH_TRANSPORT_RE.test(text)) {
+    return true;
+  }
+  return code === 255 && text.trim().length > 0;
+}
+
+function getSshControlMuxPath(disableMux?: boolean): string | null {
+  if (disableMux || process.platform === 'win32') {
+    return null;
+  }
+  try {
+    if (!fs.existsSync(SSH_MUX_DIR)) {
+      fs.mkdirSync(SSH_MUX_DIR, { recursive: true, mode: 0o700 });
+    }
+    fs.chmodSync(SSH_MUX_DIR, 0o700);
+    return `${SSH_MUX_DIR}/%C`;
+  } catch {
+    return null;
+  }
+}
+
 export function removeServerKnownHostsCache(serverId: number): void {
   if (!Number.isInteger(serverId) || serverId <= 0) return;
   const fileName = `server_${serverId}.known_hosts`;
@@ -174,6 +211,17 @@ export function removeServerKnownHostsCache(serverId: number): void {
       fs.rmSync(filePath, { force: true });
     } catch {
       // Ignore cleanup errors
+    }
+  }
+  if (process.platform !== 'win32') {
+    try {
+      if (fs.existsSync(SSH_MUX_DIR)) {
+        for (const entry of fs.readdirSync(SSH_MUX_DIR)) {
+          fs.rmSync(path.join(SSH_MUX_DIR, entry), { force: true });
+        }
+      }
+    } catch {
+      // Ignore mux socket cleanup errors
     }
   }
 }
@@ -270,7 +318,8 @@ function assertNotHostKeyMismatch(server: ServerRecord): void {
  */
 export async function ensureServerHostKeyPinned(
   serverId: number,
-  injectedScanStdout?: string
+  injectedScanStdout?: string,
+  options?: { forceRescan?: boolean }
 ): Promise<{ status: HostKeyStatus; fingerprint: string; changed?: boolean }> {
   const db = getDb();
   const server = db
@@ -305,6 +354,26 @@ export async function ensureServerHostKeyPinned(
     throw new Error(`Cổng SSH không hợp lệ: ${server.ssh_port}`);
   }
 
+  // Khi khóa đã được ghim VERIFIED, không gọi lại `ssh-keyscan` (mở 5 kết nối TCP chưa xác thực cùng lúc
+  // dễ kích hoạt CSF PORTFLOOD / PerSourceMaxStartups gây lỗi `kex_exchange_identification: Connection reset by peer`).
+  // OpenSSH đã kiểm tra trực tiếp khóa ghim qua `StrictHostKeyChecking=yes` + `UserKnownHostsFile`.
+  const preExistingEntries = parseKnownHostsBlock(
+    server.known_host_entry || ''
+  );
+  if (
+    injectedScanStdout === undefined &&
+    !options?.forceRescan &&
+    server.host_key_status === 'VERIFIED' &&
+    preExistingEntries.length > 0
+  ) {
+    const fp =
+      server.host_key_fingerprint ||
+      computeOpenSshKeyFingerprint(
+        selectPrimaryHostKeyEntry(preExistingEntries).rawLine
+      );
+    return { status: 'VERIFIED', fingerprint: fp, changed: false };
+  }
+
   let scanStdout = '';
   let scanStderr = '';
   if (injectedScanStdout !== undefined) {
@@ -312,7 +381,7 @@ export async function ensureServerHostKeyPinned(
   } else {
     const scanRes = await execLocalCommand(
       'ssh-keyscan',
-      ['-T', '10', '-p', String(port), ipAddr],
+      ['-T', '10', '-t', 'ed25519,ecdsa,rsa', '-p', String(port), ipAddr],
       15000
     );
     scanStdout = scanRes.stdout;
@@ -558,7 +627,10 @@ function resolveServerKeyPath(server: ServerRecord): string | null {
   }
 }
 
-export function buildSshBaseArgs(server: ServerRecord): string[] {
+export function buildSshBaseArgs(
+  server: ServerRecord,
+  options: { disableMux?: boolean } = {}
+): string[] {
   assertNotHostKeyMismatch(server);
 
   const port = Number(server.ssh_port || 22);
@@ -567,6 +639,7 @@ export function buildSshBaseArgs(server: ServerRecord): string[] {
   }
 
   const knownHostsFile = materializeServerKnownHostsFile(server);
+  const muxPath = getSshControlMuxPath(options.disableMux);
 
   const args: string[] = [
     '-F',
@@ -595,7 +668,7 @@ export function buildSshBaseArgs(server: ServerRecord): string[] {
 
   args.push(
     '-o',
-    'IgnoreUnknown=WarnWeakCrypto,PubkeyAcceptedAlgorithms,HostKeyAlgorithms',
+    'IgnoreUnknown=WarnWeakCrypto,PubkeyAcceptedAlgorithms,HostKeyAlgorithms,ControlMaster,ControlPath,ControlPersist',
     '-o',
     'WarnWeakCrypto=no',
     '-o',
@@ -605,10 +678,23 @@ export function buildSshBaseArgs(server: ServerRecord): string[] {
     '-o',
     'ConnectTimeout=15',
     '-o',
+    'ConnectionAttempts=3',
+    '-o',
     'ServerAliveInterval=15',
     '-o',
     'ServerAliveCountMax=3'
   );
+
+  if (muxPath) {
+    args.push(
+      '-o',
+      'ControlMaster=auto',
+      '-o',
+      `ControlPath=${muxPath}`,
+      '-o',
+      'ControlPersist=90'
+    );
+  }
 
   const resolvedKey = resolveServerKeyPath(server);
   if (resolvedKey) {
@@ -618,7 +704,10 @@ export function buildSshBaseArgs(server: ServerRecord): string[] {
   return args;
 }
 
-export function buildRsyncSshTransport(server: ServerRecord): string {
+export function buildRsyncSshTransport(
+  server: ServerRecord,
+  options: { disableMux?: boolean } = {}
+): string {
   assertNotHostKeyMismatch(server);
 
   const port = Number(server.ssh_port || 22);
@@ -628,6 +717,7 @@ export function buildRsyncSshTransport(server: ServerRecord): string {
 
   const resolvedKey = resolveServerKeyPath(server);
   const knownHostsFile = materializeServerKnownHostsFile(server);
+  const muxPath = getSshControlMuxPath(options.disableMux);
 
   const parts: string[] = ['ssh', '-F /dev/null'];
   if (resolvedKey) {
@@ -648,14 +738,25 @@ export function buildRsyncSshTransport(server: ServerRecord): string {
   }
 
   parts.push(
-    '-o IgnoreUnknown=WarnWeakCrypto,PubkeyAcceptedAlgorithms,HostKeyAlgorithms',
+    '-o IgnoreUnknown=WarnWeakCrypto,PubkeyAcceptedAlgorithms,HostKeyAlgorithms,ControlMaster,ControlPath,ControlPersist',
     '-o WarnWeakCrypto=no',
     '-o PubkeyAcceptedAlgorithms=+ssh-rsa',
     '-o HostKeyAlgorithms=+ssh-rsa',
+    '-o ConnectTimeout=15',
+    '-o ConnectionAttempts=3',
     '-o ServerAliveInterval=15',
     '-o ServerAliveCountMax=3',
     '-o Compression=no'
   );
+
+  if (muxPath) {
+    parts.push(
+      '-o ControlMaster=auto',
+      `-o ControlPath=${shellSingleQuote(muxPath)}`,
+      '-o ControlPersist=90'
+    );
+  }
+
   return parts.join(' ');
 }
 
@@ -729,7 +830,12 @@ export function setSshInterceptorForTests(
 export async function execRemoteSSH(
   server: ServerRecord,
   remoteCommand: string,
-  options: { zeroImpact?: boolean; timeoutMs?: number } = {}
+  options: {
+    zeroImpact?: boolean;
+    timeoutMs?: number;
+    maxRetries?: number;
+    retryBaseDelayMs?: number;
+  } = {}
 ): Promise<CommandResult> {
   const sshUser = (server.ssh_user || 'root').trim();
   const ipAddr = (server.ip_address || '').trim();
@@ -748,18 +854,58 @@ export async function execRemoteSSH(
     ? wrapZeroImpact(remoteCommand)
     : remoteCommand;
 
-  if (testSshInterceptor) {
-    return await testSshInterceptor(server, remoteCommand, finalCmd);
+  const maxAttempts = Math.max(1, (options.maxRetries ?? 2) + 1);
+  const baseDelayMs = options.retryBaseDelayMs ?? 1800;
+
+  let lastRes: CommandResult = { code: 1, stdout: '', stderr: '' };
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    if (testSshInterceptor) {
+      lastRes = await testSshInterceptor(server, remoteCommand, finalCmd);
+    } else {
+      const args = [
+        ...buildSshBaseArgs(server, { disableMux: attempt > 0 }),
+        '--',
+        `${sshUser}@${ipAddr}`,
+        finalCmd,
+      ];
+      lastRes = await execLocalCommand(
+        'ssh',
+        args,
+        options.timeoutMs ?? 60000
+      );
+    }
+
+    if (lastRes.code === 0) {
+      return lastRes;
+    }
+
+    if (
+      !testSshInterceptor &&
+      lastRes.code === 255 &&
+      /REMOTE HOST IDENTIFICATION HAS CHANGED|Host key verification failed/i.test(
+        lastRes.stderr
+      ) &&
+      Number(server.id) > 0
+    ) {
+      await ensureServerHostKeyPinned(server.id, undefined, {
+        forceRescan: true,
+      });
+    }
+
+    if (
+      attempt + 1 < maxAttempts &&
+      isTransientSshTransportError(lastRes.code, lastRes.stderr)
+    ) {
+      const delayMs =
+        baseDelayMs * (attempt + 1) + Math.floor(Math.random() * 350);
+      await new Promise((r) => setTimeout(r, delayMs));
+      continue;
+    }
+
+    break;
   }
 
-  const args = [
-    ...buildSshBaseArgs(server),
-    '--',
-    `${sshUser}@${ipAddr}`,
-    finalCmd,
-  ];
-
-  return execLocalCommand('ssh', args, options.timeoutMs ?? 60000);
+  return lastRes;
 }
 
 export async function testSshConnection(server: ServerRecord): Promise<{

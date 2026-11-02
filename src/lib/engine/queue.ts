@@ -571,7 +571,11 @@ export function reloadCronSchedules() {
         `UPDATE backup_schedules SET last_run_at = datetime('now') WHERE id = ?`
       ).run(sched.id);
 
-      for (const srvId of sched.server_ids) {
+      for (let i = 0; i < sched.server_ids.length; i++) {
+        const srvId = sched.server_ids[i];
+        if (i > 0) {
+          await new Promise((r) => setTimeout(r, 1500));
+        }
         try {
           await enqueueServerBackup({
             serverId: srvId,

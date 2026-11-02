@@ -10,6 +10,10 @@ Mọi thay đổi đáng chú ý của dự án **NAS-Sync** (<https://github.co
   - Chuẩn hóa bộ lọc `sed` đọc thông tin `/root/.my.cnf` trên `CPanelAdapter` và `CyberPanelAdapter`, tránh lỗi thoát dấu nháy đơn trong template literal.
   - Cải tiến hàm bọc `wrapZeroImpact` trong `src/lib/ssh.ts` sang cấu trúc điều kiện `if ...; then ...; else ...; fi` kèm kiểm tra quyền `ionice -c 2 -n 7 true`, đảm bảo câu lệnh từ xa chỉ thực thi đúng 1 lần duy nhất thay vì chạy lặp lần thứ hai khi trả về mã lỗi khác `0`.
   - Bổ sung bộ kiểm thử hồi quy tự động chạy `sh -n` kiểm tra cú pháp POSIX Shell cho toàn bộ script SSH sinh ra bởi cả 7 Control Panel Adapter trong `tests/security-and-engine.test.ts`.
+- **Khắc phục triệt để lỗi ngắt kết nối `kex_exchange_identification: read: Connection reset by peer` trên VPS bật CSF `PORTFLOOD` / `MaxStartups` (`ssh.ts`, `directadmin.ts`, `backup-worker.ts`, `queue.ts`, `updater.ts`)**:
+  - Bỏ thao tác gọi lặp `ssh-keyscan` (vốn mở đồng thời 5 kết nối TCP chưa xác thực dễ chạm ngưỡng CSF `PORTFLOOD` / `PerSourceMaxStartups`) đối với các máy chủ đã ghim khóa `VERIFIED`, ủy quyền xác thực trực tiếp cho `StrictHostKeyChecking=yes` + `UserKnownHostsFile` và chỉ quét lại khi phát hiện cảnh báo thay đổi Host Key.
+  - Kích hoạt cơ chế gộp kênh OpenSSH Multiplexing (`ControlMaster=auto`, `ControlPersist=90s`, `ConnectionAttempts=3`) cho cả `ssh` và `rsync`, tái sử dụng duy nhất 1 kết nối TCP cho toàn bộ phiên sao lưu của mỗi VPS, đồng thời gộp đọc thông tin MySQL vào chung 1 lượt gọi SSH trong `DirectAdminAdapter.discoverDomains` và giãn cách `1.5s` khi lập lịch Cron nhiều VPS cùng giờ.
+  - Bổ sung cơ chế tự động thử lại tức thì (3 lần kèm backoff) trong `execRemoteSSH` khi gặp lỗi rơi gói bắt tay KEX (`kex_exchange_identification` / `Connection reset by peer`), và tự động chuyển Job sang trạng thái `INTERRUPTED` (`Auto-Resume`) thay vì `FAILED` nếu cổng SSH đang bị tường lửa giới hạn tạm thời.
 
 ## [1.5.5] - 2026-11-02
 

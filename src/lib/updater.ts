@@ -1075,71 +1075,95 @@ export async function performGitHubUpdate(
           // Ignore
         }
 
-        const depsChanged = haveDependenciesChanged(
-          path.join(appRoot, 'package.json'),
-          path.join(stagingDir, 'package.json')
-        );
-        const stagingNodeModules = path.join(stagingDir, 'node_modules');
-        fs.rmSync(stagingNodeModules, { recursive: true, force: true });
+        const isPrebuiltBehindLatestMainCommit =
+          Boolean(checkInfo.latestCommit) &&
+          Boolean(prebuiltCommitSha) &&
+          !prebuiltCommitSha
+            .toLowerCase()
+            .startsWith(checkInfo.latestCommit!.toLowerCase());
 
-        if (depsChanged) {
+        if (isPrebuiltBehindLatestMainCommit) {
           broadcastStep(
-            'INSTALLING',
-            62,
-            'Phát hiện thư viện mới trong package.json — Đang cài đặt cô lập tại Staging...',
-            'Chạy npm install --include=dev --ignore-scripts trong vùng Staging...',
+            'DOWNLOADING',
+            50,
+            'Phát hiện bản vá mới hơn trên nhánh main — Chuyển sang đồng bộ trực tiếp mã nguồn main...',
+            `Gói Release hiện tại (${prebuiltCommitSha.slice(
+              0,
+              7
+            )}) cũ hơn nhánh main (${
+              checkInfo.latestCommit
+            }) -> Tự động chuyển sang tải nhánh main...`,
             targetVer
           );
-          const npmBin = process.platform === 'win32' ? 'npm.cmd' : 'npm';
-          const npmCode = await runStreamingCommand(
-            npmBin,
-            [
-              'install',
-              '--include=dev',
-              '--no-audit',
-              '--no-fund',
-              '--ignore-scripts',
-            ],
-            stagingDir,
-            (line) =>
-              broadcastStep(
-                'INSTALLING',
-                72,
-                'Đang cài đặt thư viện mới...',
-                line,
-                targetVer
-              )
+          fs.rmSync(stagingDir, { recursive: true, force: true });
+          fs.mkdirSync(stagingDir, { recursive: true });
+        } else {
+          const depsChanged = haveDependenciesChanged(
+            path.join(appRoot, 'package.json'),
+            path.join(stagingDir, 'package.json')
           );
-          if (npmCode !== 0) {
-            throw new Error(
-              'Cài đặt gói phụ thuộc npm trong vùng Staging thất bại. Phiên bản đang chạy vẫn an toàn 100%.'
+          const stagingNodeModules = path.join(stagingDir, 'node_modules');
+          fs.rmSync(stagingNodeModules, { recursive: true, force: true });
+
+          if (depsChanged) {
+            broadcastStep(
+              'INSTALLING',
+              62,
+              'Phát hiện thư viện mới trong package.json — Đang cài đặt cô lập tại Staging...',
+              'Chạy npm install --include=dev --ignore-scripts trong vùng Staging...',
+              targetVer
             );
-          }
-          if (shouldSyncAppRoot && fs.existsSync(stagingNodeModules)) {
-            const syncRes = syncNodeModulesSafe(
-              stagingNodeModules,
-              path.join(appRoot, 'node_modules')
+            const npmBin = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+            const npmCode = await runStreamingCommand(
+              npmBin,
+              [
+                'install',
+                '--include=dev',
+                '--no-audit',
+                '--no-fund',
+                '--ignore-scripts',
+              ],
+              stagingDir,
+              (line) =>
+                broadcastStep(
+                  'INSTALLING',
+                  72,
+                  'Đang cài đặt thư viện mới...',
+                  line,
+                  targetVer
+                )
             );
-            if (syncRes.deferredToRestart) {
-              fs.writeFileSync(
-                path.join(stagingDir, '.needs_npm_sync'),
-                new Date().toISOString(),
-                'utf8'
+            if (npmCode !== 0) {
+              throw new Error(
+                'Cài đặt gói phụ thuộc npm trong vùng Staging thất bại. Phiên bản đang chạy vẫn an toàn 100%.'
               );
             }
+            if (shouldSyncAppRoot && fs.existsSync(stagingNodeModules)) {
+              const syncRes = syncNodeModulesSafe(
+                stagingNodeModules,
+                path.join(appRoot, 'node_modules')
+              );
+              if (syncRes.deferredToRestart) {
+                fs.writeFileSync(
+                  path.join(stagingDir, '.needs_npm_sync'),
+                  new Date().toISOString(),
+                  'utf8'
+                );
+              }
+            }
+            fs.rmSync(stagingNodeModules, { recursive: true, force: true });
+          } else {
+            broadcastStep(
+              'INSTALLING',
+              75,
+              'Gói Prebuilt tương thích hoàn toàn — Bỏ qua biên dịch next build, kích hoạt siêu tốc...',
+              'Không tốn RAM/CPU biên dịch lại giao diện trên NAS (~5 giây).',
+              targetVer
+            );
           }
-          fs.rmSync(stagingNodeModules, { recursive: true, force: true });
-        } else {
-          broadcastStep(
-            'INSTALLING',
-            75,
-            'Gói Prebuilt tương thích hoàn toàn — Bỏ qua biên dịch next build, kích hoạt siêu tốc...',
-            'Không tốn RAM/CPU biên dịch lại giao diện trên NAS (~5 giây).',
-            targetVer
-          );
-        }
 
-        usedPrebuiltFastPath = true;
+          usedPrebuiltFastPath = true;
+        }
       }
     }
 

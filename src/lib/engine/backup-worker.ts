@@ -3,7 +3,10 @@ import path from 'node:path';
 import { getDb, getSetting } from '@/lib/db';
 import { emitJobUpdated } from '@/lib/events';
 import { createSystemAlert } from '@/lib/notifications';
-import { ensureServerHostKeyPinned } from '@/lib/ssh';
+import {
+  ensureServerHostKeyPinned,
+  isTransientSshTransportError,
+} from '@/lib/ssh';
 import type {
   BackupJob,
   DomainMetadataJson,
@@ -697,7 +700,19 @@ export async function executeBackupJob(
         );
       }
     }
-  } catch (err) {
+  } catch (rawErr) {
+    let err = rawErr;
+    if (
+      !(err instanceof RetryableNetworkError) &&
+      !isJobCancelled(jobId) &&
+      isTransientSshTransportError(255, (err as Error)?.message || '')
+    ) {
+      err = new RetryableNetworkError(
+        (err as Error)?.message || 'Gián đoạn kết nối SSH tạm thời.',
+        255
+      );
+    }
+
     if (err instanceof RetryableNetworkError) {
       const nextRetry = job.retry_count + 1;
       appendLog(

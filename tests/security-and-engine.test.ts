@@ -57,6 +57,8 @@ import {
   buildSshBaseArgs,
   computeOpenSshKeyFingerprint,
   ensureServerHostKeyPinned,
+  execRemoteSSH,
+  isTransientSshTransportError,
   materializeServerKnownHostsFile,
   setSshInterceptorForTests,
   wrapZeroImpact,
@@ -1523,6 +1525,79 @@ describe('8. v1.5.6 POSIX sh -n syntax validation across all 7 live Panel Adapte
           `Expected >= 4 SSH scripts captured & validated for ${panel}`
         );
       }
+    } finally {
+      setSshInterceptorForTests(null);
+    }
+  });
+
+  it('skips redundant ssh-keyscan on VERIFIED servers and auto-retries kex_exchange_identification resets', async () => {
+    // 1. Phân loại chính xác lỗi KEX / Connection reset tạm thời so với lỗi xác thực vĩnh viễn
+    assert.equal(
+      isTransientSshTransportError(
+        255,
+        'kex_exchange_identification: read: Connection reset by peer\nConnection reset by 198.51.100.110 port 22'
+      ),
+      true
+    );
+    assert.equal(
+      isTransientSshTransportError(255, 'Permission denied (publickey).'),
+      false
+    );
+    assert.equal(
+      isTransientSshTransportError(
+        255,
+        'WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!'
+      ),
+      false
+    );
+
+    // 2. Máy chủ đã VERIFIED không gọi lại ssh-keyscan (tránh mở 5 kết nối TCP chưa xác thực kích hoạt CSF PORTFLOOD)
+    const db = getDb();
+    const rawKey = crypto.randomBytes(51).toString('base64');
+    const knownLine = `198.51.100.110 ssh-ed25519 ${rawKey}`;
+    const expectedFp = computeOpenSshKeyFingerprint(knownLine);
+
+    const ins = db
+      .prepare(
+        `INSERT INTO servers (hostname, ip_address, ssh_port, ssh_user, panel_type, is_mock, known_host_entry, host_key_fingerprint, host_key_status)
+         VALUES ('verified-noscans.example.com', '198.51.100.110', 22, 'root', 'DIRECTADMIN', 0, ?, ?, 'VERIFIED')`
+      )
+      .run(knownLine, expectedFp);
+    const verifiedServerId = Number(ins.lastInsertRowid);
+
+    // Gọi không truyền injectedScanStdout: nếu lỡ gọi ssh-keyscan tới 198.51.100.110 (TEST-NET-2 không tồn tại) sẽ bị timeout/throw ngay!
+    const fastPin = await ensureServerHostKeyPinned(verifiedServerId);
+    assert.equal(fastPin.status, 'VERIFIED');
+    assert.equal(fastPin.fingerprint, expectedFp);
+
+    // 3. Tự động retry khi gặp `kex_exchange_identification: read: Connection reset by peer` ở lượt đầu
+    const srvRow = db
+      .prepare('SELECT * FROM servers WHERE id = ?')
+      .get(verifiedServerId) as unknown as ServerRecord;
+
+    let attempts = 0;
+    try {
+      setSshInterceptorForTests(() => {
+        attempts++;
+        if (attempts < 3) {
+          return {
+            code: 255,
+            stdout: '',
+            stderr:
+              'kex_exchange_identification: read: Connection reset by peer\nConnection reset by 198.51.100.110 port 22\n',
+          };
+        }
+        return { code: 0, stdout: 'RECOVERED_OK\n', stderr: '' };
+      });
+
+      const res = await execRemoteSSH(srvRow, 'echo RECOVERED_OK', {
+        zeroImpact: true,
+        maxRetries: 2,
+        retryBaseDelayMs: 5,
+      });
+      assert.equal(res.code, 0);
+      assert.equal(res.stdout.trim(), 'RECOVERED_OK');
+      assert.equal(attempts, 3);
     } finally {
       setSshInterceptorForTests(null);
     }

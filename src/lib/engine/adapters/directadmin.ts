@@ -43,8 +43,6 @@ export class DirectAdminAdapter implements PanelAdapter {
   }
 
   async discoverDomains(server: ServerRecord): Promise<DiscoveredDomain[]> {
-    const creds = await this.getMysqlAdminCredentials(server);
-    const quotedMysqlUser = shellSingleQuote(creds.user);
     const pgListCmd = shellSingleQuote(
       `psql -Atc ${shellSingleQuote(
         "SELECT datname FROM pg_database WHERE datistemplate = false AND datname <> 'postgres'"
@@ -53,8 +51,14 @@ export class DirectAdminAdapter implements PanelAdapter {
 
     const script = `
       DA_MYSQL_CONF="/usr/local/directadmin/conf/mysql.conf"
+      if [ ! -f "$DA_MYSQL_CONF" ] && [ ! -d /usr/local/directadmin/data/users ]; then
+        echo "Không đọc được /usr/local/directadmin/conf/mysql.conf" >&2
+        exit 1
+      fi
+      DA_MYSQL_USER=$(grep -E '^user=' "$DA_MYSQL_CONF" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d '\\r\\n ')
+      [ -z "$DA_MYSQL_USER" ] && DA_MYSQL_USER="da_admin"
       DA_MYSQL_PWD=$(grep -E '^passwd=' "$DA_MYSQL_CONF" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d '\\r\\n')
-      ALL_DBS=$(MYSQL_PWD="$DA_MYSQL_PWD" mysql -u ${quotedMysqlUser} -N -B -e "SHOW DATABASES;" 2>/dev/null | grep -Ev '^(information_schema|performance_schema|mysql|sys)$' || true)
+      ALL_DBS=$(MYSQL_PWD="$DA_MYSQL_PWD" mysql -u "$DA_MYSQL_USER" -N -B -e "SHOW DATABASES;" 2>/dev/null | grep -Ev '^(information_schema|performance_schema|mysql|sys)$' || true)
       unset DA_MYSQL_PWD
       ALL_PG_DBS=$(command -v psql >/dev/null 2>&1 && su - postgres -c ${pgListCmd} 2>/dev/null || true)
       DA_SUB_IN_DOMAINS=$(grep -E '^(create_subdomain_docroot_in_domains_dir|subdomain_docroot_in_domains_dir)=1' /usr/local/directadmin/conf/directadmin.conf 2>/dev/null | head -n1 || true)
