@@ -7,6 +7,7 @@ import {
   Activity,
   AlertTriangle,
   ArrowUpCircle,
+  BellRing,
   CalendarClock,
   ExternalLink,
   FolderGit2,
@@ -35,6 +36,7 @@ const NAV_ITEMS = [
   { href: '/schedules', label: 'Lập lịch & GFS', icon: CalendarClock },
   { href: '/restore', label: 'Khôi phục & Di chuyển', icon: RotateCcw },
   { href: '/explorer', label: 'File Explorer & Diff', icon: FolderGit2 },
+  { href: '/alerts', label: 'Nhật ký & Cảnh báo', icon: BellRing },
   { href: '/settings', label: 'Cấu hình & Cập nhật', icon: Settings },
 ];
 
@@ -54,9 +56,13 @@ function getRoleBadgeStyle(role: UserRole): string {
 export function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const router = useRouter();
-  const { connected, progressMap, latestAlert } = useRealtime();
+  const { connected, progressMap, latestAlert, lastUpdateCounter } =
+    useRealtime();
   const [mobileOpen, setMobileOpen] = useState(false);
-  const [criticalAlertIds, setCriticalAlertIds] = useState<number[]>([]);
+  const [alertCounts, setAlertCounts] = useState<{
+    unreadCount: number;
+    criticalUnreadCount: number;
+  }>({ unreadCount: 0, criticalUnreadCount: 0 });
   const [currentUser, setCurrentUser] = useState<{
     userId: number;
     username: string;
@@ -66,7 +72,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const [versionInfo, setVersionInfo] = useState<{
     currentVersion: string;
     hasUpdate: boolean;
-  }>({ currentVersion: '1.3.0', hasUpdate: false });
+  }>({ currentVersion: '1.5.2', hasUpdate: false });
 
   useEffect(() => {
     setMobileOpen(false);
@@ -91,12 +97,35 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   }, [mobileOpen]);
 
   useEffect(() => {
-    if (latestAlert && latestAlert.severity === 'CRITICAL') {
-      setCriticalAlertIds((prev) =>
-        prev.includes(latestAlert.id) ? prev : [...prev, latestAlert.id]
-      );
-    }
-  }, [latestAlert]);
+    if (pathname === '/login') return;
+    let active = true;
+
+    const refreshAlertCounts = () => {
+      fetch('/api/alerts?limit=1', { cache: 'no-store' })
+        .then((r) => (r.ok ? r.json() : null))
+        .then((data) => {
+          if (active && data?.summary) {
+            setAlertCounts({
+              unreadCount: Number(data.summary.unreadCount || 0),
+              criticalUnreadCount: Number(
+                data.summary.criticalUnreadCount || 0
+              ),
+            });
+          }
+        })
+        .catch(() => {});
+    };
+
+    refreshAlertCounts();
+
+    const onAlertsChanged = () => refreshAlertCounts();
+    window.addEventListener('nas-sync:alerts-changed', onAlertsChanged);
+
+    return () => {
+      active = false;
+      window.removeEventListener('nas-sync:alerts-changed', onAlertsChanged);
+    };
+  }, [pathname, lastUpdateCounter]);
 
   useEffect(() => {
     if (pathname === '/login') return;
@@ -143,12 +172,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     ['RUNNING', 'RESUMING', 'VERIFYING'].includes(p.status)
   ).length;
 
-  const criticalCount =
-    criticalAlertIds.length > 0
-      ? criticalAlertIds.length
-      : latestAlert && latestAlert.severity === 'CRITICAL'
-      ? 1
-      : 0;
+  const criticalCount = alertCounts.criticalUnreadCount;
 
   const handleLogout = async () => {
     await fetch('/api/auth/logout', { method: 'POST' });
@@ -229,6 +253,17 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                 {item.href === '/jobs' && runningCount > 0 && (
                   <span className="px-2 py-0.5 text-[11px] rounded-full bg-blue-500 text-white animate-pulse shrink-0">
                     {runningCount}
+                  </span>
+                )}
+                {item.href === '/alerts' && alertCounts.unreadCount > 0 && (
+                  <span
+                    className={`px-2 py-0.5 text-[11px] rounded-full font-mono font-semibold shrink-0 ${
+                      alertCounts.criticalUnreadCount > 0
+                        ? 'bg-rose-500 text-white animate-pulse'
+                        : 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40'
+                    }`}
+                  >
+                    {alertCounts.unreadCount}
                   </span>
                 )}
                 {item.href === '/settings' &&
@@ -342,7 +377,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                 </span>
               </h1>
               <p className="text-xs text-slate-400 hidden md:block truncate">
-                DirectAdmin • cPanel • Plesk • aaPanel (Domain & Subdomain) ➔ Synology NAS
+                DirectAdmin • cPanel • Plesk • aaPanel • CyberPanel • HestiaCP • CloudPanel ➔ Synology NAS
               </p>
             </div>
           </div>
@@ -361,7 +396,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             {criticalCount > 0 && (
               <>
                 <Link
-                  href="/settings"
+                  href="/alerts"
                   title={latestAlert?.title || 'Cảnh báo hệ thống nghiêm trọng'}
                   aria-label={`Xem ${criticalCount} cảnh báo nghiêm trọng`}
                   className="md:hidden inline-flex items-center gap-1 px-2.5 py-1.5 min-h-[38px] rounded-full text-xs font-semibold bg-rose-500/20 border border-rose-500/40 text-rose-300 shrink-0"
@@ -370,7 +405,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                   <span>{criticalCount}</span>
                 </Link>
                 <Link
-                  href="/settings"
+                  href="/alerts"
                   className="hidden md:inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium bg-rose-500/20 border border-rose-500/40 text-rose-300 max-w-[260px]"
                 >
                   <span className="shrink-0">🚨</span>

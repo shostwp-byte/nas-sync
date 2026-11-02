@@ -6,7 +6,6 @@ import {
   BellRing,
   CalendarClock,
   Check,
-  CheckCheck,
   CheckCircle2,
   Cloud,
   Copy,
@@ -40,7 +39,6 @@ import type {
   OffsiteProviderType,
   OffsiteSyncJob,
   OffsiteSyncStatus,
-  SystemAlert,
   SystemUpdateInfo,
   UserRecord,
   UserRole,
@@ -182,9 +180,8 @@ export default function SettingsPage() {
   } | null>(null);
   const [activeTab, setActiveTab] = useState<SettingsTab>('config');
 
-  // System Settings & Alerts (Tab 1)
+  // System Settings (Tab 1)
   const [settings, setSettings] = useState<Record<string, string>>({});
-  const [alerts, setAlerts] = useState<SystemAlert[]>([]);
   const [saving, setSaving] = useState(false);
   const [testingNotify, setTestingNotify] = useState(false);
   const [detectingChatId, setDetectingChatId] = useState(false);
@@ -326,7 +323,6 @@ export default function SettingsPage() {
     if (settingsResp.ok) {
       const json = await settingsResp.json();
       setSettings(json.settings || {});
-      setAlerts(json.alerts || []);
     }
   }, []);
 
@@ -1195,15 +1191,6 @@ export default function SettingsPage() {
       text: `✅ Đã xóa tài khoản "${user.username}".`,
     });
     await loadUsers();
-  };
-
-  const markAlertsRead = async () => {
-    await fetch('/api/settings', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action: 'mark_all_read' }),
-    });
-    await loadAdminSettings();
   };
 
   const updateField = (key: string, val: string) => {
@@ -3138,48 +3125,6 @@ export default function SettingsPage() {
               </button>
             </div>
           </form>
-
-          {/* System Alerts Card */}
-          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-6 space-y-4 text-xs">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <h3 className="text-sm font-bold text-white">
-                Nhật ký Sự kiện &amp; Cảnh báo Hệ thống Gần đây
-              </h3>
-              <button
-                type="button"
-                onClick={() => void markAlertsRead()}
-                className="min-h-[34px] inline-flex items-center gap-1 text-slate-400 hover:text-white shrink-0"
-              >
-                <CheckCheck className="w-3.5 h-3.5 shrink-0" />
-                Đánh dấu đã đọc
-              </button>
-            </div>
-
-            <div className="space-y-2.5 max-h-60 overflow-y-auto">
-              {alerts.length === 0 ? (
-                <div className="text-slate-500 py-6 text-center">
-                  Chưa có cảnh báo hệ thống nào.
-                </div>
-              ) : (
-                alerts.map((a) => (
-                  <div
-                    key={a.id}
-                    className="p-3 rounded-xl bg-slate-950 border border-slate-800 space-y-1"
-                  >
-                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1">
-                      <div className="font-semibold text-white break-words min-w-0">
-                        [{a.category}] {a.title}
-                      </div>
-                      <span className="text-[10px] text-slate-500 shrink-0">
-                        {formatDateTime(a.created_at)}
-                      </span>
-                    </div>
-                    <p className="text-slate-400 break-words">{a.message}</p>
-                  </div>
-                ))
-              )}
-            </div>
-          </div>
         </div>
       )}
 

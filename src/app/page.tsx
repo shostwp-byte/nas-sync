@@ -1357,10 +1357,10 @@ export default function DashboardPage() {
               <span>Nhật ký Cảnh báo Hệ thống</span>
             </h3>
             <Link
-              href="/settings"
-              className="text-xs text-slate-400 hover:text-white shrink-0"
+              href="/alerts"
+              className="text-xs text-cyan-400 hover:text-cyan-300 font-medium shrink-0"
             >
-              Cài đặt Telegram/SMTP
+              Xem tất cả →
             </Link>
           </div>
 

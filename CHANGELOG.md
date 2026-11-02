@@ -2,6 +2,13 @@
 
 Mọi thay đổi đáng chú ý của dự án **NAS-Sync** (<https://github.com/shostwp-byte/nas-sync>) đều được ghi nhận tại tài liệu này theo chuẩn [Keep a Changelog](https://keepachangelog.com/vi/1.1.0/) và [Semantic Versioning](https://semver.org/).
 
+## [1.5.2] - 2026-11-02
+
+### Added & Improved
+- **Tách riêng Menu Điều hướng `Nhật ký & Cảnh báo` (`/alerts`, `src/app/api/alerts/route.ts`, `AppShell.tsx`, `settings/page.tsx`)**:
+  - Đưa toàn bộ mục **Nhật ký Sự kiện & Cảnh báo Hệ thống** ra khỏi trang `Cấu hình & Cập nhật` sang một menu độc lập **Nhật ký & Cảnh báo** trên thanh điều hướng Sidebar kèm huy hiệu đếm thông báo chưa đọc theo thời gian thực.
+  - Bổ sung bộ lọc nhanh theo mức độ (`Chưa đọc`, `CRITICAL`, `WARNING`, `INFO`), phân mục (`BACKUP`, `RESTORE`, `ANOMALY`, `VOLUME`, `BTRFS`, `SYSTEM`), ô tìm kiếm tức thì, đánh dấu đã đọc từng mục / tất cả, dọn dẹp thông báo cũ và tích hợp thẻ xem nhanh **Nhật ký Kiểm toán Bảo mật (Audit Logs)** dành cho `ADMIN`.
+
 ## [1.5.1] - 2026-11-02
 
 ### Fixed
