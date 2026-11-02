@@ -6,6 +6,7 @@ export interface SessionPayload {
   userId: number;
   username: string;
   role: string;
+  tokenVersion?: number;
 }
 
 function getJwtSecret(): Uint8Array {
@@ -19,7 +20,13 @@ function getJwtSecret(): Uint8Array {
 }
 
 export async function signSessionToken(payload: SessionPayload): Promise<string> {
-  return await new SignJWT({ ...payload })
+  return await new SignJWT({
+    userId: payload.userId,
+    username: payload.username,
+    role: payload.role,
+    tokenVersion:
+      typeof payload.tokenVersion === 'number' ? payload.tokenVersion : 1,
+  })
     .setProtectedHeader({ alg: 'HS256' })
     .setIssuedAt()
     .setExpirationTime('7d')
@@ -38,9 +45,14 @@ export async function verifySessionToken(
       userId: payload.userId as number,
       username: payload.username as string,
       role: (payload.role as string) || 'ADMIN',
+      tokenVersion:
+        typeof payload.tokenVersion === 'number' ? payload.tokenVersion : 1,
     };
   } catch {
     return null;
   }
 }
+
+export const signSessionJwt = signSessionToken;
+export const verifySessionJwt = verifySessionToken;
 

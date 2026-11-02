@@ -4,6 +4,11 @@ import type {
   MysqlAdminCredentials,
   ServerRecord,
 } from '@/types';
+import {
+  assertSafe,
+  isSafeDomain,
+  isSafeSystemUser,
+} from '../safe-names';
 import { finalizeDiscoveredDomains, type PanelAdapter } from './base';
 
 export class PleskAdapter implements PanelAdapter {
@@ -25,13 +30,16 @@ export class PleskAdapter implements PanelAdapter {
     return {
       user: 'admin',
       password: res.stdout.trim(),
+      remoteAuthPrelude:
+        'export MYSQL_PWD="$(tr -d \'\\r\\n\' < /etc/psa/.psa.shadow)"',
     };
   }
 
   async discoverDomains(server: ServerRecord): Promise<DiscoveredDomain[]> {
     const script = `
-      PSA_PASS=$(cat /etc/psa/.psa.shadow)
+      PSA_PASS=$(tr -d '\\r\\n' < /etc/psa/.psa.shadow)
       MYSQL_PWD="$PSA_PASS" mysql -u admin -D psa -N -B -e "
+        SET SESSION group_concat_max_len = 1048576;
         SELECT
           d.name,
           COALESCE(s.login, ps.login, 'root') AS sys_login,
@@ -53,6 +61,7 @@ export class PleskAdapter implements PanelAdapter {
         WHERE d.htype IN ('vrt_hst', 'subdomain')
         ORDER BY is_sub ASC, d.id ASC;
       "
+      unset PSA_PASS
     `;
 
     const res = await execRemoteSSH(server, script, {
@@ -102,12 +111,15 @@ export class PleskAdapter implements PanelAdapter {
     _systemUser: string,
     domain: string
   ): Promise<string> {
+    assertSafe(isSafeDomain, domain, 'domain');
+
     if (!server.is_mock) {
       const safeDom = domain.replace(/[^a-zA-Z0-9._-]/g, '');
       const checkCmd = `
         if [ -f /etc/psa/.psa.shadow ]; then
-          PSA_PASS=$(cat /etc/psa/.psa.shadow)
+          PSA_PASS=$(tr -d '\\r\\n' < /etc/psa/.psa.shadow)
           WROOT=$(MYSQL_PWD="$PSA_PASS" mysql -u admin -D psa -N -B -e "SELECT h.www_root FROM domains d JOIN hosting h ON d.id = h.dom_id WHERE d.name = '${safeDom}' LIMIT 1;" 2>/dev/null || true)
+          unset PSA_PASS
           [ -n "$WROOT" ] && echo "$WROOT" && exit 0
         fi
         echo "/var/www/vhosts/${safeDom}/httpdocs"
@@ -125,9 +137,11 @@ export class PleskAdapter implements PanelAdapter {
     domain: string,
     targetWebroot: string
   ): string {
+    assertSafe(isSafeSystemUser, systemUser, 'systemUser');
+    assertSafe(isSafeDomain, domain, 'domain');
     return `plesk repair fs ${shellSingleQuote(
       domain
-    )} -y || chown -R ${shellSingleQuote(`${systemUser}:psacln`)} ${shellSingleQuote(
+    )} -y || chown -hR ${shellSingleQuote(`${systemUser}:psacln`)} ${shellSingleQuote(
       targetWebroot
     )}`;
   }

@@ -1,6 +1,8 @@
+import fs from 'node:fs';
 import { NextRequest, NextResponse } from 'next/server';
 import { getDb } from '@/lib/db';
 import { validateServerConnectionFields } from '@/lib/engine/safe-names';
+import { resolveValidatedSshKeyPath } from '@/lib/ssh';
 
 export async function GET() {
   const servers = getDb()
@@ -25,10 +27,10 @@ export async function POST(req: NextRequest) {
     const body = await req.json();
     const hostname = String(body.hostname || '').trim();
     const ipAddress = String(body.ip_address || '').trim();
-    const sshPort = Number(body.ssh_port || 22);
+    const sshPort = Number(body.ssh_port ?? 22);
     const sshUser = String(body.ssh_user || 'root').trim();
-    const sshKeyPath = String(body.ssh_key_path || '').trim();
-    const panelType = String(body.panel_type || 'DIRECTADMIN');
+    const rawSshKeyPath = String(body.ssh_key_path || '').trim();
+    const panelType = String(body.panel_type || 'DIRECTADMIN').trim();
     const bwLimit = Number(body.bw_limit_kbps ?? 25600);
     const isMock = body.is_mock ? 1 : 0;
     const notes = String(body.notes || '');
@@ -40,9 +42,34 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const invalidField = validateServerConnectionFields({ hostname, ipAddress, sshUser });
+    const invalidField = validateServerConnectionFields({
+      hostname,
+      ipAddress,
+      sshUser,
+      panelType,
+      sshPort,
+      bwLimitKbps: bwLimit,
+    });
     if (invalidField) {
       return NextResponse.json({ error: invalidField }, { status: 400 });
+    }
+
+    let sshKeyPath = '';
+    if (rawSshKeyPath) {
+      try {
+        sshKeyPath = resolveValidatedSshKeyPath(rawSshKeyPath);
+      } catch (err) {
+        return NextResponse.json(
+          { error: (err as Error).message },
+          { status: 400 }
+        );
+      }
+      if (!fs.existsSync(sshKeyPath)) {
+        return NextResponse.json(
+          { error: 'Không tìm thấy tệp khóa SSH được chỉ định trong thư mục SSH Keys.' },
+          { status: 400 }
+        );
+      }
     }
 
     const db = getDb();

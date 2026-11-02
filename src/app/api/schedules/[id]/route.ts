@@ -25,6 +25,15 @@ export async function PATCH(
       );
     }
 
+    const nextName =
+      body.name !== undefined ? String(body.name).trim() : String(curr.name);
+    if (!nextName || nextName.length > 128) {
+      return NextResponse.json(
+        { error: 'Tên lịch sao lưu không hợp lệ (1-128 ký tự).' },
+        { status: 400 }
+      );
+    }
+
     const nextCron = String(body.cron_expression ?? curr.cron_expression).trim();
     if (!cron.validate(nextCron)) {
       return NextResponse.json(
@@ -33,19 +42,84 @@ export async function PATCH(
       );
     }
 
+    let nextServerIdsJson = String(curr.server_ids || '[]');
+    if (body.server_ids !== undefined) {
+      const parsedIds = Array.isArray(body.server_ids)
+        ? Array.from(
+            new Set(
+              body.server_ids
+                .map((v: unknown) => Number(v))
+                .filter((n: number) => Number.isInteger(n) && n > 0)
+            )
+          )
+        : [];
+      if (parsedIds.length === 0) {
+        return NextResponse.json(
+          { error: 'Vui lòng chọn ít nhất 1 máy chủ cho lịch sao lưu.' },
+          { status: 400 }
+        );
+      }
+      nextServerIdsJson = JSON.stringify(parsedIds);
+    }
+
+    const nextMaxConcurrency = Number(
+      body.max_concurrency ?? curr.max_concurrency
+    );
+    if (
+      !Number.isInteger(nextMaxConcurrency) ||
+      nextMaxConcurrency < 1 ||
+      nextMaxConcurrency > 10
+    ) {
+      return NextResponse.json(
+        {
+          error:
+            'Số luồng chạy đồng thời (max_concurrency) phải là số nguyên từ 1 đến 10.',
+        },
+        { status: 400 }
+      );
+    }
+
+    let nextRetentionJson = String(
+      curr.retention_policy || '{"daily":7,"weekly":4,"monthly":6}'
+    );
+    if (body.retention_policy !== undefined) {
+      const rawRet = body.retention_policy || {};
+      const daily = Number(rawRet.daily);
+      const weekly = Number(rawRet.weekly);
+      const monthly = Number(rawRet.monthly);
+      if (
+        !Number.isInteger(daily) ||
+        daily < 1 ||
+        daily > 3650 ||
+        !Number.isInteger(weekly) ||
+        weekly < 0 ||
+        weekly > 520 ||
+        !Number.isInteger(monthly) ||
+        monthly < 0 ||
+        monthly > 240
+      ) {
+        return NextResponse.json(
+          {
+            error:
+              'Chính sách lưu trữ GFS không hợp lệ (Daily >= 1, Weekly >= 0, Monthly >= 0).',
+          },
+          { status: 400 }
+        );
+      }
+      nextRetentionJson = JSON.stringify({ daily, weekly, monthly });
+    }
+
     db.prepare(
       `UPDATE backup_schedules
        SET name = ?, cron_expression = ?, server_ids = ?, max_concurrency = ?,
            retention_policy = ?, verify_db_sandbox = ?, btrfs_snapshot_after = ?, enabled = ?
        WHERE id = ?`
     ).run(
-      body.name ?? curr.name,
+      nextName,
       nextCron,
-      body.server_ids ? JSON.stringify(body.server_ids) : curr.server_ids,
-      Number(body.max_concurrency ?? curr.max_concurrency),
-      body.retention_policy
-        ? JSON.stringify(body.retention_policy)
-        : curr.retention_policy,
+      nextServerIdsJson,
+      nextMaxConcurrency,
+      nextRetentionJson,
       body.verify_db_sandbox !== undefined
         ? body.verify_db_sandbox
           ? 1

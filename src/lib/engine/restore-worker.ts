@@ -15,21 +15,52 @@ import type {
   BackupJob,
   DatabaseBackupInfo,
   DomainMetadataJson,
+  MysqlAdminCredentials,
   RestoreRequestPayload,
   ServerRecord,
   StorageVolume,
 } from '@/types';
 import { getPanelAdapter } from './adapters';
-import { buildMysqlAuthFlags } from './adapters/base';
+import {
+  buildMysqlAuthFlags,
+  buildRemoteMysqlEnvPrelude,
+  verifyRemoteWebrootSafety,
+} from './adapters/base';
+import {
+  clearCancelledJob,
+  isJobCancelled,
+} from './backup-worker';
 import {
   assertSafe,
   isSafeDbName,
   isSafeDomain,
+  isSafeSnapshotName,
   isSafeSystemUser,
   isSafeWebroot,
 } from './safe-names';
 
+const RESTORE_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
+
+function terminateChildGracefully(child: ReturnType<typeof spawn>) {
+  try {
+    child.kill('SIGTERM');
+  } catch {
+    return;
+  }
+  const forceTimer = setTimeout(() => {
+    try {
+      if (child.exitCode === null) {
+        child.kill('SIGKILL');
+      }
+    } catch {
+      // Ignore
+    }
+  }, 5000);
+  forceTimer.unref();
+}
+
 function pushFilesViaRsync(params: {
+  jobId: number;
   targetServer: ServerRecord;
   localPublicHtmlDir: string;
   targetWebroot: string;
@@ -37,6 +68,7 @@ function pushFilesViaRsync(params: {
   onProgress: (pct: number) => void;
 }): Promise<void> {
   const {
+    jobId,
     targetServer,
     localPublicHtmlDir,
     targetWebroot,
@@ -47,13 +79,16 @@ function pushFilesViaRsync(params: {
   const args: string[] = [
     '-az',
     '--delete',
+    '--no-devices',
+    '--no-specials',
+    '--safe-links',
     '--info=progress2',
     '--timeout=60',
   ];
   if (excludedSubpaths && excludedSubpaths.length > 0) {
     for (const rel of excludedSubpaths) {
       const cleanRel = rel.replace(/^\/+|\/+$/g, '');
-      if (cleanRel) {
+      if (cleanRel && !cleanRel.includes('..') && !/[\r\n\0]/.test(cleanRel)) {
         args.push(`--exclude=/${cleanRel}`);
       }
     }
@@ -73,17 +108,52 @@ function pushFilesViaRsync(params: {
   return new Promise((resolve, reject) => {
     const child = spawn('rsync', args, { stdio: ['ignore', 'pipe', 'pipe'] });
     let stderr = '';
+    let lastActivityAt = Date.now();
+    let idleTimedOut = false;
+
+    const watcher = setInterval(() => {
+      if (isJobCancelled(jobId)) {
+        terminateChildGracefully(child);
+        return;
+      }
+      if (Date.now() - lastActivityAt > RESTORE_IDLE_TIMEOUT_MS) {
+        idleTimedOut = true;
+        terminateChildGracefully(child);
+      }
+    }, 3000);
+
     child.stdout.on('data', (chunk: Buffer) => {
+      lastActivityAt = Date.now();
       const m = chunk.toString('utf8').match(/(\d+)%/);
       if (m) {
         onProgress(Math.min(100, Number(m[1])));
       }
     });
     child.stderr.on('data', (chunk: Buffer) => {
+      lastActivityAt = Date.now();
       stderr += chunk.toString('utf8');
+      if (stderr.length > 65536) {
+        stderr = stderr.slice(-32768);
+      }
     });
-    child.on('error', (err) => reject(err));
+    child.on('error', (err) => {
+      clearInterval(watcher);
+      reject(err);
+    });
     child.on('close', (code) => {
+      clearInterval(watcher);
+      if (isJobCancelled(jobId)) {
+        reject(new Error('Job khôi phục đã bị hủy bởi quản trị viên.'));
+        return;
+      }
+      if (idleTimedOut) {
+        reject(
+          new Error(
+            'Rsync Restore bị treo quá 30 phút không có phản hồi dữ liệu.'
+          )
+        );
+        return;
+      }
       if (code === 0 || code === 24) resolve();
       else reject(new Error(`Rsync Restore lỗi (code ${code}): ${stderr.trim()}`));
     });
@@ -91,21 +161,25 @@ function pushFilesViaRsync(params: {
 }
 
 function streamRestoreDatabaseOverSsh(params: {
+  jobId: number;
   targetServer: ServerRecord;
-  authFlags: string;
+  creds: MysqlAdminCredentials;
   dumpFilePath: string;
   targetDbName: string;
 }): Promise<void> {
-  const { targetServer, authFlags, dumpFilePath, targetDbName } = params;
+  const { jobId, targetServer, creds, dumpFilePath, targetDbName } = params;
 
   return new Promise((resolve, reject) => {
     const ext = path.extname(dumpFilePath).toLowerCase();
     const decompCmd =
-      ext === '.zst' ? 'zstdcat' : ext === '.gz' ? 'gzip -dc' : 'cat';
+      ext === '.zst' ? 'zstd -dc' : ext === '.gz' ? 'gzip -dc' : 'cat';
 
-    // Không nội suy đường dẫn / tham số ssh vào chuỗi bash cục bộ: truyền qua "$@".
-    // Lệnh phía VPS là 1 tham số duy nhất, tên DB được single-quote cho shell từ xa.
-    const remoteMysqlCmd = `mysql ${authFlags} ${shellSingleQuote(targetDbName)}`;
+    const authFlags = buildMysqlAuthFlags(creds);
+    const envPrelude = buildRemoteMysqlEnvPrelude(creds);
+
+    // Không đặt mật khẩu trên argv: nạp MYSQL_PWD nội bộ qua envPrelude trong bash phía VPS.
+    const remoteInner = `${envPrelude}mysql ${authFlags} ${shellSingleQuote(targetDbName)}`;
+    const remoteMysqlCmd = `bash -o pipefail -c ${shellSingleQuote(remoteInner)}`;
     const pipeline = `set -o pipefail; dump="$1"; shift; ${decompCmd} -- "$dump" | ssh "$@"`;
 
     const child = spawn(
@@ -116,6 +190,7 @@ function streamRestoreDatabaseOverSsh(params: {
         'restore-db',
         dumpFilePath,
         ...buildSshBaseArgs(targetServer),
+        '--',
         `${targetServer.ssh_user || 'root'}@${targetServer.ip_address}`,
         remoteMysqlCmd,
       ],
@@ -125,11 +200,48 @@ function streamRestoreDatabaseOverSsh(params: {
     );
 
     let stderr = '';
-    child.stderr.on('data', (d: Buffer) => {
-      stderr += d.toString('utf8');
+    let lastActivityAt = Date.now();
+    let idleTimedOut = false;
+
+    const watcher = setInterval(() => {
+      if (isJobCancelled(jobId)) {
+        terminateChildGracefully(child);
+        return;
+      }
+      if (Date.now() - lastActivityAt > RESTORE_IDLE_TIMEOUT_MS) {
+        idleTimedOut = true;
+        terminateChildGracefully(child);
+      }
+    }, 3000);
+
+    child.stdout.on('data', () => {
+      lastActivityAt = Date.now();
     });
-    child.on('error', (err) => reject(err));
+    child.stderr.on('data', (d: Buffer) => {
+      lastActivityAt = Date.now();
+      stderr += d.toString('utf8');
+      if (stderr.length > 65536) {
+        stderr = stderr.slice(-32768);
+      }
+    });
+    child.on('error', (err) => {
+      clearInterval(watcher);
+      reject(err);
+    });
     child.on('close', (code) => {
+      clearInterval(watcher);
+      if (isJobCancelled(jobId)) {
+        reject(new Error('Job khôi phục đã bị hủy bởi quản trị viên.'));
+        return;
+      }
+      if (idleTimedOut) {
+        reject(
+          new Error(
+            `Nạp Database ${targetDbName} quá thời gian chờ 30 phút (Idle Timeout).`
+          )
+        );
+        return;
+      }
       if (code === 0) resolve();
       else
         reject(
@@ -190,6 +302,9 @@ export async function executeRestoreJob(jobId: number): Promise<void> {
     const ts = new Date().toLocaleTimeString('vi-VN', { hour12: false });
     const line = `[${ts}] ${msg}`;
     logLines.push(line);
+    if (logLines.length > 250) {
+      logLines.shift();
+    }
     db.prepare('UPDATE backup_jobs SET live_log = ? WHERE id = ?').run(
       logLines.join('\n'),
       jobId
@@ -229,6 +344,10 @@ export async function executeRestoreJob(jobId: number): Promise<void> {
   emitJobUpdated(jobId);
 
   try {
+    if (isJobCancelled(jobId)) {
+      throw new Error('Job khôi phục đã bị hủy bởi quản trị viên.');
+    }
+
     const targetDomain = assertSafe(
       isSafeDomain,
       (payload.targetDomainName || item.domain_name).trim(),
@@ -240,9 +359,10 @@ export async function executeRestoreJob(jobId: number): Promise<void> {
       'User hệ thống đích'
     );
     assertSafe(isSafeDomain, item.domain_name, 'Tên miền nguồn trong bản sao lưu');
+    assertSafe(isSafeSnapshotName, item.snapshot_name, 'Snapshot nguồn');
     const targetAdapter = getPanelAdapter(targetServer);
 
-    // Webroot đích nhận rsync --delete và chown -R với quyền root: chặn "/", "/home", ".."...
+    // Webroot đích nhận rsync --delete và chown -hR với quyền root: chặn "/", "/home", ".."...
     const resolvedWebroot = assertSafe(
       (v) => isSafeWebroot(v.replace(/\/+$/, '')),
       payload.targetWebrootOverride?.trim() ||
@@ -266,13 +386,18 @@ export async function executeRestoreJob(jobId: number): Promise<void> {
     const localDatabasesDir = path.join(sourceDomainDir, 'databases');
     const metadataPath = path.join(sourceDomainDir, 'metadata.json');
     let savedExcludedSubpaths: string[] = [];
-    if (!isCrossPanel && fs.existsSync(metadataPath)) {
+    const shouldPreserveExcludedSubpaths =
+      !payload.targetWebrootOverride?.trim() &&
+      sourceServer.panel_type === targetServer.panel_type;
+    if (shouldPreserveExcludedSubpaths && fs.existsSync(metadataPath)) {
       try {
         const meta = JSON.parse(
           fs.readFileSync(metadataPath, 'utf8')
         ) as DomainMetadataJson;
         if (Array.isArray(meta.excluded_subpaths)) {
-          savedExcludedSubpaths = meta.excluded_subpaths;
+          savedExcludedSubpaths = meta.excluded_subpaths.filter(
+            (s) => typeof s === 'string' && !s.includes('..') && !/[\r\n\0]/.test(s)
+          );
         }
       } catch {
         // Ignore invalid metadata
@@ -287,13 +412,17 @@ export async function executeRestoreJob(jobId: number): Promise<void> {
 
     // 1. Khôi phục Mã nguồn (Files)
     if (payload.mode === 'FILES_ONLY' || payload.mode === 'FULL') {
+      if (isJobCancelled(jobId)) {
+        throw new Error('Job khôi phục đã bị hủy bởi quản trị viên.');
+      }
+
       if (!fs.existsSync(localPublicHtml)) {
         throw new Error(
           `Không tìm thấy thư mục mã nguồn tại ${localPublicHtml}`
         );
       }
 
-      setStep(20, `Đang đẩy mã nguồn lên ${resolvedWebroot}...`);
+      setStep(20, `Đang kiểm tra an toàn & đẩy mã nguồn lên ${resolvedWebroot}...`);
       appendLog(
         `[Files Restore] Nguồn NAS: ${localPublicHtml} ➔ Đích VPS: ${targetServer.hostname}:${resolvedWebroot}`
       );
@@ -324,6 +453,20 @@ export async function executeRestoreJob(jobId: number): Promise<void> {
           `[Permissions] Đã thực thi chuẩn hóa quyền trên ${targetServer.panel_type}: ${permCmd}`
         );
       } else {
+        // Kiểm tra Symlink Webroot Jail trước khi mkdir -p và rsync --delete trên VPS đích
+        const safety = await verifyRemoteWebrootSafety(
+          targetServer,
+          targetServer.panel_type,
+          targetUser,
+          resolvedWebroot,
+          { mustExist: false }
+        );
+        if (!safety.ok) {
+          throw new Error(
+            `[SECURITY] Từ chối khôi phục mã nguồn vào đường dẫn không an toàn (${resolvedWebroot}): ${safety.reason}`
+          );
+        }
+
         await execRemoteSSH(
           targetServer,
           `mkdir -p ${shellSingleQuote(resolvedWebroot)}`,
@@ -337,6 +480,7 @@ export async function executeRestoreJob(jobId: number): Promise<void> {
           );
         }
         await pushFilesViaRsync({
+          jobId,
           targetServer,
           localPublicHtmlDir: localPublicHtml,
           targetWebroot: resolvedWebroot,
@@ -374,14 +518,31 @@ export async function executeRestoreJob(jobId: number): Promise<void> {
       } else {
         const creds = await targetAdapter.getMysqlAdminCredentials(targetServer);
         const authFlags = buildMysqlAuthFlags(creds);
+        const envPrelude = buildRemoteMysqlEnvPrelude(creds);
 
         for (let i = 0; i < dbsToRestore.length; i++) {
+          if (isJobCancelled(jobId)) {
+            throw new Error('Job khôi phục đã bị hủy bởi quản trị viên.');
+          }
+
           const dbInfo = dbsToRestore[i];
           const targetDbName = assertSafe(
             isSafeDbName,
             payload.targetDbMap?.[dbInfo.name]?.trim() || dbInfo.name,
             'Tên database đích'
           );
+
+          if (
+            !dbInfo.file ||
+            path.basename(dbInfo.file) !== dbInfo.file ||
+            dbInfo.file.includes('..') ||
+            /[/\\\0]/.test(dbInfo.file)
+          ) {
+            throw new Error(
+              `Tên file dump SQL không hợp lệ: ${JSON.stringify(dbInfo.file)}`
+            );
+          }
+
           const dumpPath = path.join(localDatabasesDir, dbInfo.file);
 
           if (!fs.existsSync(dumpPath)) {
@@ -403,14 +564,21 @@ export async function executeRestoreJob(jobId: number): Promise<void> {
               `[DB Stream Restore] ✅ Đã nạp thành công toàn bộ bảng vào database "${targetDbName}" trên ${targetServer.hostname}.`
             );
           } else {
-            await execRemoteSSH(
-              targetServer,
-              `mysql ${authFlags} -e "CREATE DATABASE IF NOT EXISTS \\\`${targetDbName}\\\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"`,
-              { zeroImpact: true }
-            );
+            const createDbCmd = `bash -o pipefail -c ${shellSingleQuote(
+              `${envPrelude}mysql ${authFlags} -e "CREATE DATABASE IF NOT EXISTS \\\`${targetDbName}\\\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"`
+            )}`;
+            const createRes = await execRemoteSSH(targetServer, createDbCmd, {
+              zeroImpact: true,
+            });
+            if (createRes.code !== 0) {
+              throw new Error(
+                `Không thể khởi tạo database đích "${targetDbName}": ${createRes.stderr.trim()}`
+              );
+            }
             await streamRestoreDatabaseOverSsh({
+              jobId,
               targetServer,
-              authFlags,
+              creds,
               dumpFilePath: dumpPath,
               targetDbName,
             });
@@ -445,25 +613,39 @@ export async function executeRestoreJob(jobId: number): Promise<void> {
 
     emitJobUpdated(jobId);
   } catch (err) {
+    const cancelled = isJobCancelled(jobId);
     const errMsg = (err as Error).message;
-    appendLog(`❌ Khôi phục thất bại: ${errMsg}`);
+    appendLog(
+      cancelled
+        ? `⏹️ Phiên khôi phục đã bị hủy: ${errMsg}`
+        : `❌ Khôi phục thất bại: ${errMsg}`
+    );
     db.prepare(
       `UPDATE backup_jobs
-       SET status = 'FAILED', current_phase = 'Khôi phục thất bại', completed_at = datetime('now'), error_log = ?
+       SET status = ?, current_phase = ?, completed_at = datetime('now'), error_log = ?
        WHERE id = ?`
-    ).run(errMsg, jobId);
+    ).run(
+      cancelled ? 'CANCELLED' : 'FAILED',
+      cancelled ? 'Đã hủy bởi quản trị viên' : 'Khôi phục thất bại',
+      errMsg,
+      jobId
+    );
 
-    await createSystemAlert({
-      severity: 'CRITICAL',
-      category: 'RESTORE',
-      title: `Khôi phục thất bại cho ${item.domain_name}`,
-      message: errMsg,
-      serverId: targetServer.id,
-      jobId,
-    });
+    if (!cancelled) {
+      await createSystemAlert({
+        severity: 'CRITICAL',
+        category: 'RESTORE',
+        title: `Khôi phục thất bại cho ${item.domain_name}`,
+        message: errMsg,
+        serverId: targetServer.id,
+        jobId,
+      });
+    }
 
     emitJobUpdated(jobId);
     throw err;
+  } finally {
+    clearCancelledJob(jobId);
   }
 }
 

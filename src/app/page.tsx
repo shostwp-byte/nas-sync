@@ -112,17 +112,19 @@ export default function DashboardPage() {
   return (
     <div className="space-y-6">
       {/* Top Banner */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 bg-gradient-to-r from-slate-900 via-slate-900 to-blue-950/50 border border-slate-800 rounded-2xl p-5">
-        <div>
-          <div className="flex items-center gap-2 text-xs font-medium text-blue-400 mb-1">
-            <Sparkles className="w-3.5 h-3.5" />
-            ENGINE:{' '}
-            {data?.runtime.mode === 'BULLMQ_REDIS'
-              ? 'BullMQ + Redis Cluster Queue'
-              : 'Local Concurrent Queue (Windows/Standalone Compatible)'}{' '}
-            • {data?.runtime.activeSchedulesCount || 0} lịch Cron đang bật
+      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 bg-gradient-to-r from-slate-900 via-slate-900 to-blue-950/50 border border-slate-800 rounded-2xl p-4 sm:p-5">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-1.5 text-xs font-medium text-blue-400 mb-1">
+            <Sparkles className="w-3.5 h-3.5 shrink-0" />
+            <span>
+              ENGINE:{' '}
+              {data?.runtime.mode === 'BULLMQ_REDIS'
+                ? 'BullMQ + Redis Cluster Queue'
+                : 'Local Concurrent Queue (Windows/Standalone Compatible)'}{' '}
+              • {data?.runtime.activeSchedulesCount || 0} lịch Cron đang bật
+            </span>
           </div>
-          <h2 className="text-lg font-bold text-white">
+          <h2 className="text-base sm:text-lg font-bold text-white">
             Trung tâm Giám sát Sao lưu Tập trung NAS-Sync
           </h2>
           <p className="text-xs text-slate-400 mt-0.5">
@@ -130,30 +132,31 @@ export default function DashboardPage() {
           </p>
         </div>
 
-        <div className="flex items-center gap-2.5">
+        <div className="flex flex-wrap items-center gap-2 w-full md:w-auto shrink-0">
           <button
+            type="button"
             onClick={() => void loadDashboard()}
-            className="inline-flex items-center gap-2 px-3.5 py-2 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700"
+            className="flex-1 sm:flex-initial justify-center min-h-[40px] whitespace-nowrap inline-flex items-center gap-2 px-3.5 py-2 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors"
           >
-            <RefreshCw className="w-3.5 h-3.5" />
+            <RefreshCw className="w-3.5 h-3.5 shrink-0" />
             Làm mới
           </button>
           <Link
             href="/servers"
-            className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold bg-blue-600 hover:bg-blue-500 text-white shadow-lg shadow-blue-600/20"
+            className="flex-1 sm:flex-initial justify-center min-h-[40px] whitespace-nowrap inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold bg-blue-600 hover:bg-blue-500 text-white shadow-lg shadow-blue-600/20 transition-colors"
           >
-            <Server className="w-3.5 h-3.5" />
+            <Server className="w-3.5 h-3.5 shrink-0" />
             Quản lý VPS
           </Link>
         </div>
       </div>
 
       {/* 4 KPI Cards */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
-        <div className="bg-slate-900 border border-slate-800 rounded-xl p-5">
-          <div className="flex items-center justify-between text-slate-400 text-xs mb-2">
+      <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3.5 sm:gap-4">
+        <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 sm:p-5">
+          <div className="flex items-center justify-between gap-2 text-slate-400 text-xs mb-2">
             <span>Máy chủ VPS Quản lý</span>
-            <Server className="w-4 h-4 text-blue-400" />
+            <Server className="w-4 h-4 text-blue-400 shrink-0" />
           </div>
           <div className="text-2xl font-bold text-white">
             {stats?.onlineServers ?? 0}{' '}
@@ -166,10 +169,10 @@ export default function DashboardPage() {
           </div>
         </div>
 
-        <div className="bg-slate-900 border border-slate-800 rounded-xl p-5">
-          <div className="flex items-center justify-between text-slate-400 text-xs mb-2">
+        <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 sm:p-5">
+          <div className="flex items-center justify-between gap-2 text-slate-400 text-xs mb-2">
             <span>Bản Sao lưu & Kiểm định SQL</span>
-            <Database className="w-4 h-4 text-emerald-400" />
+            <Database className="w-4 h-4 text-emerald-400 shrink-0" />
           </div>
           <div className="text-2xl font-bold text-white">
             {stats?.totalSnapshots ?? 0}{' '}
@@ -178,15 +181,15 @@ export default function DashboardPage() {
             </span>
           </div>
           <div className="mt-2 text-xs text-emerald-400 flex items-center gap-1">
-            <CheckCircle2 className="w-3.5 h-3.5" />
-            {stats?.verifiedItemsCount ?? 0} Domain DB đạt chuẩn Verified ✅
+            <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+            <span>{stats?.verifiedItemsCount ?? 0} Domain DB đạt chuẩn Verified ✅</span>
           </div>
         </div>
 
-        <div className="bg-slate-900 border border-slate-800 rounded-xl p-5">
-          <div className="flex items-center justify-between text-slate-400 text-xs mb-2">
+        <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 sm:p-5">
+          <div className="flex items-center justify-between gap-2 text-slate-400 text-xs mb-2">
             <span>Hiệu quả Hard-Link Incremental</span>
-            <HardDrive className="w-4 h-4 text-cyan-400" />
+            <HardDrive className="w-4 h-4 text-cyan-400 shrink-0" />
           </div>
           <div className="text-2xl font-bold text-white">
             {(stats?.savingsPercent ?? 0).toFixed(1)}%{' '}
@@ -198,20 +201,20 @@ export default function DashboardPage() {
           </div>
         </div>
 
-        <div className="bg-slate-900 border border-slate-800 rounded-xl p-5">
-          <div className="flex items-center justify-between text-slate-400 text-xs mb-2">
+        <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 sm:p-5">
+          <div className="flex items-center justify-between gap-2 text-slate-400 text-xs mb-2">
             <span>An toàn Chống Ransomware</span>
-            <ShieldAlert className="w-4 h-4 text-amber-400" />
+            <ShieldAlert className="w-4 h-4 text-amber-400 shrink-0" />
           </div>
-          <div className="text-2xl font-bold text-white flex items-baseline gap-2">
+          <div className="text-2xl font-bold text-white flex flex-wrap items-baseline gap-2">
             <span>{stats?.pinnedSnapshotsCount ?? 0}</span>
             <span className="text-xs font-normal text-slate-400">
               bản khóa bảo vệ (Pinned)
             </span>
           </div>
           <div className="mt-2 text-xs text-slate-400 flex items-center gap-1.5">
-            <Lock className="w-3.5 h-3.5 text-amber-400" />
-            Phát hiện bất thường: {stats?.anomalyCount ?? 0} phiên
+            <Lock className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+            <span>Phát hiện bất thường: {stats?.anomalyCount ?? 0} phiên</span>
           </div>
         </div>
       </div>
@@ -219,12 +222,12 @@ export default function DashboardPage() {
       {/* Multi-Volume Storage & Quick Trigger */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* Multi-Volume Status */}
-        <div className="lg:col-span-2 bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-4">
-          <div className="flex items-center justify-between">
-            <div>
+        <div className="lg:col-span-2 bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-5 space-y-4">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+            <div className="min-w-0">
               <h3 className="text-sm font-semibold text-white flex items-center gap-2">
-                <HardDrive className="w-4 h-4 text-blue-400" />
-                Trạng thái Đa Phân vùng Synology NAS (Smart Multi-Volume)
+                <HardDrive className="w-4 h-4 text-blue-400 shrink-0" />
+                <span>Trạng thái Đa Phân vùng Synology NAS (Smart Multi-Volume)</span>
               </h3>
               <p className="text-xs text-slate-400 mt-0.5">
                 Tự động Local Seeding sang Volume kế tiếp khi chạm ngưỡng mà không đứt chuỗi Incremental
@@ -232,7 +235,7 @@ export default function DashboardPage() {
             </div>
             <Link
               href="/volumes"
-              className="text-xs text-blue-400 hover:text-blue-300 font-medium"
+              className="text-xs text-blue-400 hover:text-blue-300 font-medium shrink-0 whitespace-nowrap"
             >
               Cấu hình Volume →
             </Link>
@@ -251,20 +254,20 @@ export default function DashboardPage() {
                   key={vol.id}
                   className="bg-slate-950/80 border border-slate-800 rounded-xl p-4 space-y-3"
                 >
-                  <div className="flex items-start justify-between">
-                    <div>
-                      <div className="font-semibold text-sm text-white flex items-center gap-2">
-                        {vol.name}
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0">
+                      <div className="font-semibold text-sm text-white flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                        <span>{vol.name}</span>
                         <span className="text-[11px] font-normal text-slate-400">
                           (Ưu tiên #{vol.priority})
                         </span>
                       </div>
-                      <div className="text-xs font-mono text-slate-400 mt-0.5">
+                      <div className="text-xs font-mono text-slate-400 mt-0.5 break-all">
                         {vol.mount_path}
                       </div>
                     </div>
                     <span
-                      className={`px-2 py-0.5 text-[11px] font-semibold rounded border ${
+                      className={`px-2 py-0.5 text-[11px] font-semibold rounded border shrink-0 ${
                         vol.status === 'ACTIVE'
                           ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
                           : vol.status === 'FULL'
@@ -277,7 +280,7 @@ export default function DashboardPage() {
                   </div>
 
                   <div>
-                    <div className="flex justify-between text-xs mb-1.5">
+                    <div className="flex flex-wrap justify-between gap-x-3 gap-y-1 text-xs mb-1.5">
                       <span className="text-slate-300 font-medium">
                         Đã dùng {pct.toFixed(1)}% ({formatBytes(vol.used_bytes)})
                       </span>
@@ -297,9 +300,13 @@ export default function DashboardPage() {
                         style={{ width: `${Math.max(2, pct)}%` }}
                       />
                     </div>
-                    <div className="flex justify-between text-[11px] text-slate-500 mt-1.5">
-                      <span>Ngưỡng tràn: {vol.max_usage_percent}%</span>
-                      <span>Tối thiểu trống: {vol.min_free_gb} GB</span>
+                    <div className="flex flex-wrap justify-between gap-x-3 gap-y-1 text-[11px] text-slate-500 mt-1.5">
+                      <span>Ngưỡng cảnh báo: {vol.max_usage_percent}% (Min {vol.min_free_gb} GB)</span>
+                      <span>
+                        {vol.btrfs_immutable_enabled === 1
+                          ? `Btrfs WORM (${vol.btrfs_retention_days}d) 🔒`
+                          : 'Chuẩn POSIX'}
+                      </span>
                     </div>
                   </div>
                 </div>
@@ -309,11 +316,11 @@ export default function DashboardPage() {
         </div>
 
         {/* Quick Trigger Backup Card */}
-        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 flex flex-col">
+        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-5 flex flex-col">
           <div className="mb-3">
             <h3 className="text-sm font-semibold text-white flex items-center gap-2">
-              <Play className="w-4 h-4 text-emerald-400" />
-              Kích hoạt Sao lưu Nhanh (1-Click)
+              <Play className="w-4 h-4 text-emerald-400 shrink-0" />
+              <span>Kích hoạt Sao lưu Nhanh (1-Click)</span>
             </h3>
             <p className="text-xs text-slate-400 mt-0.5">
               Chọn máy chủ để chạy ngay phiên Pull Backup về NAS
@@ -324,41 +331,51 @@ export default function DashboardPage() {
             {servers.map((srv) => (
               <div
                 key={srv.id}
-                className="flex items-center justify-between p-3 rounded-xl bg-slate-950/80 border border-slate-800"
+                className="flex items-center justify-between gap-2.5 p-3 rounded-xl bg-slate-950/80 border border-slate-800"
               >
-                <div className="min-w-0 pr-2">
-                  <div className="text-xs font-semibold text-white truncate flex items-center gap-1.5">
-                    {srv.hostname}
+                <div className="min-w-0 flex-1">
+                  <div className="text-xs font-semibold text-white flex items-center gap-1.5 min-w-0">
+                    <span
+                      className={`w-2 h-2 rounded-full shrink-0 ${
+                        srv.status === 'ONLINE'
+                          ? 'bg-emerald-400'
+                          : srv.status === 'BACKUP_RUNNING'
+                          ? 'bg-blue-400 animate-pulse'
+                          : 'bg-rose-400'
+                      }`}
+                    />
+                    <span className="truncate">{srv.hostname}</span>
                     {srv.is_mock === 1 && (
-                      <span className="text-[10px] px-1.5 py-0.2 bg-amber-500/15 text-amber-300 rounded">
+                      <span className="text-[10px] px-1.5 py-0.5 bg-amber-500/15 text-amber-300 rounded shrink-0">
                         Demo
                       </span>
                     )}
                   </div>
-                  <div className="flex items-center gap-2 mt-1">
+                  <div className="flex flex-wrap items-center gap-1.5 mt-1">
                     <span
-                      className={`text-[10px] px-1.5 py-0.5 rounded border ${getPanelBadgeClass(
+                      className={`text-[10px] px-1.5 py-0.5 rounded border shrink-0 ${getPanelBadgeClass(
                         srv.panel_type
                       )}`}
                     >
                       {srv.panel_type}
                     </span>
-                    <span className="text-[11px] text-slate-500">
+                    <span className="text-[11px] text-slate-500 font-mono truncate">
                       {srv.ip_address}
                     </span>
                   </div>
                 </div>
 
                 <button
+                  type="button"
                   onClick={() => void triggerQuickBackup(srv.id)}
                   disabled={
                     startingServerId === srv.id ||
                     srv.status === 'BACKUP_RUNNING'
                   }
-                  className="shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-emerald-600/20 hover:bg-emerald-600 text-emerald-300 hover:text-white border border-emerald-500/30 disabled:opacity-50 transition-all"
+                  className="shrink-0 whitespace-nowrap min-h-[38px] px-3.5 inline-flex items-center justify-center gap-1.5 rounded-lg text-xs font-medium bg-emerald-600/20 hover:bg-emerald-600 text-emerald-300 hover:text-white border border-emerald-500/30 disabled:opacity-50 transition-all"
                 >
-                  <Play className="w-3 h-3 fill-current" />
-                  {srv.status === 'BACKUP_RUNNING' ? 'Đang chạy' : 'Backup'}
+                  <Play className="w-3 h-3 fill-current shrink-0" />
+                  {srv.status === 'BACKUP_RUNNING' ? 'Đang chạy' : 'Sao lưu'}
                 </button>
               </div>
             ))}
@@ -369,24 +386,24 @@ export default function DashboardPage() {
       {/* Live Progress & Live Terminal Console */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Active Progress */}
-        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-4">
-          <div className="flex items-center justify-between">
+        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-5 space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-2">
             <h3 className="text-sm font-semibold text-white flex items-center gap-2">
-              <Activity className="w-4 h-4 text-blue-400" />
-              Tiến trình Đang thực thi Thời gian thực (WebSocket)
+              <Activity className="w-4 h-4 text-blue-400 shrink-0" />
+              <span>Tiến trình Đang thực thi Thời gian thực (WebSocket)</span>
             </h3>
             <Link
               href="/jobs"
-              className="text-xs text-blue-400 hover:text-blue-300"
+              className="text-xs text-blue-400 hover:text-blue-300 shrink-0 whitespace-nowrap"
             >
               Tất cả lịch sử →
             </Link>
           </div>
 
           {activeJobs.length === 0 ? (
-            <div className="py-10 text-center text-xs text-slate-500 border border-dashed border-slate-800 rounded-xl">
+            <div className="py-10 px-4 text-center text-xs text-slate-500 border border-dashed border-slate-800 rounded-xl">
               Hiện không có tiến trình nào đang chạy. Hãy nhấn nút{' '}
-              <strong className="text-slate-300">Backup</strong> ở khung bên trên để xem trực tiếp thanh tiến trình & Live Terminal!
+              <strong className="text-slate-300">Sao lưu</strong> ở khung bên trên để xem trực tiếp thanh tiến trình & Live Terminal!
             </div>
           ) : (
             <div className="space-y-3">
@@ -397,28 +414,36 @@ export default function DashboardPage() {
                 const dom = live?.currentDomain ?? j.current_domain;
                 const speed = live?.speedBps ?? j.speed_bps;
                 const eta = live?.etaSeconds ?? j.eta_seconds;
+                const retries = live?.retryCount ?? j.retry_count;
                 const st = getJobStatusMeta(live?.status ?? j.status);
 
                 return (
                   <div
                     key={j.id}
-                    className="p-4 rounded-xl bg-slate-950 border border-blue-500/30 space-y-2.5"
+                    className="p-3.5 sm:p-4 rounded-xl bg-slate-950 border border-blue-500/30 space-y-2.5"
                   >
-                    <div className="flex items-center justify-between">
-                      <div className="font-semibold text-sm text-white flex items-center gap-2">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="font-semibold text-sm text-white flex flex-wrap items-center gap-1.5 min-w-0">
                         <span>#{j.id}</span>
-                        <span>{j.server_hostname}</span>
+                        <span className="break-all">{j.server_hostname}</span>
                         {dom && (
-                          <span className="text-xs font-mono text-cyan-400">
+                          <span className="text-xs font-mono text-cyan-400 break-all">
                             ({dom})
                           </span>
                         )}
                       </div>
-                      <span
-                        className={`text-[11px] px-2 py-0.5 rounded border ${st.className}`}
-                      >
-                        {st.label}
-                      </span>
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        {retries > 0 && (
+                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/30 shrink-0">
+                            Retry #{retries}
+                          </span>
+                        )}
+                        <span
+                          className={`text-[11px] px-2 py-0.5 rounded border shrink-0 ${st.className}`}
+                        >
+                          {st.label}
+                        </span>
+                      </div>
                     </div>
 
                     <div className="w-full h-2.5 bg-slate-800 rounded-full overflow-hidden">
@@ -428,8 +453,8 @@ export default function DashboardPage() {
                       />
                     </div>
 
-                    <div className="flex items-center justify-between text-xs text-slate-400">
-                      <span className="truncate pr-2">{phase}</span>
+                    <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-1 text-xs text-slate-400">
+                      <span className="break-words">{phase}</span>
                       <span className="shrink-0 font-mono text-slate-300">
                         {pct}% • {formatSpeed(speed)} • ETA {formatEta(eta)}
                       </span>
@@ -442,15 +467,18 @@ export default function DashboardPage() {
         </div>
 
         {/* Live Terminal Stream */}
-        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 flex flex-col">
-          <div className="flex items-center justify-between mb-3">
-            <h3 className="text-sm font-semibold text-white flex items-center gap-2">
-              <Terminal className="w-4 h-4 text-emerald-400" />
-              Live Worker Terminal Log (Rsync / SSH Stream / Sandbox)
+        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-5 flex flex-col">
+          <div className="flex items-center justify-between gap-2 mb-3">
+            <h3 className="text-sm font-semibold text-white flex items-center gap-2 min-w-0">
+              <Terminal className="w-4 h-4 text-emerald-400 shrink-0" />
+              <span className="truncate">
+                Live Worker Terminal Log (Rsync / SSH Stream / Sandbox)
+              </span>
             </h3>
             <button
+              type="button"
               onClick={clearLogs}
-              className="text-[11px] text-slate-400 hover:text-white"
+              className="text-[11px] text-slate-400 hover:text-white shrink-0 whitespace-nowrap"
             >
               Xóa màn hình
             </button>
@@ -458,7 +486,7 @@ export default function DashboardPage() {
 
           <div className="flex-1 bg-slate-950 border border-slate-800 rounded-xl p-3.5 font-mono text-xs h-56 overflow-y-auto space-y-1">
             {liveLogs.length === 0 ? (
-              <div className="text-slate-600">
+              <div className="text-slate-600 break-words">
                 nas-sync-worker@synology-nas:~$ Đang lắng nghe luồng sự kiện thời gian thực từ Worker...
               </div>
             ) : (
@@ -475,22 +503,88 @@ export default function DashboardPage() {
 
       {/* Recent Jobs Table & Recent Alerts */}
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
-        <div className="xl:col-span-2 bg-slate-900 border border-slate-800 rounded-2xl p-5">
-          <div className="flex items-center justify-between mb-4">
+        <div className="xl:col-span-2 bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-5">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-4">
             <h3 className="text-sm font-semibold text-white">
               Phiên Sao lưu & Khôi phục Gần đây
             </h3>
             <Link
               href="/explorer"
-              className="inline-flex items-center gap-1.5 text-xs text-cyan-400 hover:text-cyan-300"
+              className="inline-flex items-center gap-1.5 text-xs text-cyan-400 hover:text-cyan-300 shrink-0"
             >
-              <FolderGit2 className="w-3.5 h-3.5" />
+              <FolderGit2 className="w-3.5 h-3.5 shrink-0" />
               Mở File Explorer & Diff Viewer
             </Link>
           </div>
 
-          <div className="overflow-x-auto">
-            <table className="w-full text-left text-xs">
+          {/* Mobile Card List (< md) */}
+          <div className="md:hidden divide-y divide-slate-800/70">
+            {(data?.recentJobs || []).length === 0 ? (
+              <div className="py-8 text-center text-xs text-slate-500">
+                Chưa có phiên sao lưu hoặc khôi phục nào gần đây.
+              </div>
+            ) : (
+              (data?.recentJobs || []).slice(0, 8).map((job) => {
+                const st = getJobStatusMeta(
+                  progressMap[job.id]?.status || job.status
+                );
+                return (
+                  <div key={job.id} className="py-3.5 first:pt-0 last:pb-0 space-y-2 text-xs">
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="min-w-0">
+                        <div className="font-semibold text-white flex flex-wrap items-center gap-1.5">
+                          <span>#{job.id}</span>
+                          <span className="break-all">{job.server_hostname}</span>
+                          {job.is_pinned === 1 && (
+                            <span title="Đã khóa bảo vệ Pinned">📌</span>
+                          )}
+                        </div>
+                        <div className="text-[11px] text-slate-400 mt-0.5">
+                          {job.job_type === 'RESTORE'
+                            ? `Restore ➔ ${job.target_server_hostname || ''}`
+                            : `Backup (${job.server_panel})`}
+                          {job.volume_name ? ` • ${job.volume_name}` : ''}
+                        </div>
+                      </div>
+                      <span
+                        className={`inline-block px-2 py-0.5 rounded border text-[11px] shrink-0 ${st.className}`}
+                      >
+                        {st.label}
+                      </span>
+                    </div>
+
+                    <div className="font-mono text-[11px] text-slate-300 break-all bg-slate-950/70 border border-slate-800/80 rounded-lg px-2.5 py-1.5">
+                      {job.snapshot_name}
+                    </div>
+
+                    <div className="flex flex-wrap items-center justify-between gap-2 text-[11px]">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="text-slate-200 font-medium">
+                          {formatBytes(job.total_size_bytes)}
+                        </span>
+                        <span className="text-emerald-400">
+                          +{formatBytes(job.delta_size_bytes)}
+                        </span>
+                        <span className="text-slate-500">
+                          • {formatDateTime(job.completed_at || job.created_at)}
+                        </span>
+                      </div>
+                      <Link
+                        href="/jobs"
+                        className="text-blue-400 hover:text-blue-300 font-medium shrink-0"
+                      >
+                        Chi tiết →
+                      </Link>
+                    </div>
+                  </div>
+                );
+              })
+            )}
+          </div>
+
+          {/* Desktop/Tablet Table (>= md) */}
+          <div className="hidden md:block overflow-x-auto">
+            <table className="w-full min-w-[640px] text-left text-xs">
               <thead>
                 <tr className="text-slate-400 border-b border-slate-800">
                   <th className="pb-2.5 font-medium">Job / Máy chủ</th>
@@ -551,15 +645,15 @@ export default function DashboardPage() {
         </div>
 
         {/* Alerts */}
-        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5">
-          <div className="flex items-center justify-between mb-4">
+        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-5">
+          <div className="flex flex-wrap items-center justify-between gap-2 mb-4">
             <h3 className="text-sm font-semibold text-white flex items-center gap-2">
-              <AlertTriangle className="w-4 h-4 text-amber-400" />
-              Nhật ký Cảnh báo Hệ thống
+              <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
+              <span>Nhật ký Cảnh báo Hệ thống</span>
             </h3>
             <Link
               href="/settings"
-              className="text-xs text-slate-400 hover:text-white"
+              className="text-xs text-slate-400 hover:text-white shrink-0"
             >
               Cài đặt Telegram/SMTP
             </Link>
@@ -582,13 +676,13 @@ export default function DashboardPage() {
                       : 'bg-slate-950 border-slate-800 text-slate-300'
                   }`}
                 >
-                  <div className="font-semibold flex items-center justify-between gap-2">
-                    <span>{al.title}</span>
+                  <div className="font-semibold flex items-start justify-between gap-2">
+                    <span className="break-words min-w-0">{al.title}</span>
                     <span className="text-[10px] opacity-75 shrink-0">
                       {al.category}
                     </span>
                   </div>
-                  <p className="text-[11px] opacity-85 line-clamp-3">
+                  <p className="text-[11px] opacity-85 line-clamp-3 break-words">
                     {al.message}
                   </p>
                   <div className="text-[10px] opacity-60">

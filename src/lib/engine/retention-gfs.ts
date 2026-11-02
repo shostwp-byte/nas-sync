@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { getDb } from '@/lib/db';
+import { isSafeSnapshotName } from './safe-names';
 import { refreshAllVolumes, resolveLatestSnapshotDir } from './volume-manager';
 import type { RetentionPolicy } from '@/types';
 
@@ -15,11 +16,14 @@ interface SnapshotCandidate {
   isPinned: boolean;
 }
 
-function getIsoDayKey(d: Date): string {
-  return d.toISOString().slice(0, 10);
+function getLocalDayKey(d: Date): string {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
 }
 
-function getIsoWeekKey(d: Date): string {
+function getLocalWeekKey(d: Date): string {
   const copy = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
   const dayNum = copy.getUTCDay() || 7;
   copy.setUTCDate(copy.getUTCDate() + 4 - dayNum);
@@ -28,14 +32,65 @@ function getIsoWeekKey(d: Date): string {
   return `${copy.getUTCFullYear()}-W${String(weekNo).padStart(2, '0')}`;
 }
 
-function getMonthKey(d: Date): string {
+function getLocalMonthKey(d: Date): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+}
+
+function collectActiveRestoreProtection(serverId: number): {
+  protectedJobIds: Set<number>;
+  protectedSnapshotNames: Set<string>;
+} {
+  const db = getDb();
+  const protectedJobIds = new Set<number>();
+  const protectedSnapshotNames = new Set<string>();
+
+  const activeRestores = db
+    .prepare(
+      `SELECT server_id, snapshot_name, restore_options
+       FROM backup_jobs
+       WHERE job_type = 'RESTORE'
+         AND status IN ('QUEUED', 'RUNNING', 'RESUMING', 'VERIFYING', 'INTERRUPTED')`
+    )
+    .all();
+
+  const itemStmt = db.prepare(
+    'SELECT job_id, server_id, snapshot_name FROM backup_items WHERE id = ?'
+  );
+
+  for (const r of activeRestores) {
+    if (Number(r.server_id) === serverId && r.snapshot_name) {
+      protectedSnapshotNames.add(String(r.snapshot_name));
+    }
+    if (!r.restore_options) continue;
+    try {
+      const parsed = JSON.parse(String(r.restore_options)) as {
+        sourceJobId?: number;
+        backupItemId?: number;
+      };
+      if (parsed.sourceJobId && Number.isFinite(Number(parsed.sourceJobId))) {
+        protectedJobIds.add(Number(parsed.sourceJobId));
+      }
+      if (parsed.backupItemId && Number.isFinite(Number(parsed.backupItemId))) {
+        const itemRow = itemStmt.get(Number(parsed.backupItemId));
+        if (itemRow) {
+          protectedJobIds.add(Number(itemRow.job_id));
+          if (Number(itemRow.server_id) === serverId && itemRow.snapshot_name) {
+            protectedSnapshotNames.add(String(itemRow.snapshot_name));
+          }
+        }
+      }
+    } catch {
+      // Ignore malformed JSON
+    }
+  }
+
+  return { protectedJobIds, protectedSnapshotNames };
 }
 
 /**
  * Mục 9.4: Chính sách Lưu trữ GFS (Grandfather-Father-Son Retention)
  * Mặc định: Giữ lại 7 bản Daily + 4 bản Weekly (ưu tiên Chủ nhật) + 6 bản Monthly (ưu tiên mùng 1)
- * Tuyệt đối không xóa bản đang là symlink `latest` hoặc bản đã được gắn cờ `is_pinned`.
+ * Tuyệt đối không xóa bản đang là symlink `latest`, bản `is_pinned`, hoặc bản đang phục vụ Restore.
  */
 export async function applyGfsRetentionForServer(
   serverId: number,
@@ -46,6 +101,10 @@ export async function applyGfsRetentionForServer(
   deletedSnapshots: string[];
   freedVolumesRefreshed: boolean;
 }> {
+  const safeDaily = Math.max(1, Math.floor(Number(policy?.daily) || 7));
+  const safeWeekly = Math.max(0, Math.floor(Number(policy?.weekly ?? 4) || 0));
+  const safeMonthly = Math.max(0, Math.floor(Number(policy?.monthly ?? 6) || 0));
+
   const db = getDb();
   const rows = db
     .prepare(
@@ -78,9 +137,12 @@ export async function applyGfsRetentionForServer(
     isPinned: Number(r.is_pinned) === 1 || Number(r.pinned_items) > 0,
   }));
 
+  const { protectedJobIds, protectedSnapshotNames } =
+    collectActiveRestoreProtection(serverId);
+
   const keepMap = new Map<number, string>();
 
-  // 1. Luôn giữ lại bản mới nhất tuyệt đối và mọi bản được Pin hoặc đang trỏ bởi symlink latest
+  // 1. Luôn giữ lại bản mới nhất tuyệt đối, bản Pinned, bản đang trỏ bởi symlink latest, hoặc bản đang Restore
   candidates.forEach((c, idx) => {
     const latestDir = resolveLatestSnapshotDir(path.join(c.mountPath, c.hostname));
     const snapDir = path.join(c.mountPath, c.hostname, c.snapshotName);
@@ -90,14 +152,19 @@ export async function applyGfsRetentionForServer(
       keepMap.set(c.jobId, 'Pinned (Đã khóa bảo vệ)');
     } else if (latestDir && path.resolve(latestDir) === path.resolve(snapDir)) {
       keepMap.set(c.jobId, 'Active Symlink Latest');
+    } else if (
+      protectedJobIds.has(c.jobId) ||
+      protectedSnapshotNames.has(c.snapshotName)
+    ) {
+      keepMap.set(c.jobId, 'Active Restore (Đang phục vụ khôi phục)');
     }
   });
 
-  // 2. Daily buckets (Mới nhất mỗi ngày - tối đa policy.daily ngày)
+  // 2. Daily buckets (Mới nhất mỗi ngày theo giờ địa phương - tối đa safeDaily ngày)
   const seenDays = new Set<string>();
   for (const c of candidates) {
-    if (seenDays.size >= policy.daily) break;
-    const dayKey = getIsoDayKey(c.createdAt);
+    if (seenDays.size >= safeDaily) break;
+    const dayKey = getLocalDayKey(c.createdAt);
     if (!seenDays.has(dayKey)) {
       seenDays.add(dayKey);
       if (!keepMap.has(c.jobId)) {
@@ -106,17 +173,17 @@ export async function applyGfsRetentionForServer(
     }
   }
 
-  // 3. Weekly buckets (Ưu tiên Chủ nhật của mỗi tuần - tối đa policy.weekly tuần)
+  // 3. Weekly buckets (Ưu tiên Chủ nhật của mỗi tuần theo giờ địa phương - tối đa safeWeekly tuần)
   const byWeek = new Map<string, SnapshotCandidate[]>();
   for (const c of candidates) {
-    const wk = getIsoWeekKey(c.createdAt);
+    const wk = getLocalWeekKey(c.createdAt);
     const arr = byWeek.get(wk) || [];
     arr.push(c);
     byWeek.set(wk, arr);
   }
   let weeklyCount = 0;
   for (const [wk, list] of byWeek.entries()) {
-    if (weeklyCount >= policy.weekly) break;
+    if (weeklyCount >= safeWeekly) break;
     const sundaySnap = list.find((item) => item.createdAt.getDay() === 0) || list[0];
     if (!keepMap.has(sundaySnap.jobId)) {
       keepMap.set(sundaySnap.jobId, `GFS Weekly (${wk})`);
@@ -124,17 +191,17 @@ export async function applyGfsRetentionForServer(
     weeklyCount++;
   }
 
-  // 4. Monthly buckets (Ưu tiên ngày mùng 1 hàng tháng - tối đa policy.monthly tháng)
+  // 4. Monthly buckets (Ưu tiên ngày mùng 1 hàng tháng theo giờ địa phương - tối đa safeMonthly tháng)
   const byMonth = new Map<string, SnapshotCandidate[]>();
   for (const c of candidates) {
-    const mk = getMonthKey(c.createdAt);
+    const mk = getLocalMonthKey(c.createdAt);
     const arr = byMonth.get(mk) || [];
     arr.push(c);
     byMonth.set(mk, arr);
   }
   let monthlyCount = 0;
   for (const [mk, list] of byMonth.entries()) {
-    if (monthlyCount >= policy.monthly) break;
+    if (monthlyCount >= safeMonthly) break;
     const firstDaySnap =
       list.find((item) => item.createdAt.getDate() === 1) ||
       list[list.length - 1];
@@ -156,8 +223,13 @@ export async function applyGfsRetentionForServer(
 
     deletedSnapshots.push(c.snapshotName);
     if (!dryRun) {
-      const snapDir = path.join(c.mountPath, c.hostname, c.snapshotName);
-      if (fs.existsSync(snapDir)) {
+      const hostDir = path.resolve(c.mountPath, c.hostname);
+      const snapDir = path.resolve(hostDir, c.snapshotName);
+      if (
+        isSafeSnapshotName(c.snapshotName) &&
+        path.dirname(snapDir) === hostDir &&
+        fs.existsSync(snapDir)
+      ) {
         fs.rmSync(snapDir, { recursive: true, force: true });
       }
       db.prepare('DELETE FROM backup_jobs WHERE id = ?').run(c.jobId);

@@ -98,14 +98,14 @@ export function getLocalBuildMetadata(): {
   return { version, commit };
 }
 
-function getActiveBlockingReason(): {
+export function getActiveBlockingReason(): {
   canUpdateNow: boolean;
   blockingReason: string | null;
 } {
   if (globalThis.__nasSyncUpdating) {
     return {
       canUpdateNow: false,
-      blockingReason: 'Hệ thống đang thực thi tiến trình cập nhật.',
+      blockingReason: 'Một tiến trình cập nhật khác đang chạy. Vui lòng đợi hoàn tất.',
     };
   }
 
@@ -269,15 +269,47 @@ function runStreamingCommand(
   cmd: string,
   args: string[],
   cwd: string,
-  onLine: (line: string) => void
+  onLine: (line: string) => void,
+  timeoutMs = 15 * 60 * 1000
 ): Promise<number> {
   return new Promise((resolve, reject) => {
+    let settled = false;
     const child = spawn(cmd, args, {
       cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
       env: { ...process.env, NEXT_TELEMETRY_DISABLED: '1' },
     });
+
+    let killTimer: ReturnType<typeof setTimeout> | null = null;
+    const timeoutHandle = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try {
+        child.kill('SIGTERM');
+      } catch {
+        // Ignore
+      }
+      killTimer = setTimeout(() => {
+        try {
+          child.kill('SIGKILL');
+        } catch {
+          // Ignore
+        }
+      }, 5000);
+      reject(
+        new Error(
+          `Lệnh cập nhật (${cmd}) vượt quá thời gian chờ tối đa (${Math.round(
+            timeoutMs / 60000
+          )} phút).`
+        )
+      );
+    }, timeoutMs);
+
+    const cleanupTimers = () => {
+      clearTimeout(timeoutHandle);
+      if (killTimer) clearTimeout(killTimer);
+    };
 
     const handleChunk = (buf: Buffer) => {
       const lines = buf
@@ -290,8 +322,18 @@ function runStreamingCommand(
 
     child.stdout.on('data', handleChunk);
     child.stderr.on('data', handleChunk);
-    child.on('error', (err) => reject(err));
-    child.on('close', (code) => resolve(code ?? 1));
+    child.on('error', (err) => {
+      cleanupTimers();
+      if (settled) return;
+      settled = true;
+      reject(err);
+    });
+    child.on('close', (code) => {
+      cleanupTimers();
+      if (settled) return;
+      settled = true;
+      resolve(code ?? 1);
+    });
   });
 }
 
@@ -302,7 +344,18 @@ function backupSqliteBeforeUpdate(): string {
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   const dest = path.join(backupsDir, `nas-sync-pre-update-${stamp}.db`);
   if (fs.existsSync(dbFile)) {
-    fs.copyFileSync(dbFile, dest);
+    try {
+      fs.rmSync(dest, { force: true });
+      getDb().prepare('VACUUM INTO ?').run(dest);
+    } catch {
+      fs.copyFileSync(dbFile, dest);
+      for (const suffix of ['-wal', '-shm']) {
+        const sidecar = `${dbFile}${suffix}`;
+        if (fs.existsSync(sidecar)) {
+          fs.copyFileSync(sidecar, `${dest}${suffix}`);
+        }
+      }
+    }
   }
 
   // Giữ tối đa 5 bản sao lưu CSDL gần nhất
@@ -312,7 +365,10 @@ function backupSqliteBeforeUpdate(): string {
     .sort()
     .reverse();
   for (const old of all.slice(5)) {
-    fs.rmSync(path.join(backupsDir, old), { force: true });
+    const oldBase = path.join(backupsDir, old);
+    fs.rmSync(oldBase, { force: true });
+    fs.rmSync(`${oldBase}-wal`, { force: true });
+    fs.rmSync(`${oldBase}-shm`, { force: true });
   }
   return dest;
 }
@@ -341,8 +397,14 @@ function haveDependenciesChanged(oldPkgPath: string, newPkgPath: string): boolea
 export async function performGitHubUpdate(options: {
   force?: boolean;
 } = {}): Promise<void> {
+  if (globalThis.__nasSyncUpdating) {
+    throw new Error(
+      'Một tiến trình cập nhật khác đang chạy. Vui lòng đợi hoàn tất.'
+    );
+  }
+
   const { canUpdateNow, blockingReason } = getActiveBlockingReason();
-  if (!canUpdateNow && !options.force) {
+  if (!canUpdateNow) {
     throw new Error(blockingReason || 'Không thể cập nhật ngay lúc này.');
   }
 
@@ -365,12 +427,24 @@ export async function performGitHubUpdate(options: {
     const checkInfo = await checkGitHubUpdate();
     const targetVer = checkInfo.latestVersion;
 
-    // 1. Sao lưu CSDL SQLite trước khi cập nhật
+    if (!checkInfo.hasUpdate && !options.force) {
+      globalThis.__nasSyncUpdating = false;
+      broadcastStep(
+        'COMPLETED',
+        100,
+        `Hệ thống đang ở phiên bản mới nhất (v${targetVer}).`,
+        'Không có thay đổi mới cần cập nhật.',
+        targetVer
+      );
+      return;
+    }
+
+    // 1. Sao lưu CSDL SQLite nguyên tử (VACUUM INTO) trước khi cập nhật
     broadcastStep(
       'DOWNLOADING',
       12,
       'Đang tạo bản sao lưu an toàn CSDL quản trị...',
-      'Sao lưu tự động CSDL SQLite trước khi nâng cấp...'
+      'Sao lưu nguyên tử CSDL SQLite (VACUUM INTO) trước khi nâng cấp...'
     );
     const dbBackupFile = backupSqliteBeforeUpdate();
     broadcastStep(
@@ -423,33 +497,35 @@ export async function performGitHubUpdate(options: {
       throw new Error('Giải nén gói cập nhật từ GitHub thất bại.');
     }
 
-    // 3. Kiểm tra dependencies và liên kết node_modules
+    // 3. Kiểm tra dependencies và chuẩn bị node_modules cô lập hoàn toàn trong stagingDir
+    //    TUYỆT ĐỐI KHÔNG ghi đè appRoot/package.json trước khi next build thành công!
     const depsChanged = haveDependenciesChanged(
       path.join(appRoot, 'package.json'),
       path.join(stagingDir, 'package.json')
     );
 
+    const stagingNodeModules = path.join(stagingDir, 'node_modules');
+    fs.rmSync(stagingNodeModules, { recursive: true, force: true });
+
     if (depsChanged) {
       broadcastStep(
         'INSTALLING',
         45,
-        'Phát hiện thư viện mới trong package.json — Đang cài đặt npm packages...',
-        'Chạy npm install --include=dev...'
-      );
-      fs.copyFileSync(
-        path.join(stagingDir, 'package.json'),
-        path.join(appRoot, 'package.json')
+        'Phát hiện thư viện mới trong package.json — Đang cài đặt cô lập tại Staging...',
+        'Chạy npm install --include=dev --ignore-scripts trong vùng Staging...'
       );
       const npmBin = process.platform === 'win32' ? 'npm.cmd' : 'npm';
       const npmCode = await runStreamingCommand(
         npmBin,
-        ['install', '--include=dev', '--no-audit', '--no-fund'],
-        appRoot,
+        ['install', '--include=dev', '--no-audit', '--no-fund', '--ignore-scripts'],
+        stagingDir,
         (line) =>
           broadcastStep('INSTALLING', 52, 'Đang cài đặt thư viện mới...', line)
       );
       if (npmCode !== 0) {
-        throw new Error('Cài đặt gói phụ thuộc npm thất bại.');
+        throw new Error(
+          'Cài đặt gói phụ thuộc npm trong vùng Staging thất bại. Phiên bản đang chạy vẫn an toàn 100%.'
+        );
       }
     } else {
       broadcastStep(
@@ -458,15 +534,12 @@ export async function performGitHubUpdate(options: {
         'Các gói node_modules không đổi — Tái sử dụng tức thì...',
         'Liên kết node_modules hiện hành sang vùng Staging (0s)...'
       );
+      fs.symlinkSync(
+        path.join(appRoot, 'node_modules'),
+        stagingNodeModules,
+        process.platform === 'win32' ? 'junction' : 'dir'
+      );
     }
-
-    const stagingNodeModules = path.join(stagingDir, 'node_modules');
-    fs.rmSync(stagingNodeModules, { recursive: true, force: true });
-    fs.symlinkSync(
-      path.join(appRoot, 'node_modules'),
-      stagingNodeModules,
-      process.platform === 'win32' ? 'junction' : 'dir'
-    );
 
     // 4. Chạy Production Build (next build) trong vùng Staging cô lập
     broadcastStep(
@@ -476,7 +549,14 @@ export async function performGitHubUpdate(options: {
       'Khởi chạy Next.js Production Build...'
     );
 
-    const nextBin = path.join(
+    const stagedNextBin = path.join(
+      stagingNodeModules,
+      'next',
+      'dist',
+      'bin',
+      'next'
+    );
+    const fallbackNextBin = path.join(
       appRoot,
       'node_modules',
       'next',
@@ -484,6 +564,10 @@ export async function performGitHubUpdate(options: {
       'bin',
       'next'
     );
+    const nextBin = fs.existsSync(stagedNextBin)
+      ? stagedNextBin
+      : fallbackNextBin;
+
     const buildCode = await runStreamingCommand(
       process.execPath,
       [nextBin, 'build'],
@@ -511,8 +595,24 @@ export async function performGitHubUpdate(options: {
       'Ghi nhận BUILD_INFO.json và đồng bộ vào thư mục thực thi...'
     );
 
-    // Gỡ symlink node_modules trước khi lưu bền vững
-    fs.unlinkSync(stagingNodeModules);
+    const shouldSyncAppRoot =
+      process.platform !== 'win32' ||
+      process.env.ALLOW_LOCAL_SELF_OVERWRITE === 'true';
+
+    // Nếu dependencies thay đổi, đồng bộ node_modules mới sang appRoot sau khi next build thành công
+    if (depsChanged) {
+      if (shouldSyncAppRoot && fs.existsSync(stagingNodeModules)) {
+        const appNodeModules = path.join(appRoot, 'node_modules');
+        fs.cpSync(stagingNodeModules, appNodeModules, {
+          recursive: true,
+          force: true,
+        });
+      }
+      fs.rmSync(stagingNodeModules, { recursive: true, force: true });
+    } else {
+      // Gỡ symlink node_modules trước khi lưu bền vững
+      fs.unlinkSync(stagingNodeModules);
+    }
 
     let fullCommit = checkInfo.latestCommit || '';
     try {
@@ -549,12 +649,13 @@ export async function performGitHubUpdate(options: {
     fs.renameSync(stagingDir, currentPersistDir);
     fs.rmSync(prevPersistBackup, { recursive: true, force: true });
 
-    // Đồng bộ sang thư mục thực thi hiện tại (/app trên Docker)
+    // Đồng bộ sang thư mục thực thi hiện tại (/app trên Docker) CHỈ SAU KHI build thành công
     const syncTargets = [
       'src',
       '.next',
       'server.ts',
       'package.json',
+      'package-lock.json',
       'next.config.mjs',
       'postcss.config.mjs',
       'tailwind.config.ts',
@@ -563,7 +664,7 @@ export async function performGitHubUpdate(options: {
     ];
 
     // Chỉ ghi đè trực tiếp vào appRoot trên môi trường Container/Production (không ghi đè workspace Git khi dev trên Windows)
-    if (process.platform !== 'win32' || process.env.ALLOW_LOCAL_SELF_OVERWRITE === 'true') {
+    if (shouldSyncAppRoot) {
       for (const item of syncTargets) {
         const srcItem = path.join(currentPersistDir, item);
         const dstItem = path.join(appRoot, item);

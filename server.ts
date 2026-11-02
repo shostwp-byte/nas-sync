@@ -36,6 +36,51 @@ function readCookie(header: string | undefined, name: string): string | null {
   return null;
 }
 
+function stripCookieFromHeader(
+  header: string | undefined,
+  name: string
+): string | undefined {
+  if (!header) return undefined;
+  const kept = header
+    .split(';')
+    .map((p) => p.trim())
+    .filter((part) => {
+      const idx = part.indexOf('=');
+      if (idx === -1) return Boolean(part);
+      return part.slice(0, idx).trim() !== name;
+    });
+  return kept.length > 0 ? kept.join('; ') : undefined;
+}
+
+function matchesSocketOrigin(origin: string, rawHostHeader: string): boolean {
+  try {
+    const parsed = new URL(origin);
+    const originHost = parsed.host.toLowerCase();
+    const firstHost = rawHostHeader.split(',')[0]?.trim().toLowerCase() || '';
+    const normalizedExpected =
+      parsed.protocol === 'https:'
+        ? firstHost.replace(/:443$/, '')
+        : parsed.protocol === 'http:'
+        ? firstHost.replace(/:80$/, '')
+        : firstHost;
+    return Boolean(normalizedExpected) && originHost === normalizedExpected;
+  } catch {
+    return false;
+  }
+}
+
+function isTokenVersionValidInDb(userId: number, tokenVersion?: number): boolean {
+  try {
+    const row = getDb()
+      .prepare('SELECT id, COALESCE(token_version, 1) AS tv FROM users WHERE id = ?')
+      .get(userId);
+    if (!row) return false;
+    return Number(row.tv ?? 1) === (tokenVersion ?? 1);
+  } catch {
+    return false;
+  }
+}
+
 async function bootstrap() {
   await app.prepare();
 
@@ -45,8 +90,66 @@ async function bootstrap() {
     console.warn('[NAS-Sync Startup] Cảnh báo kiểm tra Volume:', err);
   });
 
-  const httpServer = createServer((req, res) => {
-    handle(req, res);
+  const httpServer = createServer(async (req, res) => {
+    try {
+      // Ghi đè IP kết nối TCP thực tế để chống giả mạo X-Forwarded-For khi không bật TRUST_PROXY
+      req.headers['x-nas-client-ip'] = req.socket.remoteAddress || 'unknown';
+
+      const rawUrl = req.url || '/';
+      const qIdx = rawUrl.indexOf('?');
+      const pathname = qIdx >= 0 ? rawUrl.slice(0, qIdx) : rawUrl;
+
+      const skipRevocationCheck =
+        pathname.startsWith('/_next') ||
+        pathname === '/favicon.ico' ||
+        pathname === '/api/health' ||
+        pathname === '/api/auth/login' ||
+        pathname === '/api/auth/logout';
+
+      if (!skipRevocationCheck) {
+        const token = readCookie(req.headers.cookie, SESSION_COOKIE_NAME);
+        if (token) {
+          const session = await verifySessionToken(token);
+          if (
+            session &&
+            !isTokenVersionValidInDb(session.userId, session.tokenVersion)
+          ) {
+            res.setHeader(
+              'Set-Cookie',
+              `${SESSION_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax`
+            );
+            if (pathname.startsWith('/api/')) {
+              res.statusCode = 401;
+              res.setHeader('Content-Type', 'application/json; charset=utf-8');
+              res.end(
+                JSON.stringify({
+                  error:
+                    'Phiên đăng nhập đã hết hạn hoặc bị thu hồi. Vui lòng đăng nhập lại.',
+                })
+              );
+              return;
+            }
+            const cleanedCookie = stripCookieFromHeader(
+              req.headers.cookie,
+              SESSION_COOKIE_NAME
+            );
+            if (cleanedCookie) {
+              req.headers.cookie = cleanedCookie;
+            } else {
+              delete req.headers.cookie;
+            }
+          }
+        }
+      }
+
+      await handle(req, res);
+    } catch (err) {
+      console.error('[NAS-Sync HTTP Error]:', err);
+      if (!res.headersSent) {
+        res.statusCode = 500;
+        res.end('Internal Server Error');
+      }
+    }
   });
 
   // Tích hợp Socket.IO phục vụ cập nhật % tiến trình & Live Terminal Log thời gian thực.
@@ -55,11 +158,23 @@ async function bootstrap() {
     path: '/socket.io',
   });
 
-  // Live log / cảnh báo chứa hostname, đường dẫn & lỗi hệ thống — chỉ phát cho phiên đã đăng nhập
+  // Live log / cảnh báo chứa hostname, đường dẫn & lỗi hệ thống — chỉ phát cho phiên hợp lệ & đúng Origin
   io.use(async (socket, nextFn) => {
+    const origin = socket.handshake.headers.origin;
+    const rawHost =
+      (socket.handshake.headers['x-forwarded-host'] as string | undefined) ||
+      socket.handshake.headers.host;
+    if (origin && rawHost && !matchesSocketOrigin(origin, rawHost)) {
+      nextFn(new Error('CSRF Origin mismatch'));
+      return;
+    }
+
     const token = readCookie(socket.handshake.headers.cookie, SESSION_COOKIE_NAME);
     const session = token ? await verifySessionToken(token) : null;
-    if (!session) {
+    if (
+      !session ||
+      !isTokenVersionValidInDb(session.userId, session.tokenVersion)
+    ) {
       nextFn(new Error('unauthorized'));
       return;
     }

@@ -172,6 +172,7 @@ export interface MysqlAdminCredentials {
   password?: string;
   defaultsFile?: string;
   socket?: string;
+  remoteAuthPrelude?: string;
 }
 
 export interface DomainMetadataJson {

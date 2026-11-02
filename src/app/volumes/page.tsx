@@ -119,40 +119,45 @@ export default function VolumesPage() {
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-        <div>
-          <h2 className="text-lg font-bold text-white flex items-center gap-2">
-            <HardDrive className="w-5 h-5 text-blue-400" />
-            Quản lý Đa Phân vùng Thông minh & Btrfs WORM
+      <div className="flex flex-col xl:flex-row xl:items-center justify-between gap-3">
+        <div className="min-w-0">
+          <h2 className="text-base sm:text-lg font-bold text-white flex items-center gap-2">
+            <HardDrive className="w-5 h-5 text-blue-400 shrink-0" />
+            <span>Quản lý Đa Phân vùng Thông minh & Btrfs WORM</span>
           </h2>
           <p className="text-xs text-slate-400 mt-0.5">
             Tự động kiểm tra df / statfs trước mỗi phiên chạy, chuyển Volume khi đầy ≥ 85% kèm Local Seeding bảo toàn chuỗi Incremental Hard-Link.
           </p>
         </div>
 
-        <div className="flex flex-wrap items-center gap-2.5">
+        <div className="flex flex-wrap items-center gap-2">
           <button
+            type="button"
+            onClick={() => void loadVolumes(true)}
+            className="flex-1 sm:flex-initial justify-center min-h-[40px] whitespace-nowrap inline-flex items-center gap-2 px-3.5 py-2 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors"
+          >
+            <RefreshCw className="w-3.5 h-3.5 shrink-0" />
+            Kiểm tra Dung lượng
+          </button>
+          <button
+            type="button"
             onClick={() => void triggerWormSnapshot()}
             disabled={wormLoading}
-            className="inline-flex items-center gap-2 px-3.5 py-2 rounded-lg text-xs font-medium bg-emerald-600/20 hover:bg-emerald-600 text-emerald-300 hover:text-white border border-emerald-500/30 transition-colors"
+            className="w-full sm:w-auto justify-center min-h-[40px] inline-flex items-center gap-2 px-3.5 py-2 rounded-lg text-xs font-medium bg-emerald-600/20 hover:bg-emerald-600 text-emerald-300 hover:text-white border border-emerald-500/30 transition-colors disabled:opacity-50"
           >
-            <Lock className="w-3.5 h-3.5" />
-            {wormLoading
-              ? 'Đang tạo WORM Snapshot...'
-              : 'Chụp Btrfs Immutable (WORM 7 ngày)'}
+            <Lock className="w-3.5 h-3.5 shrink-0" />
+            <span>
+              {wormLoading
+                ? 'Đang tạo WORM Snapshot...'
+                : 'Tạo Btrfs WORM Snapshot Ngay'}
+            </span>
           </button>
           <button
-            onClick={() => void loadVolumes(true)}
-            className="inline-flex items-center gap-2 px-3.5 py-2 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700"
-          >
-            <RefreshCw className="w-3.5 h-3.5" />
-            Quét df -B1
-          </button>
-          <button
+            type="button"
             onClick={() => setShowAdd(true)}
-            className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold bg-blue-600 hover:bg-blue-500 text-white"
+            className="flex-1 sm:flex-initial justify-center min-h-[40px] whitespace-nowrap inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold bg-blue-600 hover:bg-blue-500 text-white transition-colors"
           >
-            <Plus className="w-4 h-4" />
+            <Plus className="w-4 h-4 shrink-0" />
             Thêm Volume
           </button>
         </div>
@@ -161,7 +166,7 @@ export default function VolumesPage() {
       {wormMsg && (
         <div className="p-4 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-xs text-emerald-200 flex items-center gap-2">
           <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" />
-          <span>{wormMsg}</span>
+          <span className="break-words">{wormMsg}</span>
         </div>
       )}
 
@@ -189,22 +194,22 @@ export default function VolumesPage() {
             return (
               <div
                 key={vol.id}
-                className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-5"
+                className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-6 space-y-5"
               >
-                <div className="flex items-start justify-between">
-                  <div>
-                    <div className="text-base font-bold text-white flex items-center gap-2">
-                      {vol.name}
+                <div className="flex items-start justify-between gap-2">
+                  <div className="min-w-0">
+                    <div className="text-base font-bold text-white flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                      <span>{vol.name}</span>
                       <span className="text-xs font-normal text-slate-400">
                         • Ưu tiên #{vol.priority}
                       </span>
                     </div>
-                    <div className="text-xs font-mono text-cyan-400 mt-0.5">
+                    <div className="text-xs font-mono text-cyan-400 mt-0.5 break-all">
                       Mount Path: {vol.mount_path}
                     </div>
                   </div>
 
-                  <div className="flex items-center gap-2">
+                  <div className="flex items-center gap-2 shrink-0">
                     <span
                       className={`px-2.5 py-1 rounded text-xs font-semibold border ${
                         vol.status === 'ACTIVE'
@@ -217,8 +222,10 @@ export default function VolumesPage() {
                       {vol.status}
                     </span>
                     <button
+                      type="button"
                       onClick={() => void deleteVolume(vol)}
-                      className="p-1.5 rounded-lg bg-slate-800 hover:bg-rose-600/30 text-rose-400"
+                      aria-label={`Xóa phân vùng ${vol.name}`}
+                      className="h-9 w-9 min-h-[36px] min-w-[36px] inline-flex items-center justify-center rounded-lg bg-slate-800 hover:bg-rose-600/30 text-rose-400 transition-colors"
                     >
                       <Trash2 className="w-3.5 h-3.5" />
                     </button>
@@ -226,7 +233,7 @@ export default function VolumesPage() {
                 </div>
 
                 <div className="space-y-2">
-                  <div className="flex justify-between text-xs">
+                  <div className="flex flex-wrap items-center justify-between gap-1 text-xs">
                     <span className="text-slate-200 font-medium">
                       Đã sử dụng: {formatBytes(vol.used_bytes)} ({pct.toFixed(1)}%)
                     </span>
@@ -248,12 +255,12 @@ export default function VolumesPage() {
                     />
                   </div>
                   {hasQuotaOrReserve && (
-                    <div className="text-[11px] text-slate-500">
+                    <div className="text-[11px] text-slate-500 break-words">
                       Lưu ý: Khoảng {formatBytes(reservedBytes)} trên ổ cứng đang bị giới hạn bởi Hạn ngạch (Shared Folder Quota), LUN hoặc phân vùng hệ thống DSM nên không tính vào dung lượng trống khả dụng.
                     </div>
                   )}
                   {vol.status === 'FULL' && (
-                    <div className="p-2.5 rounded-lg bg-rose-500/10 border border-rose-500/30 text-[11px] text-rose-200">
+                    <div className="p-2.5 rounded-lg bg-rose-500/10 border border-rose-500/30 text-[11px] text-rose-200 break-words">
                       {isFullByPct
                         ? `Phân vùng đang báo FULL do tỷ lệ sử dụng (${pct.toFixed(1)}%) đã chạm ngưỡng đầy (${vol.max_usage_percent}%).`
                         : isFullByFreeGb
@@ -263,8 +270,8 @@ export default function VolumesPage() {
                   )}
                 </div>
 
-                <div className="grid grid-cols-3 gap-3 pt-2 border-t border-slate-800 text-xs">
-                  <div>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-2 border-t border-slate-800 text-xs">
+                  <div className="flex flex-col justify-between">
                     <label className="block text-[11px] text-slate-400 mb-1">
                       Ngưỡng đầy (%)
                     </label>
@@ -285,10 +292,10 @@ export default function VolumesPage() {
                           vol.priority
                         )
                       }
-                      className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-white font-mono"
+                      className="w-full min-h-[40px] bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-white font-mono"
                     />
                   </div>
-                  <div>
+                  <div className="flex flex-col justify-between">
                     <label className="block text-[11px] text-slate-400 mb-1">
                       Trống tối thiểu (GB)
                     </label>
@@ -308,10 +315,10 @@ export default function VolumesPage() {
                           vol.priority
                         )
                       }
-                      className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-white font-mono"
+                      className="w-full min-h-[40px] bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-white font-mono"
                     />
                   </div>
-                  <div>
+                  <div className="flex flex-col justify-between">
                     <label className="block text-[11px] text-slate-400 mb-1">
                       Độ ưu tiên
                     </label>
@@ -331,16 +338,17 @@ export default function VolumesPage() {
                           Number(e.target.value)
                         )
                       }
-                      className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-white font-mono"
+                      className="w-full min-h-[40px] bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-white font-mono"
                     />
                   </div>
                 </div>
 
-                <div className="flex items-center justify-between text-[11px] text-slate-500 pt-1">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-[11px] text-slate-500 pt-1">
                   <span>Kiểm tra gần nhất: {formatDateTime(vol.last_checked_at)}</span>
                   <button
+                    type="button"
                     onClick={() => void toggleMaintenance(vol)}
-                    className="text-amber-400 hover:underline"
+                    className="text-left sm:text-right text-amber-400 hover:underline font-medium"
                   >
                     {vol.status === 'MAINTENANCE'
                       ? 'Mở lại trạng thái ACTIVE'
@@ -356,14 +364,16 @@ export default function VolumesPage() {
       {/* Add Volume Modal */}
       {showAdd && (
         <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4">
-          <div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-md w-full p-6 space-y-4">
-            <div className="flex items-center justify-between">
+          <div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-md w-full p-4 sm:p-6 space-y-4 max-h-[calc(100dvh-2rem)] overflow-y-auto">
+            <div className="flex items-center justify-between gap-3">
               <h3 className="text-base font-bold text-white">
                 Thêm Phân vùng Synology NAS Mới
               </h3>
               <button
+                type="button"
                 onClick={() => setShowAdd(false)}
-                className="text-slate-400 hover:text-white"
+                aria-label="Đóng"
+                className="h-10 w-10 inline-flex items-center justify-center rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 shrink-0"
               >
                 <X className="w-5 h-5" />
               </button>
@@ -376,7 +386,7 @@ export default function VolumesPage() {
                   required
                   value={form.name}
                   onChange={(e) => setForm({ ...form, name: e.target.value })}
-                  className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white"
+                  className="w-full min-h-[42px] bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white"
                 />
               </div>
               <div>
@@ -390,11 +400,11 @@ export default function VolumesPage() {
                     setForm({ ...form, mount_path: e.target.value })
                   }
                   placeholder="/mnt/vol3"
-                  className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white font-mono"
+                  className="w-full min-h-[42px] bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white font-mono"
                 />
               </div>
-              <div className="grid grid-cols-3 gap-3">
-                <div>
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                <div className="flex flex-col justify-between">
                   <label className="block text-slate-300 mb-1">Max %</label>
                   <input
                     type="number"
@@ -405,10 +415,10 @@ export default function VolumesPage() {
                         max_usage_percent: Number(e.target.value),
                       })
                     }
-                    className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white"
+                    className="w-full min-h-[40px] bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white font-mono"
                   />
                 </div>
-                <div>
+                <div className="flex flex-col justify-between">
                   <label className="block text-slate-300 mb-1">Min GB</label>
                   <input
                     type="number"
@@ -416,10 +426,10 @@ export default function VolumesPage() {
                     onChange={(e) =>
                       setForm({ ...form, min_free_gb: Number(e.target.value) })
                     }
-                    className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white"
+                    className="w-full min-h-[40px] bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white font-mono"
                   />
                 </div>
-                <div>
+                <div className="flex flex-col justify-between">
                   <label className="block text-slate-300 mb-1">Priority</label>
                   <input
                     type="number"
@@ -427,22 +437,22 @@ export default function VolumesPage() {
                     onChange={(e) =>
                       setForm({ ...form, priority: Number(e.target.value) })
                     }
-                    className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white"
+                    className="w-full min-h-[40px] bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white font-mono"
                   />
                 </div>
               </div>
 
-              <div className="flex justify-end gap-2 pt-3">
+              <div className="flex flex-col-reverse sm:flex-row sm:justify-end gap-2 pt-3 border-t border-slate-800">
                 <button
                   type="button"
                   onClick={() => setShowAdd(false)}
-                  className="px-4 py-2 rounded-lg bg-slate-800 text-slate-300"
+                  className="w-full sm:w-auto min-h-[42px] px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300"
                 >
                   Hủy
                 </button>
                 <button
                   type="submit"
-                  className="px-4 py-2 rounded-lg bg-blue-600 text-white font-semibold"
+                  className="w-full sm:w-auto min-h-[42px] px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-semibold"
                 >
                   Thêm Phân vùng
                 </button>

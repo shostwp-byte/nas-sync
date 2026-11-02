@@ -25,9 +25,95 @@ export function shellSingleQuote(str: string): string {
   return `'${str.replace(/'/g, `'\\''`)}'`;
 }
 
+const SAFE_SSH_KEY_NAME_RE = /^[A-Za-z0-9._-]{1,64}$/;
+
+const RESERVED_OPENSSH_CONTROL_FILES = new Set([
+  'config',
+  'authorized_keys',
+  'authorized_keys2',
+  'known_hosts',
+  'known_hosts.old',
+  'rc',
+  'environment',
+]);
+
+export function validateSafeSshKeyName(rawName: string): string {
+  const trimmed = String(rawName || '').trim();
+  if (!trimmed) {
+    throw new Error('Tên khóa SSH không được để trống.');
+  }
+  if (
+    trimmed.startsWith('.') ||
+    trimmed.startsWith('-') ||
+    trimmed.includes('..') ||
+    !SAFE_SSH_KEY_NAME_RE.test(trimmed)
+  ) {
+    throw new Error(
+      'Tên khóa SSH không hợp lệ (chỉ cho phép chữ, số, ".", "_", "-", dài 1–64 ký tự và không bắt đầu bằng "." hay "-").'
+    );
+  }
+
+  const lower = trimmed.toLowerCase();
+  if (lower.endsWith('.pub')) {
+    throw new Error('Tên định danh khóa SSH không được kết thúc bằng ".pub".');
+  }
+  const lowerWithoutPub = lower.endsWith('.pub') ? lower.slice(0, -4) : lower;
+  if (
+    RESERVED_OPENSSH_CONTROL_FILES.has(lower) ||
+    RESERVED_OPENSSH_CONTROL_FILES.has(lowerWithoutPub)
+  ) {
+    throw new Error(
+      `Tên khóa SSH "${trimmed}" trùng với tệp điều khiển hệ thống OpenSSH bị cấm (${Array.from(
+        RESERVED_OPENSSH_CONTROL_FILES
+      ).join(', ')}).`
+    );
+  }
+
+  return trimmed;
+}
+
+export function resolveValidatedSshKeyPath(sshKeyPath: string): string {
+  const raw = String(sshKeyPath || '').trim();
+  if (!raw) {
+    throw new Error('Đường dẫn khóa SSH không được để trống.');
+  }
+  if (raw.includes('\0')) {
+    throw new Error('Đường dẫn khóa SSH chứa ký tự không hợp lệ.');
+  }
+
+  const keysDir = path.resolve(getSshKeysDir());
+  const resolved = path.resolve(raw);
+  const parentDir = path.dirname(resolved);
+
+  const sameDir =
+    process.platform === 'win32'
+      ? parentDir.toLowerCase() === keysDir.toLowerCase()
+      : parentDir === keysDir;
+
+  if (!sameDir) {
+    throw new Error(
+      'Đường dẫn khóa SSH phải nằm trực tiếp bên trong thư mục quản lý khóa SSH được cấp phép.'
+    );
+  }
+
+  const baseName = path.basename(resolved);
+  validateSafeSshKeyName(baseName);
+
+  const lstat = fs.lstatSync(resolved, { throwIfNoEntry: false });
+  if (lstat && !lstat.isFile()) {
+    throw new Error(
+      'Tệp khóa SSH không hợp lệ (không chấp nhận thư mục, symlink hoặc thiết bị đặc biệt).'
+    );
+  }
+
+  return resolved;
+}
+
 function resolveServerKeyPath(server: ServerRecord): string | null {
   let candidate = (server.ssh_key_path || '').trim();
-  if (!candidate) {
+  if (candidate) {
+    candidate = resolveValidatedSshKeyPath(candidate);
+  } else {
     try {
       const latestKey = getDb()
         .prepare(
@@ -35,14 +121,20 @@ function resolveServerKeyPath(server: ServerRecord): string | null {
         )
         .get() as { private_key_path?: string } | undefined;
       if (latestKey?.private_key_path) {
-        candidate = latestKey.private_key_path.trim();
+        candidate = resolveValidatedSshKeyPath(latestKey.private_key_path.trim());
       }
     } catch {
-      // Bỏ qua nếu CSDL chưa khởi tạo
+      // Bỏ qua nếu CSDL chưa khởi tạo hoặc đường dẫn cũ không hợp lệ
+      candidate = '';
     }
   }
 
   if (!candidate || !fs.existsSync(candidate)) {
+    return null;
+  }
+
+  const keyStat = fs.lstatSync(candidate, { throwIfNoEntry: false });
+  if (!keyStat || !keyStat.isFile()) {
     return null;
   }
 
@@ -78,9 +170,16 @@ function resolveServerKeyPath(server: ServerRecord): string | null {
 }
 
 export function buildSshBaseArgs(server: ServerRecord): string[] {
+  const port = Number(server.ssh_port || 22);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error(`Cổng SSH không hợp lệ: ${server.ssh_port}`);
+  }
+
   const args: string[] = [
+    '-F',
+    '/dev/null',
     '-p',
-    String(server.ssh_port || 22),
+    String(port),
     '-o',
     'BatchMode=yes',
     '-o',
@@ -110,11 +209,29 @@ export function buildSshBaseArgs(server: ServerRecord): string[] {
 }
 
 export function buildRsyncSshTransport(server: ServerRecord): string {
+  const port = Number(server.ssh_port || 22);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error(`Cổng SSH không hợp lệ: ${server.ssh_port}`);
+  }
+
   const resolvedKey = resolveServerKeyPath(server);
-  const keyPart = resolvedKey ? `-i "${resolvedKey}" ` : '';
-  return `ssh ${keyPart}-p ${
-    server.ssh_port || 22
-  } -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o IgnoreUnknown=WarnWeakCrypto,PubkeyAcceptedAlgorithms,HostKeyAlgorithms -o WarnWeakCrypto=no -o PubkeyAcceptedAlgorithms=+ssh-rsa -o HostKeyAlgorithms=+ssh-rsa -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o Compression=no`;
+  const parts: string[] = ['ssh', '-F /dev/null'];
+  if (resolvedKey) {
+    parts.push(`-i ${shellSingleQuote(resolvedKey)}`);
+  }
+  parts.push(
+    `-p ${port}`,
+    '-o BatchMode=yes',
+    '-o StrictHostKeyChecking=accept-new',
+    '-o IgnoreUnknown=WarnWeakCrypto,PubkeyAcceptedAlgorithms,HostKeyAlgorithms',
+    '-o WarnWeakCrypto=no',
+    '-o PubkeyAcceptedAlgorithms=+ssh-rsa',
+    '-o HostKeyAlgorithms=+ssh-rsa',
+    '-o ServerAliveInterval=15',
+    '-o ServerAliveCountMax=3',
+    '-o Compression=no'
+  );
+  return parts.join(' ');
 }
 
 export function execLocalCommand(
@@ -175,13 +292,27 @@ export async function execRemoteSSH(
   remoteCommand: string,
   options: { zeroImpact?: boolean; timeoutMs?: number } = {}
 ): Promise<CommandResult> {
+  const sshUser = (server.ssh_user || 'root').trim();
+  const ipAddr = (server.ip_address || '').trim();
+  if (
+    !sshUser ||
+    sshUser.startsWith('-') ||
+    !/^[A-Za-z0-9._-]{1,64}$/.test(sshUser) ||
+    !ipAddr ||
+    ipAddr.startsWith('-') ||
+    !/^[A-Za-z0-9._:-]{1,253}$/.test(ipAddr)
+  ) {
+    throw new Error('Thông tin SSH User hoặc địa chỉ IP máy chủ không hợp lệ.');
+  }
+
   const finalCmd = options.zeroImpact
     ? wrapZeroImpact(remoteCommand)
     : remoteCommand;
 
   const args = [
     ...buildSshBaseArgs(server),
-    `${server.ssh_user || 'root'}@${server.ip_address}`,
+    '--',
+    `${sshUser}@${ipAddr}`,
     finalCmd,
   ];
 
@@ -255,12 +386,12 @@ export async function generateSshKeyPair(
   publicKey: string;
   fingerprint: string;
 }> {
-  const safeName = keyName.replace(/[^a-zA-Z0-9_-]/g, '_');
-  const keysDir = getSshKeysDir();
+  const safeName = validateSafeSshKeyName(keyName);
+  const keysDir = path.resolve(getSshKeysDir());
   const privateKeyPath = path.join(keysDir, safeName);
   const pubKeyPath = `${privateKeyPath}.pub`;
 
-  if (fs.existsSync(privateKeyPath)) {
+  if (fs.existsSync(privateKeyPath) || fs.existsSync(pubKeyPath)) {
     throw new Error(`Khóa SSH "${safeName}" đã tồn tại tại ${privateKeyPath}`);
   }
 

@@ -1,5 +1,6 @@
 import { cookies } from 'next/headers';
 import type { NextRequest } from 'next/server';
+import { getDb } from './db';
 import {
   SESSION_COOKIE_NAME,
   SessionPayload,
@@ -19,11 +20,38 @@ export {
 
 export const SESSION_MAX_AGE_SECONDS = 7 * 24 * 3600;
 
+export function validateSessionAgainstDb(
+  session: SessionPayload
+): SessionPayload | null {
+  try {
+    const row = getDb()
+      .prepare(
+        'SELECT id, username, role, COALESCE(token_version, 1) AS token_version FROM users WHERE id = ?'
+      )
+      .get(session.userId);
+    if (!row) return null;
+    const dbTokenVersion = Number(row.token_version ?? 1);
+    if (dbTokenVersion !== (session.tokenVersion ?? 1)) {
+      return null;
+    }
+    return {
+      userId: Number(row.id),
+      username: String(row.username),
+      role: String(row.role || 'ADMIN'),
+      tokenVersion: dbTokenVersion,
+    };
+  } catch {
+    return null;
+  }
+}
+
 export async function getCurrentSession(): Promise<SessionPayload | null> {
   const cookieStore = await cookies();
   const token = cookieStore.get(SESSION_COOKIE_NAME)?.value;
   if (!token) return null;
-  return verifySessionToken(token);
+  const session = await verifySessionToken(token);
+  if (!session) return null;
+  return validateSessionAgainstDb(session);
 }
 
 /**

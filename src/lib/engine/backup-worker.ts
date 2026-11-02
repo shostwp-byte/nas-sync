@@ -20,8 +20,13 @@ import type {
   ServerRecord,
 } from '@/types';
 import { getPanelAdapter } from './adapters';
-import { buildMysqlAuthFlags } from './adapters/base';
+import {
+  buildMysqlAuthFlags,
+  buildRemoteMysqlEnvPrelude,
+  verifyRemoteWebrootSafety,
+} from './adapters/base';
 import { evaluateBackupAnomaly } from './anomaly-detector';
+import { assertSafe, isSafeSnapshotName } from './safe-names';
 import { verifyJobDatabasesInSandbox } from './sandbox-verifier';
 import {
   ensureActiveVolumeForBackup,
@@ -39,17 +44,50 @@ export class RetryableNetworkError extends Error {
   }
 }
 
-const cancelledJobIds = new Set<number>();
+declare global {
+  // eslint-disable-next-line no-var
+  var __nasSyncCancelledJobIds: Set<number> | undefined;
+}
+
+function getCancelledJobIdsSet(): Set<number> {
+  if (!globalThis.__nasSyncCancelledJobIds) {
+    globalThis.__nasSyncCancelledJobIds = new Set<number>();
+  }
+  return globalThis.__nasSyncCancelledJobIds;
+}
 
 export function requestCancelJob(jobId: number) {
-  cancelledJobIds.add(jobId);
+  getCancelledJobIdsSet().add(jobId);
+}
+
+export function clearCancelledJob(jobId: number) {
+  getCancelledJobIdsSet().delete(jobId);
 }
 
 export function isJobCancelled(jobId: number): boolean {
-  return cancelledJobIds.has(jobId);
+  return getCancelledJobIdsSet().has(jobId);
 }
 
 const RETRYABLE_RSYNC_CODES = new Set([10, 12, 23, 30, 35, 255]);
+const STREAM_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
+
+function terminateChildGracefully(child: ReturnType<typeof spawn>) {
+  try {
+    child.kill('SIGTERM');
+  } catch {
+    return;
+  }
+  const forceTimer = setTimeout(() => {
+    try {
+      if (child.exitCode === null) {
+        child.kill('SIGKILL');
+      }
+    } catch {
+      // Ignore if already exited
+    }
+  }, 5000);
+  forceTimer.unref();
+}
 
 function parseSpeedToBps(speedStr: string): number {
   const m = speedStr.trim().match(/^([\d.]+)\s*([kKmMgGtT]?)[Bb]\/s$/);
@@ -93,11 +131,13 @@ function getDirectorySizeAndCount(dirPath: string): {
     for (const entry of entries) {
       if (entry.name === '.rsync-partial') continue;
       const full = path.join(curr, entry.name);
-      if (entry.isDirectory()) {
+      const st = fs.lstatSync(full, { throwIfNoEntry: false });
+      if (!st || st.isSymbolicLink()) continue;
+      if (st.isDirectory()) {
         stack.push(full);
-      } else if (entry.isFile()) {
+      } else if (st.isFile()) {
         fileCount++;
-        totalBytes += fs.statSync(full).size;
+        totalBytes += st.size;
       }
     }
   }
@@ -163,6 +203,9 @@ function runRsyncPullDomain(params: {
   const args: string[] = [
     '-az',
     '--delete',
+    '--no-devices',
+    '--no-specials',
+    '--safe-links',
     '--stats',
     '--info=progress2',
     '--partial',
@@ -173,7 +216,7 @@ function runRsyncPullDomain(params: {
   if (excludedSubpaths && excludedSubpaths.length > 0) {
     for (const rel of excludedSubpaths) {
       const cleanRel = rel.replace(/^\/+|\/+$/g, '');
-      if (cleanRel) {
+      if (cleanRel && !cleanRel.includes('..')) {
         args.push(`--exclude=/${cleanRel}`);
       }
     }
@@ -205,16 +248,27 @@ function runRsyncPullDomain(params: {
     let fullStdout = '';
     let fullStderr = '';
     let lastEmit = 0;
+    let lastActivityAt = Date.now();
+    let idleTimedOut = false;
 
     const cancelWatcher = setInterval(() => {
       if (isJobCancelled(jobId)) {
-        child.kill('SIGTERM');
+        terminateChildGracefully(child);
+        return;
       }
-    }, 1000);
+      if (Date.now() - lastActivityAt > STREAM_IDLE_TIMEOUT_MS) {
+        idleTimedOut = true;
+        terminateChildGracefully(child);
+      }
+    }, 3000);
 
     child.stdout.on('data', (chunk: Buffer) => {
+      lastActivityAt = Date.now();
       const str = chunk.toString('utf8');
       fullStdout += str;
+      if (fullStdout.length > 65536) {
+        fullStdout = fullStdout.slice(-32768);
+      }
 
       // Parse dòng --info=progress2: e.g. "  1,245,184,000  64%   24.50MB/s    0:00:42"
       const lines = str.split(/[\r\n]+/);
@@ -236,8 +290,12 @@ function runRsyncPullDomain(params: {
     });
 
     child.stderr.on('data', (chunk: Buffer) => {
+      lastActivityAt = Date.now();
       const s = chunk.toString('utf8');
       fullStderr += s;
+      if (fullStderr.length > 65536) {
+        fullStderr = fullStderr.slice(-32768);
+      }
     });
 
     child.on('error', (err) => {
@@ -251,6 +309,16 @@ function runRsyncPullDomain(params: {
 
       if (isJobCancelled(jobId)) {
         reject(new Error('Job đã bị hủy bởi quản trị viên.'));
+        return;
+      }
+
+      if (idleTimedOut) {
+        reject(
+          new RetryableNetworkError(
+            'Tiến trình Rsync không phản hồi dữ liệu quá 30 phút (Idle Timeout).',
+            30
+          )
+        );
         return;
       }
 
@@ -325,10 +393,12 @@ function runSshStreamDatabaseDump(params: {
 
   return new Promise((resolve, reject) => {
     const authFlags = buildMysqlAuthFlags(creds);
+    const envPrelude = buildRemoteMysqlEnvPrelude(creds);
 
     // Ưu tiên nén zstd -3 -T1 theo đặc tả; tự động fallback sang gzip -c nếu VPS chưa cài zstd
     const checkZstdArgs = [
       ...buildSshBaseArgs(server),
+      '--',
       `${server.ssh_user || 'root'}@${server.ip_address}`,
       'command -v zstd >/dev/null 2>&1 && echo ZSTD || echo GZIP',
     ];
@@ -337,11 +407,40 @@ function runSshStreamDatabaseDump(params: {
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let probeOut = '';
+    let probeSettled = false;
+    const probeTimer = setTimeout(() => {
+      if (!probeSettled) {
+        probeSettled = true;
+        terminateChildGracefully(probe);
+        reject(
+          new RetryableNetworkError(
+            `Quá thời gian kết nối SSH khi chuẩn bị stream DB ${dbName}`,
+            255
+          )
+        );
+      }
+    }, 20000);
+
     probe.stdout.on('data', (d: Buffer) => {
       probeOut += d.toString('utf8');
     });
-    probe.on('error', (err) => reject(err));
+    probe.on('error', (err) => {
+      clearTimeout(probeTimer);
+      if (!probeSettled) {
+        probeSettled = true;
+        reject(err);
+      }
+    });
     probe.on('close', (pCode) => {
+      clearTimeout(probeTimer);
+      if (probeSettled) return;
+      probeSettled = true;
+
+      if (isJobCancelled(jobId)) {
+        reject(new Error('Job đã bị hủy bởi quản trị viên.'));
+        return;
+      }
+
       if (pCode === 255) {
         reject(
           new RetryableNetworkError(
@@ -359,15 +458,15 @@ function runSshStreamDatabaseDump(params: {
       const outPath = path.join(destDatabasesDir, fileName);
       const tmpOutPath = `${outPath}.part`;
 
-      // Sử dụng bash pipefail / PIPESTATUS trên VPS để đảm bảo mysqldump trả về đúng mã 0.
-      // dbName do khách hàng hosting đặt — PHẢI single-quote (dấu "..." vẫn cho $(...) chạy với quyền root).
+      // Sử dụng bash pipefail trên VPS để đảm bảo cả mysqldump lẫn luồng nén đều trả về đúng mã 0.
+      // Mật khẩu MySQL được nạp nội bộ qua envPrelude (MYSQL_PWD), tuyệt đối không xuất hiện trên `ps aux`.
       const quotedDb = shellSingleQuote(dbName);
-      const remoteDumpScript = `bash -o pipefail -c ${shellSingleQuote(
-        `(command -v ionice >/dev/null 2>&1 && ionice -c2 -n7 nice -n19 mysqldump ${authFlags} --single-transaction --quick --lock-tables=false --routines --triggers --events ${quotedDb} || nice -n19 mysqldump ${authFlags} --single-transaction --quick --lock-tables=false --routines --triggers --events ${quotedDb}) | ${compCmd}`
-      )}`;
+      const innerDumpScript = `${envPrelude}if command -v ionice >/dev/null 2>&1 && ionice -c2 -n7 true 2>/dev/null; then IONICE_CMD="ionice -c2 -n7"; else IONICE_CMD=""; fi\n$IONICE_CMD nice -n19 mysqldump ${authFlags} --single-transaction --quick --lock-tables=false --routines --triggers --events ${quotedDb} | ${compCmd}`;
+      const remoteDumpScript = `bash -o pipefail -c ${shellSingleQuote(innerDumpScript)}`;
 
       const sshArgs = [
         ...buildSshBaseArgs(server),
+        '--',
         `${server.ssh_user || 'root'}@${server.ip_address}`,
         remoteDumpScript,
       ];
@@ -379,26 +478,51 @@ function runSshStreamDatabaseDump(params: {
 
       let stderr = '';
       let writeFailed = false;
+      let idleTimedOut = false;
+      let lastActivityAt = Date.now();
+
+      const dumpWatcher = setInterval(() => {
+        if (isJobCancelled(jobId)) {
+          terminateChildGracefully(child);
+          return;
+        }
+        if (Date.now() - lastActivityAt > STREAM_IDLE_TIMEOUT_MS) {
+          idleTimedOut = true;
+          terminateChildGracefully(child);
+        }
+      }, 3000);
+
+      child.stdout.on('data', () => {
+        lastActivityAt = Date.now();
+      });
       child.stdout.pipe(outStream);
       child.stderr.on('data', (d: Buffer) => {
+        lastActivityAt = Date.now();
         stderr += d.toString('utf8');
+        if (stderr.length > 65536) {
+          stderr = stderr.slice(-32768);
+        }
       });
 
       // Thiếu listener 'error' thì ENOSPC (Volume NAS đầy) thành uncaught exception
       // và làm sập toàn bộ tiến trình Node cùng mọi Job đang chạy.
       outStream.on('error', (err) => {
         writeFailed = true;
-        child.kill('SIGKILL');
+        clearInterval(dumpWatcher);
+        terminateChildGracefully(child);
         fs.rmSync(tmpOutPath, { force: true });
         reject(new Error(`Ghi file dump DB ${dbName} thất bại: ${err.message}`));
       });
 
       child.on('error', (err) => {
+        clearInterval(dumpWatcher);
         outStream.destroy();
+        fs.rmSync(tmpOutPath, { force: true });
         reject(err);
       });
 
       child.on('close', (code) => {
+        clearInterval(dumpWatcher);
         if (writeFailed) return;
         outStream.end(() => {
           try {
@@ -414,6 +538,17 @@ function runSshStreamDatabaseDump(params: {
         if (isJobCancelled(jobId)) {
           fs.rmSync(tmpOutPath, { force: true });
           reject(new Error('Job đã bị hủy bởi quản trị viên.'));
+          return;
+        }
+
+        if (idleTimedOut) {
+          fs.rmSync(tmpOutPath, { force: true });
+          reject(
+            new RetryableNetworkError(
+              `Luồng stream DB ${dbName} không phản hồi dữ liệu quá 30 phút (Idle Timeout).`,
+              30
+            )
+          );
           return;
         }
 
@@ -438,8 +573,43 @@ function runSshStreamDatabaseDump(params: {
           return;
         }
 
+        const tmpStat = fs.statSync(tmpOutPath, { throwIfNoEntry: false });
+        const sizeBytes = tmpStat ? tmpStat.size : 0;
+        if (sizeBytes < (useZstd ? 8 : 20)) {
+          fs.rmSync(tmpOutPath, { force: true });
+          reject(
+            new Error(
+              `Tệp nén SQL cho DB "${dbName}" bị rỗng hoặc cắt cụt bất thường (${sizeBytes} bytes).`
+            )
+          );
+          return;
+        }
+
+        // Xác minh magic bytes luồng nén (gzip 0x1f8b / zstd 0x28b52ffd) trước khi commit tên file chính thức
+        const fd = fs.openSync(tmpOutPath, 'r');
+        const header = Buffer.alloc(4);
+        fs.readSync(fd, header, 0, 4, 0);
+        fs.closeSync(fd);
+        const validMagic = useZstd
+          ? header[0] === 0x28 &&
+            header[1] === 0xb5 &&
+            header[2] === 0x2f &&
+            header[3] === 0xfd
+          : header[0] === 0x1f && header[1] === 0x8b;
+
+        if (!validMagic) {
+          fs.rmSync(tmpOutPath, { force: true });
+          reject(
+            new Error(
+              `Tệp dump DB "${dbName}" không có định dạng nén ${
+                useZstd ? 'Zstandard' : 'Gzip'
+              } hợp lệ.`
+            )
+          );
+          return;
+        }
+
         fs.renameSync(tmpOutPath, outPath);
-        const sizeBytes = fs.statSync(outPath).size;
         onLog(
           `[DB Stream] Đã stream trực tiếp ${dbName} ➔ ${fileName} (${(
             sizeBytes / 1024
@@ -659,7 +829,7 @@ export async function executeBackupJob(
     throw new Error(`Không tìm thấy máy chủ ID=${job.server_id}`);
   }
 
-  cancelledJobIds.delete(jobId);
+  clearCancelledJob(jobId);
 
   const logLines: string[] = job.live_log
     ? job.live_log.split('\n').filter(Boolean)
@@ -775,6 +945,8 @@ export async function executeBackupJob(
       jobId
     );
 
+    assertSafe(isSafeSnapshotName, job.snapshot_name, 'Snapshot Name');
+
     const hostDir = path.join(activeVolume.mount_path, server.hostname);
     const inProgressDir = path.join(
       hostDir,
@@ -870,6 +1042,9 @@ export async function executeBackupJob(
         state.completedDomains[dom.domain] = domState;
       }
 
+      let webrootBackedUp = 1;
+      let securityJailViolationReason: string | null = null;
+
       if (domState.filesSynced && Object.keys(domState.completedDbs).length >= dom.databases.length) {
         appendLog(
           `[Auto-Resume] ⏭️ Bỏ qua ${dom.domain} (Đã hoàn thành 100% trước khi ngắt mạng).`
@@ -923,40 +1098,85 @@ export async function executeBackupJob(
         } else {
           // Chế độ Production SSH + Rsync + Zstd Stream
           if (!domState.filesSynced) {
-            appendLog(
-              `[Rsync] Đồng bộ mã nguồn ${dom.domain} (${dom.webroot})...`
-            );
-            const syncStats = await runRsyncPullDomain({
-              jobId,
+            const safety = await verifyRemoteWebrootSafety(
               server,
-              remoteWebroot: dom.webroot,
-              destPublicHtmlDir,
-              linkDestPublicHtmlDir,
-              excludedSubpaths: dom.excludedSubpaths,
-              onProgress: (subPct, speedBps, etaSec) => {
-                updateProgress({
-                  progressPercent: Math.min(
-                    85,
-                    basePct + Math.round((subPct / 100) * (spanPct * 0.7))
-                  ),
-                  speedBps,
-                  etaSeconds: etaSec,
+              server.panel_type,
+              dom.systemUser,
+              dom.webroot,
+              { mustExist: true }
+            );
+
+            if (!safety.ok) {
+              if (safety.code === 'SSH_ERROR') {
+                throw new RetryableNetworkError(
+                  `Mất kết nối SSH khi kiểm tra webroot của ${dom.domain}: ${safety.reason}`,
+                  255
+                );
+              }
+
+              if (safety.code === 'NOT_FOUND') {
+                appendLog(
+                  `[Cảnh báo] Thư mục webroot ${dom.webroot} của ${dom.domain} chưa tồn tại trên VPS — bỏ qua kéo file và tiếp tục sao lưu Database.`
+                );
+                fs.mkdirSync(destPublicHtmlDir, { recursive: true });
+                domState.filesSynced = true;
+                domState.webrootSizeBytes = 0;
+                domState.filesTotal = 0;
+                domState.filesChanged = 0;
+                domState.deltaBytes = 0;
+                saveState(stateFilePath, state);
+              } else {
+                // JAIL_VIOLATION: Phát hiện symlink thoát khỏi home của user (VD: trỏ tới /root, /etc hoặc user khác)
+                webrootBackedUp = 0;
+                securityJailViolationReason = safety.reason;
+                appendLog(
+                  `[SECURITY] ⛔ Từ chối kéo webroot của ${dom.domain} (${dom.webroot}): ${safety.reason}`
+                );
+                await createSystemAlert({
+                  severity: 'CRITICAL',
+                  category: 'BACKUP',
+                  title: `[SECURITY] Chặn Symlink Webroot nguy hiểm trên ${server.hostname}`,
+                  message: `Domain ${dom.domain} (user: ${dom.systemUser}, webroot: ${dom.webroot}) bị từ chối đồng bộ: ${safety.reason}`,
+                  serverId: server.id,
+                  jobId,
                 });
-              },
-              onLog: appendLog,
-            });
+              }
+            } else {
+              appendLog(
+                `[Rsync] Đồng bộ mã nguồn ${dom.domain} (${dom.webroot})...`
+              );
+              const syncStats = await runRsyncPullDomain({
+                jobId,
+                server,
+                remoteWebroot: dom.webroot,
+                destPublicHtmlDir,
+                linkDestPublicHtmlDir,
+                excludedSubpaths: dom.excludedSubpaths,
+                onProgress: (subPct, speedBps, etaSec) => {
+                  updateProgress({
+                    progressPercent: Math.min(
+                      85,
+                      basePct + Math.round((subPct / 100) * (spanPct * 0.7))
+                    ),
+                    speedBps,
+                    etaSeconds: etaSec,
+                  });
+                },
+                onLog: appendLog,
+              });
 
-            const measured =
-              syncStats.totalBytes > 0
-                ? syncStats.totalBytes
-                : getDirectorySizeAndCount(destPublicHtmlDir).totalBytes;
+              const measured =
+                syncStats.totalBytes > 0
+                  ? syncStats.totalBytes
+                  : getDirectorySizeAndCount(destPublicHtmlDir).totalBytes;
 
-            domState.filesSynced = true;
-            domState.webrootSizeBytes = measured;
-            domState.filesTotal = syncStats.filesTotal;
-            domState.filesChanged = syncStats.filesChanged;
-            domState.deltaBytes = syncStats.deltaBytes;
-            saveState(stateFilePath, state);
+              domState.filesSynced = true;
+              domState.webrootSizeBytes = measured;
+              domState.filesTotal = syncStats.filesTotal;
+              domState.filesChanged = syncStats.filesChanged;
+              domState.deltaBytes = syncStats.deltaBytes;
+              saveState(stateFilePath, state);
+            }
           }
 
           // Stream từng Database qua SSH Pipe về thẳng NAS (Mục 5.3)
@@ -1021,8 +1241,8 @@ export async function executeBackupJob(
 
       db.prepare(
         `INSERT INTO backup_items
-         (job_id, server_id, volume_id, snapshot_name, system_user, domain_name, source_webroot, webroot_backed_up, webroot_size_bytes, databases_list, php_version, is_subdomain, parent_domain, verification_status)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, 'UNTESTED')`
+         (job_id, server_id, volume_id, snapshot_name, system_user, domain_name, source_webroot, webroot_backed_up, webroot_size_bytes, databases_list, php_version, is_subdomain, parent_domain, verification_status, verification_detail)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       ).run(
         jobId,
         server.id,
@@ -1031,11 +1251,16 @@ export async function executeBackupJob(
         dom.systemUser,
         dom.domain,
         dom.webroot,
+        webrootBackedUp,
         domState.webrootSizeBytes,
         JSON.stringify(dbList),
         dom.phpVersion,
         dom.isSubdomain ? 1 : 0,
-        dom.parentDomain || null
+        dom.parentDomain || null,
+        securityJailViolationReason ? 'CORRUPTED' : 'UNTESTED',
+        securityJailViolationReason
+          ? `[SECURITY] ${securityJailViolationReason}`
+          : null
       );
 
       aggTotalBytes +=
@@ -1061,10 +1286,9 @@ export async function executeBackupJob(
       fs.rmSync(finalSnapshotDir, { recursive: true, force: true });
     }
     fs.renameSync(inProgressDir, finalSnapshotDir);
-    await updateLatestSymlink(hostDir, finalSnapshotDir);
 
     appendLog(
-      `[Atomic Commit] Đã chuyển giao nguyên tử sang ${finalSnapshotDir} và cập nhật symlink latest.`
+      `[Atomic Commit] Đã chuyển giao nguyên tử sang ${finalSnapshotDir}.`
     );
 
     db.prepare(
@@ -1074,7 +1298,7 @@ export async function executeBackupJob(
     ).run(aggTotalBytes, aggDeltaBytes, aggFilesTotal, aggFilesChanged, jobId);
 
     // 5. Phân tích bất thường / Ransomware Anomaly Detection (Mục 9.3)
-    await evaluateBackupAnomaly({
+    const anomalyResult = await evaluateBackupAnomaly({
       jobId,
       server,
       filesTotal: aggFilesTotal,
@@ -1091,7 +1315,38 @@ export async function executeBackupJob(
         progressPercent: 92,
         currentPhase: 'Đang nạp thử kiểm định Database trên Sandbox...',
       });
-      await verifyJobDatabasesInSandbox(jobId, finalSnapshotDir, appendLog);
+      const verifyResults = await verifyJobDatabasesInSandbox(
+        jobId,
+        finalSnapshotDir,
+        appendLog
+      );
+      const corruptedDomains = verifyResults.filter(
+        (r) => r.status === 'CORRUPTED'
+      );
+      if (corruptedDomains.length > 0) {
+        await createSystemAlert({
+          severity: 'WARNING',
+          category: 'BACKUP',
+          title: `Phát hiện ${corruptedDomains.length} domain lỗi kiểm định trên ${server.hostname}`,
+          message: `Job #${jobId} (${job.snapshot_name}) ghi nhận lỗi kiểm định toàn vẹn: ${corruptedDomains
+            .map((c) => `${c.domainName} (${c.detail})`)
+            .join('; ')}`,
+          serverId: server.id,
+          jobId,
+        });
+      }
+    }
+
+    // Chỉ cập nhật con trỏ symlink `latest` sau khi hoàn tất kiểm tra Ransomware & Sandbox
+    if (!anomalyResult.anomalyDetected) {
+      await updateLatestSymlink(hostDir, finalSnapshotDir);
+      appendLog(
+        `[Latest Pointer] Đã cập nhật con trỏ symlink latest sang bản sạch ${job.snapshot_name}.`
+      );
+    } else {
+      appendLog(
+        `[Ransomware Guard] ⚠️ Phát hiện dấu hiệu bất thường — Giữ nguyên symlink latest ở bản sạch trước đó (không trỏ sang ${job.snapshot_name}) để bảo vệ chuỗi Incremental Hard-Link & Quick Restore.`
+      );
     }
 
     await refreshAllVolumes();
@@ -1181,7 +1436,7 @@ export async function executeBackupJob(
     emitJobUpdated(jobId);
     throw err;
   } finally {
-    cancelledJobIds.delete(jobId);
+    clearCancelledJob(jobId);
   }
 }
 

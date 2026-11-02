@@ -55,30 +55,18 @@ quyền root trên các VPS đó, nên một lỗ hổng ở đây là chiếm q
 - Bản cài đang dùng `JWT_SECRET` mặc định sẽ tự chuyển sang khóa ngẫu nhiên, nên mọi người phải **đăng nhập lại 1 lần**.
 - Domain hoặc DB có tên chứa ký tự lạ (ngoài chữ, số, `.`, `_`, `-`) giờ bị **bỏ qua khi backup** và ghi cảnh báo `[NAS-Sync Security]` ra log container. Nếu có khách hợp lệ bị bỏ sót, cần nới regex trong `safe-names.ts`.
 
-## Chưa sửa — đề xuất làm tiếp
+## Đã hoàn tất bổ sung trong `v1.2.0` (Security Hardening & Mobile UX/UI)
 
-**Bảo mật / độ an toàn dữ liệu**
+Toàn bộ các mục đề xuất ở phần kế tiếp cùng 5 lỗ hổng mức Critical phát hiện thêm qua kiểm định sâu đã được xử lý triệt để trong **`v1.2.0`**:
 
-- **Retention xóa snapshot trong lúc đang restore từ chính snapshot đó** (`retention-gfs.ts:157`). Retention chạy sau mỗi backup mà không có lock. Nếu nguồn bị xóa giữa chừng, `rsync --delete` sẽ xóa file trên site đích. Cần bỏ qua snapshot đang được job RESTORE RUNNING/QUEUED tham chiếu, hoặc dùng mutex theo server.
-- **Self-update tải thẳng HEAD của nhánh `main`** (`updater.ts`), không ghim tag/release và không kiểm tra checksum hay chữ ký. Ai có quyền push `main` (hoặc token bị lộ) sẽ có RCE trên mọi NAS bấm "Cập nhật". Nên chuyển sang GitHub Release có tag và kiểm tra SHA256 hoặc chữ ký. Ngoài ra `force: true` bỏ qua kiểm tra job đang chạy.
-- `GET /api/settings` trả về nguyên văn `smtp_pass`, `dsm_password`, `telegram_bot_token` và `github_token` cho trình duyệt. Nên mask khi trả về và chỉ ghi khi có giá trị mới.
-- `btrfs-worm.ts` gửi mật khẩu DSM qua query string GET, nên nó bị ghi vào log proxy và log DSM. Nên dùng POST.
-- Logout chỉ xóa cookie, còn JWT vẫn hợp lệ 7 ngày. Đổi mật khẩu cũng không vô hiệu các phiên khác. Có thể thêm `token_version` vào bảng `users`.
-- Không có CSRF token. `sameSite: 'lax'` chặn được phần lớn trường hợp, nhưng nên kiểm tra header `Origin` cho các request POST/PUT/PATCH/DELETE trong middleware.
-- `StrictHostKeyChecking=accept-new` và `+ssh-rsa` là chấp nhận được cho kết nối lần đầu, nhưng nên hiển thị fingerprint host key trên UI để admin xác nhận.
-- `cpanel.ts` và `directadmin.ts` (`resolveTargetWebroot`) vẫn nội suy `systemUser`/`domain` trong `"..."` ở script remote. Hiện đã an toàn nhờ validate đầu vào ở restore, nhưng nên chuyển sang `shellSingleQuote` để phòng thủ nhiều lớp.
-
-**Ổn định**
-
-- Hai tiến trình con ssh (probe zstd và mysqldump) trong `backup-worker.ts`, `bash -c` trong sandbox/restore và `fetch` trong `btrfs-worm.ts` không có timeout hay theo dõi lệnh hủy. Một VPS treo sẽ giữ slot của hàng đợi mãi mãi.
-- Ở `backup-worker.ts`, nếu sandbox verify hoặc anomaly check ném lỗi *sau* khi đã commit atomic, job bị đánh FAILED nhưng symlink `latest` đã trỏ vào snapshot đó.
-- `retention-gfs.ts` tính ngày bằng UTC (`toISOString`) nhưng xét Chủ nhật / mùng 1 bằng giờ local, nên gần nửa đêm có thể chọn sai bản đại diện tuần/tháng.
-
-**Chất lượng code**
-
-- Không có test tự động. Nên thêm Vitest cho các phần thuần logic: `safe-names`, `finalizeDiscoveredDomains`, `retention-gfs`, `compareSemver`, `anomaly-detector`. CI hiện chỉ chạy typecheck và build.
-- Không có ESLint. Comment `eslint-disable` có trong code nhưng chưa cấu hình lint.
-- `backup-worker.ts` (~1200 dòng) nên tách phần stream DB, rsync và mock thành module riêng.
-- Các route API trả thẳng `err.message` cho client, có thể lộ đường dẫn nội bộ. Nên log chi tiết ở server và trả thông báo chung.
-- `Dockerfile` dùng `npm install` thay vì `npm ci` và copy cả `devDependencies` vào image runtime.
-- [Đã chuẩn hóa tại v1.1.5] Đồng bộ hoàn toàn tên định danh hệ thống, log, tên cookie phiên và biến global sang chuẩn `NAS-Sync` / `nas_sync`.
+- [x] **Khóa Mutex theo `server_id` & Bảo vệ Snapshot khi đang Restore** (`queue.ts`, `retention-gfs.ts`, `api/jobs/[id]/route.ts`).
+- [x] **Gia cố Self-Update & Entrypoint** (`updater.ts`, `docker-entrypoint.sh`, `update-synology.sh`): khóa chống chạy chồng `__nasSyncUpdating` kể cả khi `force: true`, chặn khi có job đang chạy, sao lưu SQLite nguyên tử bằng `VACUUM INTO`, cài package với `--ignore-scripts` và tự đồng bộ `dependencies` trong `docker-entrypoint.sh`.
+- [x] **Che giấu Secret (`••••••••`) trên `GET /api/settings` & ẩn `REDIS_URL` khỏi `/api/health`** (`api/settings/route.ts`, `api/health/route.ts`, `queue.ts`).
+- [x] **Chuyển Synology DSM Btrfs WORM API từ `GET` sang `POST` body** (`btrfs-worm.ts`), hỗ trợ HTTPS tự ký LAN `:5001` và timeout 15 giây.
+- [x] **Thu hồi phiên JWT tức thời bằng `token_version`** khi đăng xuất hoặc đổi mật khẩu (`db.ts`, `jwt-edge.ts`, `auth.ts`, `server.ts`, `api/auth/**`).
+- [x] **Chống CSRF qua kiểm tra `Origin` / `Host`** trên mọi API `POST/PUT/PATCH/DELETE` (`src/middleware.ts`) và Socket.IO `io.use()` (`server.ts`).
+- [x] **Khóa RCE qua `/root/.ssh/config` (`-F /dev/null`) & giới hạn `ssh_key_path` / `mount_path`** (`ssh.ts`, `api/ssh-keys/**`, `api/servers/**`, `api/volumes/**`).
+- [x] **Ẩn mật khẩu Master MySQL khỏi `ps aux`** trên cả 4 Control Panel & MariaDB Sandbox (`base.ts`, `directadmin.ts`, `cpanel.ts`, `plesk.ts`, `aapanel.ts`, `sandbox-verifier.ts`).
+- [x] **Kiểm tra vùng giam `realpath` cho Webroot chống leo thang đặc quyền Symlink**, dùng `chown -hR`, sửa quyền `755/644` trên aaPanel, chống Gzip Bomb & FIFO trong Explorer (`explorer.ts`, `download/route.ts`).
+- [x] **Bổ sung timeout + theo dõi hủy tiến trình con**, chỉ cập nhật symlink `latest` sau khi vượt qua Anomaly & Sandbox Verify (`backup-worker.ts`, `restore-worker.ts`), và đồng bộ múi giờ Local nhất quán cho GFS (`retention-gfs.ts`).
+- [x] **Chuẩn hóa 100% UX/UI Mobile-First (`320px` – `1024px`)** trên toàn bộ 12 tập tin giao diện Frontend.

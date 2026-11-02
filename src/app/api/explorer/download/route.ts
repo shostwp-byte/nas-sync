@@ -23,14 +23,25 @@ export async function GET(req: NextRequest) {
     const { snapshotRoot } = resolveSafeSnapshotRoot(jobId);
     const fullPath = resolveSafeSubPath(snapshotRoot, relPath);
 
-    if (!fs.existsSync(fullPath) || fs.statSync(fullPath).isDirectory()) {
+    if (!fs.existsSync(fullPath)) {
       return NextResponse.json(
         { error: 'File không tồn tại.' },
         { status: 404 }
       );
     }
 
-    const { size } = fs.statSync(fullPath);
+    const stat = fs.lstatSync(fullPath);
+    if (!stat.isFile()) {
+      return NextResponse.json(
+        {
+          error:
+            'Chỉ hỗ trợ tải xuống tập tin thông thường (từ chối thư mục, symlink hoặc thiết bị đặc biệt).',
+        },
+        { status: 400 }
+      );
+    }
+
+    const { size } = stat;
     const fileName = path.basename(fullPath);
     // Stream thay vì readFileSync: file backup (SQL dump, archive) có thể nhiều GB — đọc
     // toàn bộ vào RAM sẽ làm sập tiến trình Node trên NAS (Buffer tối đa ~2-4 GB).

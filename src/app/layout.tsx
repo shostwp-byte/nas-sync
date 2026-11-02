@@ -1,7 +1,14 @@
-import type { Metadata } from 'next';
+import type { Metadata, Viewport } from 'next';
 import './globals.css';
 import { AppShell } from '@/components/AppShell';
 import { SocketProvider } from '@/components/SocketProvider';
+
+export const viewport: Viewport = {
+  width: 'device-width',
+  initialScale: 1,
+  viewportFit: 'cover',
+  themeColor: '#020617',
+};
 
 export const metadata: Metadata = {
   title: 'NAS-Sync — Hệ thống Sao lưu & Khôi phục Đa Máy chủ Mã nguồn Mở',

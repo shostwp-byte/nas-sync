@@ -1,9 +1,11 @@
 /**
  * Giới hạn số lần đăng nhập sai (in-memory) để chống dò mật khẩu.
  * Khóa theo cặp IP + username: kẻ tấn công từ một IP không thể khóa tài khoản admin từ IP khác.
+ * Giới hạn kích thước Map tối đa 5000 bản ghi để chống tràn bộ nhớ (Memory DoS).
  */
-const MAX_FAILURES = 10;
+const MAX_FAILURES = 8;
 const WINDOW_MS = 15 * 60 * 1000;
+const MAX_STORE_ENTRIES = 5000;
 
 interface FailureRecord {
   count: number;
@@ -40,12 +42,23 @@ export function getLoginLockSeconds(key: string): number {
 
 export function recordLoginFailure(key: string) {
   const store = getStore();
+  const now = Date.now();
+  prune(store, now);
+
   const rec = store.get(key);
   if (rec) {
     rec.count += 1;
-  } else {
-    store.set(key, { count: 1, firstAt: Date.now() });
+    return;
   }
+
+  if (store.size >= MAX_STORE_ENTRIES) {
+    const oldestKey = store.keys().next().value;
+    if (oldestKey !== undefined) {
+      store.delete(oldestKey);
+    }
+  }
+
+  store.set(key, { count: 1, firstAt: now });
 }
 
 export function clearLoginFailures(key: string) {

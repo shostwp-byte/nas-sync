@@ -3,6 +3,12 @@
 @tailwind utilities;
 
 @layer base {
+  html,
+  body {
+    overflow-x: hidden;
+    overflow-x: clip;
+  }
+
   body {
     @apply bg-slate-950 text-slate-100 antialiased;
   }
@@ -25,5 +31,14 @@
 
 ::-webkit-scrollbar-thumb:hover {
   background: #475569;
+}
+
+/* Prevent iOS Safari auto-zoom on input focus (< 768px) while preserving desktop text sizing */
+@media screen and (max-width: 767px) {
+  input,
+  select,
+  textarea {
+    font-size: 16px !important;
+  }
 }
 

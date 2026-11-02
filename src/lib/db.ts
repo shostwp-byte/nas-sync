@@ -107,6 +107,7 @@ function initializeSchema(db: SqliteDatabase) {
       username TEXT NOT NULL UNIQUE,
       password_hash TEXT NOT NULL,
       role TEXT NOT NULL DEFAULT 'ADMIN',
+      token_version INTEGER NOT NULL DEFAULT 1,
       last_login_at TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
@@ -244,7 +245,21 @@ function initializeSchema(db: SqliteDatabase) {
     CREATE INDEX IF NOT EXISTS idx_alerts_created ON system_alerts(created_at DESC);
   `);
 
-  // Tự động nâng cấp lược đồ CSDL an toàn cho các bản cài đặt từ v1.0.0
+  // Tự động nâng cấp lược đồ CSDL an toàn cho các bản cài đặt từ v1.0.0 / v1.1.x
+  try {
+    const userCols = db.prepare('PRAGMA table_info(users)').all();
+    const hasTokenVersion = userCols.some(
+      (col) => String(col.name) === 'token_version'
+    );
+    if (!hasTokenVersion) {
+      db.exec(
+        'ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 1'
+      );
+    }
+  } catch {
+    // Bỏ qua nếu cột đã tồn tại
+  }
+
   const migrations = [
     `ALTER TABLE backup_items ADD COLUMN is_subdomain INTEGER NOT NULL DEFAULT 0`,
     `ALTER TABLE backup_items ADD COLUMN parent_domain TEXT`,
@@ -293,7 +308,9 @@ function seedDefaults(db: SqliteDatabase) {
       .prepare("SELECT id FROM users WHERE role = 'ADMIN' ORDER BY id ASC LIMIT 1")
       .get();
     if (firstAdmin) {
-      db.prepare('UPDATE users SET username = ?, password_hash = ? WHERE id = ?').run(
+      db.prepare(
+        'UPDATE users SET username = ?, password_hash = ?, token_version = COALESCE(token_version, 1) + 1 WHERE id = ?'
+      ).run(
         adminUser,
         hashPassword(process.env.ADMIN_PASSWORD),
         Number(firstAdmin.id)

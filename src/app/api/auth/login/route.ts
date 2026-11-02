@@ -13,11 +13,22 @@ import {
 } from '@/lib/login-throttle';
 
 function getClientIp(req: NextRequest): string {
-  return (
-    req.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ||
-    req.headers.get('x-real-ip') ||
-    'unknown'
-  );
+  const socketIp = req.headers.get('x-nas-client-ip')?.trim() || '';
+  if (process.env.TRUST_PROXY === 'true') {
+    const xff = req.headers.get('x-forwarded-for');
+    if (xff) {
+      const hops = xff
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+      if (hops.length > 0) {
+        return hops[hops.length - 1];
+      }
+    }
+    const realIp = req.headers.get('x-real-ip')?.trim();
+    if (realIp) return realIp;
+  }
+  return socketIp || 'local-client';
 }
 
 export async function POST(req: NextRequest) {
@@ -29,6 +40,13 @@ export async function POST(req: NextRequest) {
     if (!username || !password) {
       return NextResponse.json(
         { error: 'Vui lòng nhập đầy đủ Tên đăng nhập và Mật khẩu.' },
+        { status: 400 }
+      );
+    }
+
+    if (username.length > 64 || password.length > 256) {
+      return NextResponse.json(
+        { error: 'Tên đăng nhập hoặc mật khẩu vượt quá độ dài cho phép.' },
         { status: 400 }
       );
     }
@@ -69,6 +87,7 @@ export async function POST(req: NextRequest) {
       userId: Number(user.id),
       username: String(user.username),
       role: String(user.role || 'ADMIN'),
+      tokenVersion: Number(user.token_version ?? 1),
     });
 
     const res = NextResponse.json({

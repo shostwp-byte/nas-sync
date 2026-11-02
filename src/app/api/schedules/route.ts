@@ -43,14 +43,65 @@ export async function POST(req: NextRequest) {
     }
 
     const serverIds = Array.isArray(body.server_ids)
-      ? body.server_ids.map(Number)
+      ? Array.from(
+          new Set(
+            body.server_ids
+              .map((v: unknown) => Number(v))
+              .filter((n: number) => Number.isInteger(n) && n > 0)
+          )
+        )
       : [];
-    const maxConcurrency = Number(body.max_concurrency || 2);
-    const retention = body.retention_policy || {
+
+    if (serverIds.length === 0) {
+      return NextResponse.json(
+        { error: 'Vui lòng chọn ít nhất 1 máy chủ cho lịch sao lưu.' },
+        { status: 400 }
+      );
+    }
+
+    const maxConcurrency = Number(body.max_concurrency ?? 2);
+    if (
+      !Number.isInteger(maxConcurrency) ||
+      maxConcurrency < 1 ||
+      maxConcurrency > 10
+    ) {
+      return NextResponse.json(
+        {
+          error:
+            'Số luồng chạy đồng thời (max_concurrency) phải là số nguyên từ 1 đến 10.',
+        },
+        { status: 400 }
+      );
+    }
+
+    const rawRetention = body.retention_policy || {
       daily: 7,
       weekly: 4,
       monthly: 6,
     };
+    const daily = Number(rawRetention.daily ?? 7);
+    const weekly = Number(rawRetention.weekly ?? 4);
+    const monthly = Number(rawRetention.monthly ?? 6);
+    if (
+      !Number.isInteger(daily) ||
+      daily < 1 ||
+      daily > 3650 ||
+      !Number.isInteger(weekly) ||
+      weekly < 0 ||
+      weekly > 520 ||
+      !Number.isInteger(monthly) ||
+      monthly < 0 ||
+      monthly > 240
+    ) {
+      return NextResponse.json(
+        {
+          error:
+            'Chính sách lưu trữ GFS không hợp lệ (Daily >= 1, Weekly >= 0, Monthly >= 0).',
+        },
+        { status: 400 }
+      );
+    }
+    const retention = { daily, weekly, monthly };
     const verifyDb = body.verify_db_sandbox !== false ? 1 : 0;
     const btrfsAfter = body.btrfs_snapshot_after ? 1 : 0;
     const enabled = body.enabled !== false ? 1 : 0;

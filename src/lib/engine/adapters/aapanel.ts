@@ -4,6 +4,7 @@ import type {
   MysqlAdminCredentials,
   ServerRecord,
 } from '@/types';
+import { assertSafe, isSafeDomain } from '../safe-names';
 import { finalizeDiscoveredDomains, type PanelAdapter } from './base';
 
 export class AaPanelAdapter implements PanelAdapter {
@@ -34,6 +35,8 @@ print(row[0] if row else "")
     return {
       user: 'root',
       password: res.stdout.trim(),
+      remoteAuthPrelude:
+        'PY="/www/server/panel/pyenv/bin/python3"; [ ! -x "$PY" ] && PY="python3"; export MYSQL_PWD="$("$PY" -c "import sqlite3; c=sqlite3.connect(\'/www/server/panel/data/default.db\').cursor(); c.execute(\'SELECT mysql_root FROM config WHERE id=1\'); r=c.fetchone(); print(r[0] if r else \'\')" | tr -d \'\\r\\n\')"',
     };
   }
 
@@ -133,6 +136,8 @@ print(json.dumps(out))
     _systemUser: string,
     domain: string
   ): Promise<string> {
+    assertSafe(isSafeDomain, domain, 'domain');
+
     if (!server.is_mock) {
       const pyScript = `
 import sqlite3, os
@@ -172,8 +177,7 @@ print('/www/wwwroot/' + ${JSON.stringify(domain)})
     _domain: string,
     targetWebroot: string
   ): string {
-    return `chown -R www:www ${shellSingleQuote(targetWebroot)} && chmod -R 755 ${shellSingleQuote(
-      targetWebroot
-    )}`;
+    const q = shellSingleQuote(targetWebroot);
+    return `chown -hR www:www ${q} && find ${q} -type d -exec chmod 755 {} + && find ${q} -type f -exec chmod 644 {} +`;
   }
 }

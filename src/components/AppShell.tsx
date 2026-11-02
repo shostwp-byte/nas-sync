@@ -5,6 +5,7 @@ import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
 import {
   Activity,
+  AlertTriangle,
   ArrowUpCircle,
   CalendarClock,
   ExternalLink,
@@ -39,10 +40,41 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const router = useRouter();
   const { connected, progressMap, latestAlert } = useRealtime();
   const [mobileOpen, setMobileOpen] = useState(false);
+  const [criticalAlertIds, setCriticalAlertIds] = useState<number[]>([]);
   const [versionInfo, setVersionInfo] = useState<{
     currentVersion: string;
     hasUpdate: boolean;
   }>({ currentVersion: '1.1.0', hasUpdate: false });
+
+  useEffect(() => {
+    setMobileOpen(false);
+  }, [pathname]);
+
+  useEffect(() => {
+    if (!mobileOpen) {
+      document.body.style.overflow = '';
+      return;
+    }
+    document.body.style.overflow = 'hidden';
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setMobileOpen(false);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.body.style.overflow = '';
+      window.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [mobileOpen]);
+
+  useEffect(() => {
+    if (latestAlert && latestAlert.severity === 'CRITICAL') {
+      setCriticalAlertIds((prev) =>
+        prev.includes(latestAlert.id) ? prev : [...prev, latestAlert.id]
+      );
+    }
+  }, [latestAlert]);
 
   useEffect(() => {
     if (pathname === '/login') return;
@@ -71,6 +103,13 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     ['RUNNING', 'RESUMING', 'VERIFYING'].includes(p.status)
   ).length;
 
+  const criticalCount =
+    criticalAlertIds.length > 0
+      ? criticalAlertIds.length
+      : latestAlert && latestAlert.severity === 'CRITICAL'
+      ? 1
+      : 0;
+
   const handleLogout = async () => {
     await fetch('/api/auth/logout', { method: 'POST' });
     router.push('/login');
@@ -78,39 +117,54 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   };
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex">
-      {/* Sidebar Desktop */}
+    <div className="min-h-dvh bg-slate-950 text-slate-100">
+      {/* Mobile Backdrop Overlay */}
+      {mobileOpen && (
+        <div
+          onClick={() => setMobileOpen(false)}
+          aria-hidden="true"
+          className="fixed inset-0 z-40 bg-black/65 backdrop-blur-sm lg:hidden"
+        />
+      )}
+
+      {/* Sidebar Drawer (Mobile) & Fixed Sidebar (Desktop) */}
       <aside
-        className={`fixed inset-y-0 left-0 z-40 w-64 bg-slate-900/95 border-r border-slate-800 flex flex-col transition-transform duration-200 lg:translate-x-0 lg:static ${
+        className={`fixed top-0 left-0 z-50 h-dvh w-64 max-w-[85vw] bg-slate-900/95 border-r border-slate-800 flex flex-col transition-transform duration-200 lg:translate-x-0 ${
           mobileOpen ? 'translate-x-0' : '-translate-x-full'
         }`}
       >
-        <div className="h-16 px-5 flex items-center justify-between border-b border-slate-800">
-          <Link href="/" className="flex items-center gap-3">
-            <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-blue-500 to-cyan-400 flex items-center justify-center shadow-lg shadow-blue-500/20">
+        <div className="h-16 px-4 flex items-center justify-between gap-2 border-b border-slate-800 shrink-0">
+          <Link
+            href="/"
+            onClick={() => setMobileOpen(false)}
+            className="flex items-center gap-3 min-w-0"
+          >
+            <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-blue-500 to-cyan-400 flex items-center justify-center shadow-lg shadow-blue-500/20 shrink-0">
               <ShieldCheck className="w-5 h-5 text-slate-950 stroke-[2.5]" />
             </div>
-            <div>
+            <div className="min-w-0">
               <div className="font-bold text-sm tracking-wide text-white flex items-center gap-1.5">
-                <span>NAS-SYNC</span>
-                <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-cyan-300 font-mono">
+                <span className="truncate">NAS-SYNC</span>
+                <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-cyan-300 font-mono shrink-0">
                   v{versionInfo.currentVersion}
                 </span>
               </div>
-              <div className="text-[11px] text-slate-400">
+              <div className="text-[11px] text-slate-400 truncate">
                 Synology Agentless Pull
               </div>
             </div>
           </Link>
           <button
+            type="button"
             onClick={() => setMobileOpen(false)}
-            className="lg:hidden p-1.5 text-slate-400 hover:text-white"
+            aria-label="Đóng menu điều hướng"
+            className="lg:hidden h-10 w-10 inline-flex items-center justify-center rounded-lg text-slate-400 hover:text-white hover:bg-slate-800/80 transition-colors shrink-0"
           >
             <X className="w-5 h-5" />
           </button>
         </div>
 
-        <nav className="flex-1 px-3 py-4 space-y-1 overflow-y-auto">
+        <nav className="flex-1 px-3 py-4 space-y-1 overflow-y-auto overscroll-contain">
           {NAV_ITEMS.map((item) => {
             const Icon = item.icon;
             const active =
@@ -122,25 +176,25 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                 key={item.href}
                 href={item.href}
                 onClick={() => setMobileOpen(false)}
-                className={`flex items-center justify-between px-3.5 py-2.5 rounded-lg text-sm font-medium transition-colors ${
+                className={`flex items-center justify-between px-3.5 py-2.5 min-h-[42px] rounded-lg text-sm font-medium transition-colors ${
                   active
                     ? 'bg-blue-600/20 text-blue-300 border border-blue-500/30'
                     : 'text-slate-400 hover:text-slate-100 hover:bg-slate-800/70 border border-transparent'
                 }`}
               >
-                <span className="flex items-center gap-3">
+                <span className="flex items-center gap-3 min-w-0">
                   <Icon className="w-4 h-4 shrink-0" />
-                  <span>{item.label}</span>
+                  <span className="truncate">{item.label}</span>
                 </span>
                 {item.href === '/jobs' && runningCount > 0 && (
-                  <span className="px-2 py-0.5 text-[11px] rounded-full bg-blue-500 text-white animate-pulse">
+                  <span className="px-2 py-0.5 text-[11px] rounded-full bg-blue-500 text-white animate-pulse shrink-0">
                     {runningCount}
                   </span>
                 )}
                 {item.href === '/settings' && versionInfo.hasUpdate && (
                   <span
                     title="Có bản cập nhật mới trên GitHub"
-                    className="inline-flex items-center gap-1 px-1.5 py-0.5 text-[10px] rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/40"
+                    className="inline-flex items-center gap-1 px-1.5 py-0.5 text-[10px] rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/40 shrink-0"
                   >
                     <ArrowUpCircle className="w-3 h-3" />
                     Mới
@@ -151,16 +205,16 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           })}
         </nav>
 
-        <div className="p-4 border-t border-slate-800 space-y-3">
+        <div className="p-4 pb-[max(1rem,env(safe-area-inset-bottom))] border-t border-slate-800 space-y-3 shrink-0">
           <div className="px-3 py-2.5 rounded-lg bg-slate-950/80 border border-slate-800 text-xs space-y-1.5">
-            <div className="flex items-center justify-between">
+            <div className="flex items-center justify-between gap-2">
               <span className="text-slate-400">Realtime Socket</span>
               {connected ? (
-                <span className="inline-flex items-center gap-1 text-emerald-400 font-medium">
+                <span className="inline-flex items-center gap-1 text-emerald-400 font-medium shrink-0">
                   <Wifi className="w-3.5 h-3.5" /> Đã kết nối
                 </span>
               ) : (
-                <span className="inline-flex items-center gap-1 text-amber-400 font-medium">
+                <span className="inline-flex items-center gap-1 text-amber-400 font-medium shrink-0">
                   <WifiOff className="w-3.5 h-3.5" /> Đang nối lại
                 </span>
               )}
@@ -169,7 +223,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
               href="https://github.com/shostwp-byte/nas-sync"
               target="_blank"
               rel="noreferrer"
-              className="flex items-center justify-between text-[11px] text-slate-400 hover:text-cyan-300 transition-colors pt-1 border-t border-slate-800/80"
+              className="flex items-center justify-between gap-1 text-[11px] text-slate-400 hover:text-cyan-300 transition-colors pt-1 border-t border-slate-800/80"
             >
               <span className="truncate">github.com/shostwp-byte/nas-sync</span>
               <ExternalLink className="w-3 h-3 shrink-0" />
@@ -177,63 +231,83 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           </div>
 
           <button
+            type="button"
             onClick={handleLogout}
-            className="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-xs font-medium text-slate-300 hover:text-white bg-slate-800/70 hover:bg-rose-600/20 hover:border-rose-500/40 border border-slate-700/70 transition-colors"
+            className="w-full min-h-[40px] flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-xs font-medium text-slate-300 hover:text-white bg-slate-800/70 hover:bg-rose-600/20 hover:border-rose-500/40 border border-slate-700/70 transition-colors"
           >
-            <LogOut className="w-3.5 h-3.5" />
+            <LogOut className="w-3.5 h-3.5 shrink-0" />
             Đăng xuất quản trị
           </button>
         </div>
       </aside>
 
       {/* Main Content */}
-      <div className="flex-1 flex flex-col min-w-0">
-        <header className="h-16 bg-slate-900/60 backdrop-blur border-b border-slate-800 px-4 lg:px-8 flex items-center justify-between sticky top-0 z-30">
-          <div className="flex items-center gap-3">
+      <div className="lg:pl-64 flex flex-col min-h-dvh min-w-0">
+        <header className="min-h-16 bg-slate-900/60 backdrop-blur border-b border-slate-800 px-3.5 sm:px-6 py-2 gap-2.5 flex items-center justify-between sticky top-0 z-30">
+          <div className="flex items-center gap-2.5 min-w-0 flex-1">
             <button
+              type="button"
               onClick={() => setMobileOpen(true)}
-              className="lg:hidden p-2 rounded-lg bg-slate-800 text-slate-200"
+              aria-label="Mở menu điều hướng"
+              className="lg:hidden h-10 w-10 inline-flex items-center justify-center rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 transition-colors shrink-0"
             >
               <Menu className="w-5 h-5" />
             </button>
-            <div>
-              <h1 className="text-sm lg:text-base font-semibold text-slate-100">
-                NAS-Sync — Hệ thống Sao lưu & Khôi phục Đa Máy chủ
+            <div className="min-w-0 flex-1">
+              <h1 className="text-sm lg:text-base font-semibold text-slate-100 truncate">
+                <span className="sm:hidden">NAS-Sync NOC</span>
+                <span className="hidden sm:inline">
+                  NAS-Sync — Hệ thống Sao lưu & Khôi phục Đa Máy chủ
+                </span>
               </h1>
-              <p className="text-xs text-slate-400 hidden sm:block">
+              <p className="text-xs text-slate-400 hidden md:block truncate">
                 DirectAdmin • cPanel • Plesk • aaPanel (Domain & Subdomain) ➔ Synology NAS
               </p>
             </div>
           </div>
 
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2 shrink-0">
             {versionInfo.hasUpdate && (
               <Link
                 href="/settings"
-                className="hidden md:inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium bg-amber-500/15 border border-amber-500/40 text-amber-300 hover:bg-amber-500/25"
+                className="hidden md:inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium bg-amber-500/15 border border-amber-500/40 text-amber-300 hover:bg-amber-500/25 whitespace-nowrap"
               >
-                <ArrowUpCircle className="w-3.5 h-3.5" />
+                <ArrowUpCircle className="w-3.5 h-3.5 shrink-0" />
                 Có bản cập nhật GitHub
               </Link>
             )}
-            {latestAlert && latestAlert.severity === 'CRITICAL' && (
-              <Link
-                href="/settings"
-                className="hidden md:inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium bg-rose-500/20 border border-rose-500/40 text-rose-300"
-              >
-                🚨 {latestAlert.title}
-              </Link>
+            {criticalCount > 0 && (
+              <>
+                <Link
+                  href="/settings"
+                  title={latestAlert?.title || 'Cảnh báo hệ thống nghiêm trọng'}
+                  aria-label={`Xem ${criticalCount} cảnh báo nghiêm trọng`}
+                  className="md:hidden inline-flex items-center gap-1 px-2.5 py-1.5 min-h-[38px] rounded-full text-xs font-semibold bg-rose-500/20 border border-rose-500/40 text-rose-300 shrink-0"
+                >
+                  <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+                  <span>{criticalCount}</span>
+                </Link>
+                <Link
+                  href="/settings"
+                  className="hidden md:inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium bg-rose-500/20 border border-rose-500/40 text-rose-300 max-w-[260px]"
+                >
+                  <span className="shrink-0">🚨</span>
+                  <span className="truncate">
+                    {latestAlert?.title || `${criticalCount} cảnh báo nghiêm trọng`}
+                  </span>
+                </Link>
+              </>
             )}
             <Link
               href="/restore"
-              className="px-3.5 py-1.5 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors"
+              className="shrink-0 whitespace-nowrap min-h-[38px] flex items-center px-3 sm:px-3.5 py-2 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors"
             >
               1-Click Restore
             </Link>
           </div>
         </header>
 
-        <main className="flex-1 p-4 lg:p-8 max-w-[1600px] w-full mx-auto">
+        <main className="flex-1 p-3.5 sm:p-6 pb-[max(1.25rem,env(safe-area-inset-bottom))] sm:pb-[max(1.5rem,env(safe-area-inset-bottom))] max-w-[1600px] w-full mx-auto min-w-0">
           {children}
         </main>
       </div>

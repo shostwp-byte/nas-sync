@@ -1,3 +1,4 @@
+import { execRemoteSSH, shellSingleQuote } from '@/lib/ssh';
 import type {
   DiscoveredDomain,
   MysqlAdminCredentials,
@@ -5,6 +6,7 @@ import type {
   ServerRecord,
 } from '@/types';
 import {
+  assertSafe,
   isSafeDbName,
   isSafeDomain,
   isSafeSystemUser,
@@ -31,15 +33,208 @@ export interface PanelAdapter {
   ): string;
 }
 
+export type WebrootSafetyCheckResult =
+  | { ok: true; resolvedPath: string }
+  | {
+      ok: false;
+      code: 'NOT_FOUND' | 'JAIL_VIOLATION' | 'SSH_ERROR';
+      reason: string;
+    };
+
+/**
+ * Chỉ truyền user hoặc --defaults-extra-file qua tham số dòng lệnh;
+ * TUYỆT ĐỐI không đặt -p'...' lên argv để chống lộ mật khẩu qua `ps aux` trên VPS.
+ */
 export function buildMysqlAuthFlags(creds: MysqlAdminCredentials): string {
   if (creds.defaultsFile) {
-    return `--defaults-extra-file="${creds.defaultsFile}"`;
+    return `--defaults-extra-file=${shellSingleQuote(creds.defaultsFile)}`;
   }
-  const escapedPass = (creds.password || '').replace(/'/g, `'\\''`);
-  if (creds.password) {
-    return `-u"${creds.user}" -p'${escapedPass}'`;
+  return `-u ${shellSingleQuote(creds.user)}`;
+}
+
+/**
+ * Sinh đoạn mã tiền tố Bash chạy trực tiếp trên VPS để nạp MYSQL_PWD vào biến môi trường
+ * từ file cấu hình nội bộ của Panel mà không xuất hiện trên danh sách tiến trình `ps aux`.
+ */
+export function buildRemoteMysqlEnvPrelude(creds: MysqlAdminCredentials): string {
+  if (creds.defaultsFile) {
+    return '';
   }
-  return `-u"${creds.user}"`;
+  if (creds.remoteAuthPrelude) {
+    return `${creds.remoteAuthPrelude}\n`;
+  }
+  return '';
+}
+
+/**
+ * Kiểm tra Symlink Webroot Jail trực tiếp trên VPS trước khi chạy rsync pull/push hoặc chown:
+ * - Phân giải đường dẫn thực tế qua `realpath` / `readlink`
+ * - Trên cPanel/DirectAdmin: bắt buộc nằm bên trong thư mục home thực của `systemUser` trong `/etc/passwd`
+ * - Trên Plesk: bắt buộc nằm trong vhost root của `systemUser` hoặc `/var/www/vhosts/<domain>/...`
+ * - Trên aaPanel: bắt buộc nằm trong `/www/wwwroot/<site>`
+ * - Chặn tuyệt đối mọi symlink trỏ sang `/root`, `/etc`, `/proc`, `/var/lib/mysql` hoặc tài khoản user khác.
+ */
+export async function verifyRemoteWebrootSafety(
+  server: ServerRecord,
+  panelType: PanelType,
+  systemUser: string,
+  webroot: string,
+  options: { mustExist: boolean }
+): Promise<WebrootSafetyCheckResult> {
+  const cleanWebroot = normalizePosixWebroot(webroot);
+  assertSafe(isSafeSystemUser, systemUser, 'systemUser');
+  assertSafe((v) => isSafeWebroot(v, 2), cleanWebroot, 'webroot');
+
+  if (server.is_mock) {
+    return { ok: true, resolvedPath: cleanWebroot };
+  }
+
+  const checkScript = `
+    TARGET=${shellSingleQuote(cleanWebroot)}
+    SYS_USER=${shellSingleQuote(systemUser)}
+    PANEL=${shellSingleQuote(panelType)}
+    MUST_EXIST=${options.mustExist ? "'1'" : "'0'"}
+
+    if [ "$MUST_EXIST" = "1" ]; then
+      if [ ! -e "$TARGET" ]; then
+        echo "ERR_NOT_FOUND"
+        exit 0
+      fi
+      REAL=$(realpath -e "$TARGET" 2>/dev/null || readlink -f "$TARGET" 2>/dev/null || true)
+    else
+      if [ -L "$TARGET" ]; then
+        LINK_REAL=$(realpath -m "$TARGET" 2>/dev/null || readlink -m "$TARGET" 2>/dev/null || true)
+        REAL="$LINK_REAL"
+      else
+        REAL=$(realpath -m "$TARGET" 2>/dev/null || readlink -m "$TARGET" 2>/dev/null || true)
+      fi
+    fi
+
+    if [ -z "$REAL" ]; then
+      echo "ERR_JAIL|Không thể phân giải đường dẫn thực tế (realpath) cho $TARGET"
+      exit 0
+    fi
+
+    if [ "$REAL" != "/" ]; then
+      REAL="\${REAL%/}"
+    fi
+
+    case "$REAL/" in
+      /|/etc/*|/root/*|/proc/*|/sys/*|/dev/*|/boot/*|/usr/*|/bin/*|/sbin/*|/lib/*|/lib64/*|/run/*|/var/lib/mysql/*|/var/cpanel/*|/usr/local/directadmin/*|/www/server/panel/*)
+        echo "ERR_JAIL|Đường dẫn webroot trỏ tới vùng hệ thống bị cấm ($REAL)"
+        exit 0
+        ;;
+    esac
+
+    if [ "$PANEL" = "AAPANEL" ]; then
+      case "$REAL" in
+        /www/wwwroot/*)
+          if [ "$REAL" = "/www/wwwroot" ]; then
+            echo "ERR_JAIL|Webroot không được là thư mục gốc /www/wwwroot"
+            exit 0
+          fi
+          ;;
+        *)
+          echo "ERR_JAIL|Webroot aaPanel ($REAL) nằm ngoài phạm vi /www/wwwroot/"
+          exit 0
+          ;;
+      esac
+    elif [ "$PANEL" = "PLESK" ]; then
+      USER_HOME=$(getent passwd "$SYS_USER" 2>/dev/null | cut -d: -f6 || true)
+      REAL_HOME=""
+      if [ -n "$USER_HOME" ] && [ "$USER_HOME" != "/" ]; then
+        REAL_HOME=$(realpath -m "$USER_HOME" 2>/dev/null || readlink -m "$USER_HOME" 2>/dev/null || printf "%s" "$USER_HOME")
+        REAL_HOME="\${REAL_HOME%/}"
+      fi
+      if [ -n "$REAL_HOME" ] && [ "$REAL_HOME" != "/" ] && [ "$SYS_USER" != "root" ]; then
+        case "$REAL/" in
+          "$REAL_HOME/"*) ;;
+          *)
+            echo "ERR_JAIL|Webroot Plesk ($REAL) thoát khỏi phạm vi vhost của user $SYS_USER ($REAL_HOME)"
+            exit 0
+            ;;
+        esac
+      else
+        case "$REAL" in
+          /var/www/vhosts/*/*) ;;
+          *)
+            echo "ERR_JAIL|Webroot Plesk ($REAL) phải nằm trong /var/www/vhosts/<domain>/..."
+            exit 0
+            ;;
+        esac
+      fi
+    else
+      USER_HOME=$(getent passwd "$SYS_USER" 2>/dev/null | cut -d: -f6 || true)
+      if [ -z "$USER_HOME" ] || [ "$USER_HOME" = "/" ]; then
+        echo "ERR_JAIL|Không tìm thấy thư mục home hợp lệ trong /etc/passwd cho user $SYS_USER"
+        exit 0
+      fi
+      REAL_HOME=$(realpath -m "$USER_HOME" 2>/dev/null || readlink -m "$USER_HOME" 2>/dev/null || printf "%s" "$USER_HOME")
+      REAL_HOME="\${REAL_HOME%/}"
+      if [ -z "$REAL_HOME" ] || [ "$REAL_HOME" = "/" ]; then
+        echo "ERR_JAIL|Thư mục home thực tế của user $SYS_USER không hợp lệ ($REAL_HOME)"
+        exit 0
+      fi
+      case "$REAL/" in
+        "$REAL_HOME/"*)
+          if [ "$REAL" = "$REAL_HOME" ]; then
+            echo "ERR_JAIL|Webroot không được trùng chính xác thư mục gốc home ($REAL_HOME)"
+            exit 0
+          fi
+          ;;
+        *)
+          echo "ERR_JAIL|Phát hiện Webroot/Symlink ($REAL) thoát khỏi phạm vi home của user $SYS_USER ($REAL_HOME)"
+          exit 0
+          ;;
+      esac
+    fi
+
+    printf "OK|%s\\n" "$REAL"
+  `;
+
+  const res = await execRemoteSSH(server, checkScript, {
+    zeroImpact: true,
+    timeoutMs: 20000,
+  });
+
+  if (res.code === 255) {
+    return {
+      ok: false,
+      code: 'SSH_ERROR',
+      reason: res.stderr.trim() || 'Mất kết nối SSH tới VPS khi kiểm tra Webroot Jail.',
+    };
+  }
+
+  const out = res.stdout.trim().split('\n')[0]?.trim() || '';
+  if (out === 'ERR_NOT_FOUND') {
+    return {
+      ok: false,
+      code: 'NOT_FOUND',
+      reason: `Thư mục webroot ${cleanWebroot} chưa tồn tại trên VPS.`,
+    };
+  }
+  if (out.startsWith('ERR_JAIL|')) {
+    return {
+      ok: false,
+      code: 'JAIL_VIOLATION',
+      reason: out.slice('ERR_JAIL|'.length).trim(),
+    };
+  }
+  if (res.code === 0 && out.startsWith('OK|')) {
+    return {
+      ok: true,
+      resolvedPath: out.slice(3).trim() || cleanWebroot,
+    };
+  }
+
+  return {
+    ok: false,
+    code: 'SSH_ERROR',
+    reason:
+      res.stderr.trim() ||
+      out ||
+      `Không thể xác minh tính an toàn của webroot ${cleanWebroot} (exit ${res.code}).`,
+  };
 }
 
 /**

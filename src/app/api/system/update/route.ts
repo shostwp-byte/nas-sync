@@ -1,5 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { checkGitHubUpdate, performGitHubUpdate } from '@/lib/updater';
+import {
+  checkGitHubUpdate,
+  getActiveBlockingReason,
+  performGitHubUpdate,
+} from '@/lib/updater';
 
 export async function GET() {
   try {
@@ -17,6 +21,14 @@ export async function POST(req: NextRequest) {
   try {
     const body = await req.json().catch(() => ({}));
     const force = Boolean(body?.force);
+
+    const { canUpdateNow, blockingReason } = getActiveBlockingReason();
+    if (!canUpdateNow) {
+      return NextResponse.json(
+        { error: blockingReason || 'Không thể cập nhật ngay lúc này.' },
+        { status: 409 }
+      );
+    }
 
     // Chạy bất đồng bộ và đẩy tiến trình qua Socket.IO (system:update_progress)
     void performGitHubUpdate({ force }).catch((err) => {

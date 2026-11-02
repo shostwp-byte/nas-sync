@@ -4,6 +4,11 @@ import type {
   MysqlAdminCredentials,
   ServerRecord,
 } from '@/types';
+import {
+  assertSafe,
+  isSafeDomain,
+  isSafeSystemUser,
+} from '../safe-names';
 import { finalizeDiscoveredDomains, type PanelAdapter } from './base';
 
 export class CPanelAdapter implements PanelAdapter {
@@ -28,7 +33,15 @@ export class CPanelAdapter implements PanelAdapter {
         `Không đọc được /root/.my.cnf trên máy chủ cPanel ${server.hostname}: ${res.stderr}`
       );
     }
-    const [, user, password] = res.stdout.trim().split('|');
+    const line = res.stdout.replace(/\r?\n$/, '');
+    const firstPipe = line.indexOf('|');
+    const secondPipe = firstPipe >= 0 ? line.indexOf('|', firstPipe + 1) : -1;
+    const user =
+      firstPipe >= 0 && secondPipe >= 0
+        ? line.slice(firstPipe + 1, secondPipe).trim()
+        : 'root';
+    const password =
+      secondPipe >= 0 ? line.slice(secondPipe + 1).trim() : '';
     return {
       user: user || 'root',
       password: password || undefined,
@@ -191,18 +204,25 @@ $(head -n 120 "$cf" 2>/dev/null || true)"
     systemUser: string,
     domain: string
   ): Promise<string> {
+    assertSafe(isSafeSystemUser, systemUser, 'systemUser');
+    assertSafe(isSafeDomain, domain, 'domain');
+
     if (!server.is_mock) {
       const cmd = `
-        UDATA="/var/cpanel/userdata/${systemUser}/${domain}"
+        SYS_USER=${shellSingleQuote(systemUser)}
+        DOM=${shellSingleQuote(domain)}
+        UDATA="/var/cpanel/userdata/$SYS_USER/$DOM"
         if [ -f "$UDATA" ]; then
           DOC=$(grep -E '^documentroot:' "$UDATA" | head -n1 | awk '{print $2}')
           [ -n "$DOC" ] && echo "$DOC" && exit 0
         fi
         if [ -f /etc/userdatadomains ]; then
-          LINE_DOC=$(grep -E "^${domain}:" /etc/userdatadomains 2>/dev/null | head -n1 | cut -d: -f2- | cut -d= -f9)
+          LINE_DOC=$(grep -F -- "$DOM:" /etc/userdatadomains 2>/dev/null | awk -F: -v d="$DOM" '$1 == d { print substr($0, index($0, ":") + 1); exit }' | cut -d= -f9)
           [ -n "$LINE_DOC" ] && echo "$LINE_DOC" && exit 0
         fi
-        echo "/home/${systemUser}/public_html"
+        USER_HOME=$(getent passwd "$SYS_USER" 2>/dev/null | cut -d: -f6 || true)
+        [ -z "$USER_HOME" ] && USER_HOME="/home/$SYS_USER"
+        echo "$USER_HOME/public_html"
       `;
       const res = await execRemoteSSH(server, cmd, { zeroImpact: true });
       if (res.code === 0 && res.stdout.trim()) {
@@ -217,11 +237,12 @@ $(head -n 120 "$cf" 2>/dev/null || true)"
     _domain: string,
     targetWebroot: string
   ): string {
-    return `chown -R ${shellSingleQuote(`${systemUser}:${systemUser}`)} ${shellSingleQuote(
+    assertSafe(isSafeSystemUser, systemUser, 'systemUser');
+    return `chown -hR ${shellSingleQuote(`${systemUser}:${systemUser}`)} ${shellSingleQuote(
       targetWebroot
-    )} && chown ${shellSingleQuote(`${systemUser}:nobody`)} ${shellSingleQuote(
+    )} && chown -h ${shellSingleQuote(`${systemUser}:nobody`)} ${shellSingleQuote(
       targetWebroot
-    )} 2>/dev/null || chown -R ${shellSingleQuote(
+    )} 2>/dev/null || chown -hR ${shellSingleQuote(
       `${systemUser}:${systemUser}`
     )} ${shellSingleQuote(targetWebroot)}`;
   }

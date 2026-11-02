@@ -3,6 +3,7 @@ import path from 'node:path';
 import zlib from 'node:zlib';
 import { diffLines } from 'diff';
 import { getDb } from '@/lib/db';
+import { isSafeSnapshotName } from './safe-names';
 
 export interface ExplorerEntry {
   name: string;
@@ -39,16 +40,21 @@ export function resolveSafeSnapshotRoot(jobId: number): {
     throw new Error(`Không tìm thấy bản sao lưu Job #${jobId}`);
   }
 
-  const snapshotRoot = path.resolve(
-    String(row.mount_path),
-    String(row.hostname),
-    String(row.snapshot_name)
-  );
+  const snapshotName = String(row.snapshot_name);
+  if (!isSafeSnapshotName(snapshotName)) {
+    throw new Error('Tên Snapshot không hợp lệ.');
+  }
+
+  const hostRoot = path.resolve(String(row.mount_path), String(row.hostname));
+  const snapshotRoot = path.resolve(hostRoot, snapshotName);
+  if (!isWithinRoot(hostRoot, snapshotRoot)) {
+    throw new Error('Đường dẫn Snapshot không hợp lệ.');
+  }
 
   return {
     snapshotRoot,
     hostname: String(row.hostname),
-    snapshotName: String(row.snapshot_name),
+    snapshotName,
   };
 }
 
@@ -57,6 +63,9 @@ function isWithinRoot(root: string, target: string): boolean {
 }
 
 export function resolveSafeSubPath(snapshotRoot: string, relativeSubPath = ''): string {
+  if (relativeSubPath.includes('\0')) {
+    throw new Error('Đường dẫn chứa ký tự không hợp lệ.');
+  }
   const normalizedRel = relativeSubPath.replace(/^[/\\]+/, '');
   const resolved = path.resolve(snapshotRoot, normalizedRel);
 
@@ -98,20 +107,36 @@ export function listSnapshotDirectory(
     };
   }
 
+  const dirStat = fs.lstatSync(targetDir);
+  if (!dirStat.isDirectory()) {
+    return {
+      hostname,
+      snapshotName,
+      currentPath: relativeSubPath,
+      entries: [],
+    };
+  }
+
   const dirents = fs.readdirSync(targetDir, { withFileTypes: true });
   const entries: ExplorerEntry[] = [];
 
   for (const d of dirents) {
     if (d.name === '.rsync-partial' || d.name === '.state.json') continue;
     const full = path.join(targetDir, d.name);
-    // Symlink hỏng (rất phổ biến trong webroot WordPress) làm statSync ném ENOENT
-    // và hỏng cả danh sách — fallback sang lstat để vẫn hiển thị mục đó.
+
     let stat: fs.Stats;
     try {
-      stat = fs.statSync(full);
-    } catch {
       stat = fs.lstatSync(full);
+    } catch {
+      continue;
     }
+
+    // Bỏ qua symlink và thiết bị đặc biệt (FIFO, socket, block/char device) để chống leo thang đặc quyền / treo luồng
+    if (stat.isSymbolicLink() || (!stat.isFile() && !stat.isDirectory())) {
+      continue;
+    }
+
+    const isDir = stat.isDirectory();
     const rel = path
       .relative(snapshotRoot, full)
       .split(path.sep)
@@ -120,8 +145,8 @@ export function listSnapshotDirectory(
     entries.push({
       name: d.name,
       relativePath: rel,
-      isDirectory: d.isDirectory(),
-      sizeBytes: d.isDirectory() ? 0 : stat.size,
+      isDirectory: isDir,
+      sizeBytes: isDir ? 0 : stat.size,
       modifiedAt: stat.mtime.toISOString(),
       hardLinkCount: Number(stat.nlink || 1),
     });
@@ -140,6 +165,10 @@ export function listSnapshotDirectory(
   };
 }
 
+const MAX_GZ_PREVIEW_COMPRESSED_BYTES = 5 * 1024 * 1024; // 5 MB
+const MAX_GZ_PREVIEW_UNCOMPRESSED_BYTES = 10 * 1024 * 1024; // 10 MB
+const MAX_DIFF_FILE_BYTES = 5 * 1024 * 1024; // 5 MB
+
 export function readSnapshotFilePreview(
   jobId: number,
   relativeFilePath: string,
@@ -155,32 +184,84 @@ export function readSnapshotFilePreview(
   const { snapshotRoot } = resolveSafeSnapshotRoot(jobId);
   const fullPath = resolveSafeSubPath(snapshotRoot, relativeFilePath);
 
-  if (!fs.existsSync(fullPath) || fs.statSync(fullPath).isDirectory()) {
-    throw new Error('File không tồn tại hoặc là thư mục.');
+  if (!fs.existsSync(fullPath)) {
+    throw new Error('File không tồn tại.');
   }
 
-  const stat = fs.statSync(fullPath);
+  const stat = fs.lstatSync(fullPath);
+  if (!stat.isFile()) {
+    throw new Error(
+      'Chỉ hỗ trợ xem trước tập tin thông thường (không hỗ trợ thư mục/symlink/FIFO/device).'
+    );
+  }
+
+  const safeMaxBytes = Math.min(
+    Math.max(1024, Number(maxBytes) || 256 * 1024),
+    1024 * 1024
+  );
   const fileName = path.basename(fullPath);
 
-  // Tự động giải nén xem trước nếu là file .sql.gz nhỏ
-  if (fileName.endsWith('.sql.gz') && stat.size < 2 * 1024 * 1024) {
-    const raw = zlib.gunzipSync(fs.readFileSync(fullPath));
-    const sliced = raw.subarray(0, maxBytes);
-    return {
-      fileName,
-      sizeBytes: stat.size,
-      hardLinkCount: Number(stat.nlink || 1),
-      isBinary: false,
-      truncated: raw.length > maxBytes,
-      content: sliced.toString('utf8'),
-    };
+  // Tự động giải nén an toàn cho file .gz / .sql.gz với giới hạn chống Gzip Bomb (OOM)
+  if (fileName.endsWith('.gz')) {
+    if (stat.size > MAX_GZ_PREVIEW_COMPRESSED_BYTES) {
+      return {
+        fileName,
+        sizeBytes: stat.size,
+        hardLinkCount: Number(stat.nlink || 1),
+        isBinary: false,
+        truncated: true,
+        content:
+          '...File nén quá lớn (> 5 MB) để giải nén trực tiếp trên RAM, vui lòng tải về máy để xem toàn bộ...',
+      };
+    }
+
+    try {
+      const raw = zlib.gunzipSync(fs.readFileSync(fullPath), {
+        maxOutputLength: MAX_GZ_PREVIEW_UNCOMPRESSED_BYTES,
+      });
+      const sliced = raw.subarray(0, safeMaxBytes);
+      if (sliced.includes(0)) {
+        return {
+          fileName,
+          sizeBytes: stat.size,
+          hardLinkCount: Number(stat.nlink || 1),
+          isBinary: true,
+          truncated: false,
+          content: '',
+        };
+      }
+      return {
+        fileName,
+        sizeBytes: stat.size,
+        hardLinkCount: Number(stat.nlink || 1),
+        isBinary: false,
+        truncated: raw.length > safeMaxBytes,
+        content: sliced.toString('utf8'),
+      };
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code === 'ERR_BUFFER_TOO_LARGE') {
+        return {
+          fileName,
+          sizeBytes: stat.size,
+          hardLinkCount: Number(stat.nlink || 1),
+          isBinary: false,
+          truncated: true,
+          content:
+            '...Dữ liệu sau giải nén vượt ngưỡng an toàn RAM (10 MB), vui lòng tải file về máy để xem...',
+        };
+      }
+      throw new Error(`Không thể giải nén tập tin xem trước: ${(err as Error).message}`);
+    }
   }
 
-  const fd = fs.openSync(fullPath, 'r');
-  const readLen = Math.min(stat.size, maxBytes);
+  const readLen = Math.min(stat.size, safeMaxBytes);
   const buf = Buffer.alloc(readLen);
-  fs.readSync(fd, buf, 0, readLen, 0);
-  fs.closeSync(fd);
+  const fd = fs.openSync(fullPath, 'r');
+  try {
+    fs.readSync(fd, buf, 0, readLen, 0);
+  } finally {
+    fs.closeSync(fd);
+  }
 
   const hasNullByte = buf.includes(0);
   if (hasNullByte) {
@@ -199,7 +280,7 @@ export function readSnapshotFilePreview(
     sizeBytes: stat.size,
     hardLinkCount: Number(stat.nlink || 1),
     isBinary: false,
-    truncated: stat.size > maxBytes,
+    truncated: stat.size > safeMaxBytes,
     content: buf.toString('utf8'),
   };
 }
@@ -226,9 +307,29 @@ export function compareSnapshotFilesDiff(
   const targetFile = resolveSafeSubPath(targetInfo.snapshotRoot, relativeFilePath);
 
   const readTextSafe = (p: string): string => {
-    if (!fs.existsSync(p) || fs.statSync(p).isDirectory()) return '';
-    if (p.endsWith('.sql.gz')) {
-      return zlib.gunzipSync(fs.readFileSync(p)).toString('utf8');
+    if (!fs.existsSync(p)) return '';
+    const stat = fs.lstatSync(p);
+    if (!stat.isFile()) return '';
+    if (stat.size > MAX_DIFF_FILE_BYTES) {
+      throw new Error(
+        'Tập tin vượt quá giới hạn 5 MB để so sánh Diff trực tiếp.'
+      );
+    }
+    if (p.endsWith('.gz')) {
+      try {
+        return zlib
+          .gunzipSync(fs.readFileSync(p), {
+            maxOutputLength: MAX_DIFF_FILE_BYTES,
+          })
+          .toString('utf8');
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code === 'ERR_BUFFER_TOO_LARGE') {
+          throw new Error(
+            'Dữ liệu sau giải nén vượt quá giới hạn 5 MB để so sánh Diff trực tiếp.'
+          );
+        }
+        throw err;
+      }
     }
     return fs.readFileSync(p, 'utf8');
   };

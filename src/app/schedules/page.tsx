@@ -149,11 +149,13 @@ export default function SchedulesPage() {
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-        <div>
-          <h2 className="text-lg font-bold text-white flex items-center gap-2">
-            <CalendarClock className="w-5 h-5 text-blue-400" />
-            Lập lịch Cron & Chính sách Lưu trữ GFS (Grandfather-Father-Son)
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        <div className="min-w-0">
+          <h2 className="text-base sm:text-lg font-bold text-white flex items-center gap-2">
+            <CalendarClock className="w-5 h-5 text-blue-400 shrink-0" />
+            <span>
+              Lập lịch Cron & Chính sách Lưu trữ GFS (Grandfather-Father-Son)
+            </span>
           </h2>
           <p className="text-xs text-slate-400 mt-0.5">
             Điều phối Concurrency chống nghẽn băng thông và tự động giữ lại 7 Daily + 4 Weekly (Chủ nhật) + 6 Monthly (Mùng 1).
@@ -161,6 +163,7 @@ export default function SchedulesPage() {
         </div>
 
         <button
+          type="button"
           onClick={() => {
             setForm((f) => ({
               ...f,
@@ -168,9 +171,9 @@ export default function SchedulesPage() {
             }));
             setShowModal(true);
           }}
-          className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold bg-blue-600 hover:bg-blue-500 text-white"
+          className="w-full sm:w-auto justify-center min-h-[40px] shrink-0 whitespace-nowrap inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold bg-blue-600 hover:bg-blue-500 text-white transition-colors"
         >
-          <Plus className="w-4 h-4" />
+          <Plus className="w-4 h-4 shrink-0" />
           Tạo Lịch Sao lưu Mới
         </button>
       </div>
@@ -180,25 +183,28 @@ export default function SchedulesPage() {
         {schedules.map((sc) => (
           <div
             key={sc.id}
-            className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-4"
+            className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-6 space-y-4"
           >
             <div className="flex items-start justify-between gap-3">
-              <div>
-                <h3 className="text-sm font-bold text-white">{sc.name}</h3>
-                <div className="text-xs font-mono text-cyan-400 mt-1">
+              <div className="min-w-0">
+                <h3 className="text-sm font-bold text-white break-words">
+                  {sc.name}
+                </h3>
+                <div className="text-xs font-mono text-cyan-400 mt-1 break-words">
                   Cron: {sc.cron_expression} • Song song tối đa:{' '}
                   {sc.max_concurrency} VPS
                 </div>
               </div>
               <button
+                type="button"
                 onClick={() => void toggleEnabled(sc)}
-                className={`px-2.5 py-1 rounded text-[11px] font-semibold border ${
+                className={`shrink-0 whitespace-nowrap min-h-[32px] px-2.5 py-1 rounded text-[11px] font-semibold border transition-colors ${
                   sc.enabled
                     ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
                     : 'bg-slate-800 text-slate-400 border-slate-700'
                 }`}
               >
-                {sc.enabled ? 'ĐANG BẬT' : 'TẠM TẮT'}
+                {sc.enabled ? 'ĐANG BẬT' : 'TẠM DỪNG'}
               </button>
             </div>
 
@@ -220,23 +226,26 @@ export default function SchedulesPage() {
               )}
             </div>
 
-            <div className="flex items-center justify-between pt-3 border-t border-slate-800 text-xs">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pt-3 border-t border-slate-800 text-xs">
               <span className="text-slate-400">
                 Áp dụng {sc.server_ids.length} VPS • Chạy cuối:{' '}
                 {formatDateTime(sc.last_run_at)}
               </span>
 
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-2 w-full sm:w-auto justify-between sm:justify-end">
                 <button
+                  type="button"
                   onClick={() => void runScheduleNow(sc)}
-                  className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-emerald-600/20 hover:bg-emerald-600 text-emerald-300 hover:text-white border border-emerald-500/30"
+                  className="flex-1 sm:flex-initial justify-center min-h-[38px] inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-600/20 hover:bg-emerald-600 text-emerald-300 hover:text-white border border-emerald-500/30 transition-colors"
                 >
-                  <Play className="w-3.5 h-3.5 fill-current" />
-                  Chạy ngay
+                  <Play className="w-3.5 h-3.5 fill-current shrink-0" />
+                  Kích hoạt Chạy Ngay
                 </button>
                 <button
+                  type="button"
                   onClick={() => void deleteSchedule(sc)}
-                  className="p-1.5 rounded-lg bg-slate-800 hover:bg-rose-600/30 text-rose-400"
+                  aria-label={`Xóa lịch chạy ${sc.name}`}
+                  className="h-9 w-9 min-h-[36px] min-w-[36px] inline-flex items-center justify-center rounded-lg bg-slate-800 hover:bg-rose-600/30 text-rose-400 shrink-0 transition-colors"
                 >
                   <Trash2 className="w-3.5 h-3.5" />
                 </button>
@@ -247,23 +256,23 @@ export default function SchedulesPage() {
       </div>
 
       {/* GFS Retention Inspector */}
-      <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-4">
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-          <div>
+      <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-6 space-y-4">
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+          <div className="min-w-0">
             <h3 className="text-sm font-bold text-white flex items-center gap-2">
-              <Layers className="w-4 h-4 text-cyan-400" />
-              Bộ Kiểm tra & Dọn dẹp Vòng đời GFS (Dry-Run & Thực thi)
+              <Layers className="w-4 h-4 text-cyan-400 shrink-0" />
+              <span>Bộ Kiểm tra & Dọn dẹp Vòng đời GFS (Dry-Run & Thực thi)</span>
             </h3>
             <p className="text-xs text-slate-400 mt-0.5">
               Tự động bảo vệ bản Latest và các bản Pinned chống Ransomware trước khi giải phóng ổ cứng NAS.
             </p>
           </div>
 
-          <div className="flex flex-wrap items-center gap-2 text-xs">
+          <div className="flex flex-wrap items-center gap-2 w-full lg:w-auto text-xs">
             <select
               value={gfsServerId}
               onChange={(e) => setGfsServerId(e.target.value)}
-              className="bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white"
+              className="flex-1 sm:flex-initial w-full sm:w-auto min-w-0 min-h-[40px] bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white truncate"
             >
               {servers.map((s) => (
                 <option key={s.id} value={s.id}>
@@ -272,15 +281,17 @@ export default function SchedulesPage() {
               ))}
             </select>
             <button
+              type="button"
               onClick={() => void runGfsRetention(true)}
-              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-cyan-300 border border-slate-700"
+              className="flex-1 sm:flex-initial justify-center min-h-[40px] whitespace-nowrap inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-cyan-300 border border-slate-700 transition-colors"
             >
-              <Sparkles className="w-3.5 h-3.5" />
+              <Sparkles className="w-3.5 h-3.5 shrink-0" />
               Xem trước (Dry-Run)
             </button>
             <button
+              type="button"
               onClick={() => void runGfsRetention(false)}
-              className="px-3.5 py-2 rounded-lg bg-rose-600/20 hover:bg-rose-600 text-rose-300 hover:text-white border border-rose-500/30 font-medium"
+              className="flex-1 sm:flex-initial justify-center min-h-[40px] whitespace-nowrap inline-flex items-center px-3.5 py-2 rounded-lg bg-rose-600/20 hover:bg-rose-600 text-rose-300 hover:text-white border border-rose-500/30 font-medium transition-colors"
             >
               Dọn dẹp GFS Ngay
             </button>
@@ -297,10 +308,10 @@ export default function SchedulesPage() {
                 {gfsResult.keptSnapshots.map((k) => (
                   <div
                     key={k.snapshotName}
-                    className="flex justify-between font-mono text-slate-300"
+                    className="flex flex-wrap items-center justify-between gap-x-2 gap-y-0.5 font-mono text-slate-300"
                   >
-                    <span>{k.snapshotName}</span>
-                    <span className="text-emerald-400 font-sans">
+                    <span className="break-all">{k.snapshotName}</span>
+                    <span className="text-emerald-400 font-sans shrink-0">
                       {k.reason}
                     </span>
                   </div>
@@ -322,7 +333,9 @@ export default function SchedulesPage() {
               ) : (
                 <div className="space-y-1 font-mono text-rose-300">
                   {gfsResult.deletedSnapshots.map((d) => (
-                    <div key={d}>{d}</div>
+                    <div key={d} className="break-all">
+                      {d}
+                    </div>
                   ))}
                 </div>
               )}
@@ -334,14 +347,16 @@ export default function SchedulesPage() {
       {/* Create Schedule Modal */}
       {showModal && (
         <div className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4">
-          <div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-lg w-full p-6 space-y-4 max-h-[90vh] overflow-y-auto text-xs">
-            <div className="flex items-center justify-between">
+          <div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-lg w-full p-4 sm:p-6 space-y-4 max-h-[calc(100dvh-2rem)] overflow-y-auto text-xs">
+            <div className="flex items-start justify-between gap-3">
               <h3 className="text-base font-bold text-white">
                 Thiết lập Lịch Sao lưu Tự động & GFS
               </h3>
               <button
+                type="button"
                 onClick={() => setShowModal(false)}
-                className="text-slate-400 hover:text-white"
+                aria-label="Đóng"
+                className="h-10 w-10 inline-flex items-center justify-center rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 shrink-0"
               >
                 <X className="w-5 h-5" />
               </button>
@@ -356,12 +371,12 @@ export default function SchedulesPage() {
                   required
                   value={form.name}
                   onChange={(e) => setForm({ ...form, name: e.target.value })}
-                  className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white"
+                  className="w-full min-h-[42px] bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white"
                 />
               </div>
 
-              <div className="grid grid-cols-2 gap-3">
-                <div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div className="flex flex-col justify-between">
                   <label className="block text-slate-300 mb-1 font-medium">
                     Biểu thức Cron
                   </label>
@@ -372,10 +387,10 @@ export default function SchedulesPage() {
                       setForm({ ...form, cron_expression: e.target.value })
                     }
                     placeholder="0 1 * * *"
-                    className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white font-mono"
+                    className="w-full min-h-[42px] bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white font-mono"
                   />
                 </div>
-                <div>
+                <div className="flex flex-col justify-between">
                   <label className="block text-slate-300 mb-1 font-medium">
                     Số VPS chạy song song
                   </label>
@@ -390,43 +405,61 @@ export default function SchedulesPage() {
                         max_concurrency: Number(e.target.value),
                       })
                     }
-                    className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white"
+                    className="w-full min-h-[42px] bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white font-mono"
                   />
                 </div>
               </div>
 
               <div>
-                <label className="block text-slate-300 mb-1 font-medium">
+                <label className="block text-slate-300 mb-1.5 font-medium">
                   Chính sách GFS (Daily / Weekly / Monthly)
                 </label>
-                <div className="grid grid-cols-3 gap-3">
-                  <input
-                    type="number"
-                    value={form.daily}
-                    onChange={(e) =>
-                      setForm({ ...form, daily: Number(e.target.value) })
-                    }
-                    className="bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white"
-                    placeholder="7 Daily"
-                  />
-                  <input
-                    type="number"
-                    value={form.weekly}
-                    onChange={(e) =>
-                      setForm({ ...form, weekly: Number(e.target.value) })
-                    }
-                    className="bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white"
-                    placeholder="4 Weekly"
-                  />
-                  <input
-                    type="number"
-                    value={form.monthly}
-                    onChange={(e) =>
-                      setForm({ ...form, monthly: Number(e.target.value) })
-                    }
-                    className="bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white"
-                    placeholder="6 Monthly"
-                  />
+                <div className="grid grid-cols-3 gap-2.5">
+                  <div className="min-w-0 flex flex-col justify-between">
+                    <span className="block text-[11px] text-slate-400 mb-1">
+                      Giữ theo Ngày (Daily)
+                    </span>
+                    <input
+                      type="number"
+                      min={1}
+                      value={form.daily}
+                      onChange={(e) =>
+                        setForm({ ...form, daily: Number(e.target.value) })
+                      }
+                      className="w-full min-w-0 min-h-[40px] bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-2 text-white font-mono"
+                      placeholder="7"
+                    />
+                  </div>
+                  <div className="min-w-0 flex flex-col justify-between">
+                    <span className="block text-[11px] text-slate-400 mb-1">
+                      Giữ theo Tuần (Weekly)
+                    </span>
+                    <input
+                      type="number"
+                      min={0}
+                      value={form.weekly}
+                      onChange={(e) =>
+                        setForm({ ...form, weekly: Number(e.target.value) })
+                      }
+                      className="w-full min-w-0 min-h-[40px] bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-2 text-white font-mono"
+                      placeholder="4"
+                    />
+                  </div>
+                  <div className="min-w-0 flex flex-col justify-between">
+                    <span className="block text-[11px] text-slate-400 mb-1">
+                      Giữ theo Tháng (Monthly)
+                    </span>
+                    <input
+                      type="number"
+                      min={0}
+                      value={form.monthly}
+                      onChange={(e) =>
+                        setForm({ ...form, monthly: Number(e.target.value) })
+                      }
+                      className="w-full min-w-0 min-h-[40px] bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-2 text-white font-mono"
+                      placeholder="6"
+                    />
+                  </div>
                 </div>
               </div>
 
@@ -434,18 +467,19 @@ export default function SchedulesPage() {
                 <label className="block text-slate-300 mb-1.5 font-medium">
                   Chọn Máy chủ VPS áp dụng
                 </label>
-                <div className="space-y-1.5 max-h-40 overflow-y-auto p-3 rounded-xl bg-slate-950 border border-slate-800">
+                <div className="space-y-2 max-h-40 overflow-y-auto p-3 rounded-xl bg-slate-950 border border-slate-800">
                   {servers.map((s) => (
                     <label
                       key={s.id}
-                      className="flex items-center gap-2 text-slate-200 cursor-pointer"
+                      className="flex items-start gap-2.5 text-slate-200 cursor-pointer"
                     >
                       <input
                         type="checkbox"
                         checked={form.server_ids.includes(s.id)}
                         onChange={() => toggleServerInForm(s.id)}
+                        className="mt-0.5 shrink-0"
                       />
-                      <span>
+                      <span className="break-all">
                         {s.hostname} ({s.panel_type})
                       </span>
                     </label>
@@ -453,43 +487,45 @@ export default function SchedulesPage() {
                 </div>
               </div>
 
-              <label className="flex items-center gap-2 text-slate-300 cursor-pointer">
+              <label className="flex items-start gap-2.5 text-slate-300 cursor-pointer">
                 <input
                   type="checkbox"
                   checked={form.verify_db_sandbox}
                   onChange={(e) =>
                     setForm({ ...form, verify_db_sandbox: e.target.checked })
                   }
+                  className="mt-0.5 shrink-0"
                 />
                 <span>
                   Tự động nạp kiểm định SQL trên MariaDB Sandbox sau khi sao lưu
                 </span>
               </label>
 
-              <label className="flex items-center gap-2 text-slate-300 cursor-pointer">
+              <label className="flex items-start gap-2.5 text-slate-300 cursor-pointer">
                 <input
                   type="checkbox"
                   checked={form.btrfs_snapshot_after}
                   onChange={(e) =>
                     setForm({ ...form, btrfs_snapshot_after: e.target.checked })
                   }
+                  className="mt-0.5 shrink-0"
                 />
                 <span>
                   Tự động chụp Btrfs Immutable Snapshot (WORM 7 ngày) sau ca sao lưu
                 </span>
               </label>
 
-              <div className="flex justify-end gap-2 pt-3 border-t border-slate-800">
+              <div className="flex flex-col-reverse sm:flex-row sm:justify-end gap-2 pt-3 border-t border-slate-800">
                 <button
                   type="button"
                   onClick={() => setShowModal(false)}
-                  className="px-4 py-2 rounded-lg bg-slate-800 text-slate-300"
+                  className="w-full sm:w-auto min-h-[42px] px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300"
                 >
                   Hủy
                 </button>
                 <button
                   type="submit"
-                  className="px-4 py-2 rounded-lg bg-blue-600 text-white font-semibold"
+                  className="w-full sm:w-auto min-h-[42px] px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-semibold"
                 >
                   Lưu Lịch Chạy
                 </button>

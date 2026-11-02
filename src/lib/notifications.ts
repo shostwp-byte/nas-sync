@@ -107,6 +107,7 @@ export async function detectTelegramChatId(rawBotToken: string): Promise<{
   try {
     const meResp = await fetch(`https://api.telegram.org/bot${botToken}/getMe`, {
       cache: 'no-store',
+      signal: AbortSignal.timeout(10000),
     });
     const meJson = (await meResp.json().catch(() => ({}))) as {
       ok?: boolean;
@@ -127,7 +128,10 @@ export async function detectTelegramChatId(rawBotToken: string): Promise<{
 
     const updResp = await fetch(
       `https://api.telegram.org/bot${botToken}/getUpdates?limit=30`,
-      { cache: 'no-store' }
+      {
+        cache: 'no-store',
+        signal: AbortSignal.timeout(10000),
+      }
     );
     const updJson = (await updResp.json().catch(() => ({}))) as {
       ok?: boolean;
@@ -230,9 +234,11 @@ export async function dispatchExternalNotifications(alert: {
       );
     } else {
       try {
-        const text = `${icon} <b>[NAS-Sync - ${alert.category}]</b>\n<b>${escapeHtml(
-          alert.title
-        )}</b>\n\n${escapeHtml(alert.message)}\n\n🕒 ${new Date().toLocaleString('vi-VN')}`;
+        const text = `${icon} <b>[NAS-Sync - ${escapeHtml(
+          alert.category
+        )}]</b>\n<b>${escapeHtml(alert.title)}</b>\n\n${escapeHtml(
+          alert.message
+        )}\n\n🕒 ${new Date().toLocaleString('vi-VN')}`;
 
         const resp = await fetch(
           `https://api.telegram.org/bot${botToken}/sendMessage`,
@@ -245,6 +251,7 @@ export async function dispatchExternalNotifications(alert: {
               parse_mode: 'HTML',
               disable_web_page_preview: true,
             }),
+            signal: AbortSignal.timeout(10000),
           }
         );
         if (resp.ok) {
@@ -268,8 +275,12 @@ export async function dispatchExternalNotifications(alert: {
   const smtpPort = Number(getSetting('smtp_port', '587'));
   const smtpUser = getSetting('smtp_user').trim();
   const smtpPass = getSetting('smtp_pass');
-  const smtpFrom = getSetting('smtp_from', smtpUser || 'noreply@nas-sync.local').trim();
-  const alertEmailTo = getSetting('alert_email_to').trim();
+  const smtpFrom = getSetting('smtp_from', smtpUser || 'noreply@nas-sync.local')
+    .replace(/[\r\n]+/g, ' ')
+    .trim();
+  const alertEmailTo = getSetting('alert_email_to')
+    .replace(/[\r\n]+/g, ' ')
+    .trim();
   const emailConfigured = Boolean(smtpHost && alertEmailTo);
 
   if (emailConfigured) {
@@ -279,26 +290,33 @@ export async function dispatchExternalNotifications(alert: {
         port: smtpPort,
         secure: smtpPort === 465,
         auth: smtpUser ? { user: smtpUser, pass: smtpPass } : undefined,
+        connectionTimeout: 10000,
+        greetingTimeout: 10000,
+        socketTimeout: 15000,
       });
+
+      const safeSubjectTitle = String(alert.title || '').replace(/[\r\n]+/g, ' ').trim();
+      const safeAppUrl = escapeHtml(process.env.APP_URL || 'NAS-Sync');
+      const safeSeverity = escapeHtml(alert.severity);
 
       await transporter.sendMail({
         from: `"NAS-Sync Backup" <${smtpFrom}>`,
         to: alertEmailTo,
-        subject: `${icon} [NAS-Sync] ${alert.title}`,
+        subject: `${icon} [NAS-Sync] ${safeSubjectTitle}`,
         html: `
           <div style="font-family: Arial, sans-serif; max-width: 640px; margin: 0 auto; border: 1px solid #e2e8f0; border-radius: 8px; overflow: hidden;">
             <div style="background: #0f172a; color: #f8fafc; padding: 16px 20px;">
               <h2 style="margin: 0; font-size: 18px;">${icon} NAS-Sync — ${escapeHtml(
           alert.category
-        )}</h2>
+        )} (${safeSeverity})</h2>
             </div>
             <div style="padding: 20px; color: #1e293b; line-height: 1.6;">
               <h3 style="margin-top: 0;">${escapeHtml(alert.title)}</h3>
               <p style="white-space: pre-line;">${escapeHtml(alert.message)}</p>
               <hr style="border: none; border-top: 1px solid #e2e8f0; margin: 16px 0;" />
-              <small style="color: #64748b;">Thời gian: ${new Date().toLocaleString(
-                'vi-VN'
-              )} | Hệ thống: ${process.env.APP_URL || 'NAS-Sync'}</small>
+              <small style="color: #64748b;">Thời gian: ${escapeHtml(
+                new Date().toLocaleString('vi-VN')
+              )} | Hệ thống: ${safeAppUrl}</small>
             </div>
           </div>
         `,
@@ -319,8 +337,10 @@ export async function dispatchExternalNotifications(alert: {
 }
 
 function escapeHtml(str: string): string {
-  return str
+  return String(str)
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }

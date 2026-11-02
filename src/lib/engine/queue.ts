@@ -5,6 +5,7 @@ import { getDb, getSetting } from '@/lib/db';
 import { emitJobUpdated } from '@/lib/events';
 import type { BackupSchedule, RestoreRequestPayload, RetentionPolicy } from '@/types';
 import {
+  clearCancelledJob,
   executeBackupJob,
   requestCancelJob,
   RetryableNetworkError,
@@ -35,6 +36,10 @@ interface EngineState {
 declare global {
   // eslint-disable-next-line no-var
   var __nasSyncQueueEngine: EngineState | undefined;
+  // eslint-disable-next-line no-var
+  var __nasSyncServerLocks: Map<number, Promise<void>> | undefined;
+  // eslint-disable-next-line no-var
+  var __nasSyncActiveExecutingJobs: Set<number> | undefined;
 }
 
 function getEngineState(): EngineState {
@@ -50,6 +55,67 @@ function getEngineState(): EngineState {
     };
   }
   return globalThis.__nasSyncQueueEngine;
+}
+
+function getServerLocksMap(): Map<number, Promise<void>> {
+  if (!globalThis.__nasSyncServerLocks) {
+    globalThis.__nasSyncServerLocks = new Map();
+  }
+  return globalThis.__nasSyncServerLocks;
+}
+
+function getActiveExecutingJobsSet(): Set<number> {
+  if (!globalThis.__nasSyncActiveExecutingJobs) {
+    globalThis.__nasSyncActiveExecutingJobs = new Set();
+  }
+  return globalThis.__nasSyncActiveExecutingJobs;
+}
+
+/**
+ * Khóa tuần tự FIFO theo từng server_id để ngăn 2 tiến trình (Backup/Restore/Retention)
+ * đụng độ đồng thời trên cùng 1 máy chủ VPS hoặc thư mục Snapshot.
+ */
+export async function acquireServerLock(serverId: number): Promise<() => void> {
+  const locks = getServerLocksMap();
+  const prev = locks.get(serverId) ?? Promise.resolve();
+  let releaseCurrent!: () => void;
+  const current = new Promise<void>((resolve) => {
+    releaseCurrent = resolve;
+  });
+  const tail = prev.then(() => current);
+  locks.set(serverId, tail);
+
+  await prev;
+
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    releaseCurrent();
+    if (locks.get(serverId) === tail) {
+      locks.delete(serverId);
+    }
+  };
+}
+
+export async function acquireMultiServerLocks(
+  serverIds: number[]
+): Promise<() => void> {
+  const sortedUnique = Array.from(
+    new Set(serverIds.filter((id) => Number.isInteger(id) && id > 0))
+  ).sort((a, b) => a - b);
+
+  const releases: Array<() => void> = [];
+  for (const sid of sortedUnique) {
+    const rel = await acquireServerLock(sid);
+    releases.push(rel);
+  }
+
+  return () => {
+    for (let i = releases.length - 1; i >= 0; i--) {
+      releases[i]();
+    }
+  };
 }
 
 /**
@@ -109,24 +175,61 @@ async function probeRedisAvailable(redisUrl: string): Promise<boolean> {
 }
 
 async function processJobPayload(payload: QueuedTaskPayload): Promise<void> {
-  if (payload.jobType === 'RESTORE') {
-    await executeRestoreJob(payload.jobId);
+  const db = getDb();
+  const initialRow = db
+    .prepare(
+      'SELECT status, server_id, target_server_id FROM backup_jobs WHERE id = ?'
+    )
+    .get(payload.jobId);
+
+  if (!initialRow || initialRow.status === 'CANCELLED') {
     return;
   }
 
-  await executeBackupJob(payload.jobId, { verifyDb: payload.verifyDb });
+  const lockTargets = [
+    Number(initialRow.server_id),
+    ...(initialRow.target_server_id
+      ? [Number(initialRow.target_server_id)]
+      : []),
+  ];
 
-  if (payload.retentionPolicy) {
-    const row = getDb()
-      .prepare('SELECT server_id FROM backup_jobs WHERE id = ?')
+  const releaseLocks = await acquireMultiServerLocks(lockTargets);
+  const executingSet = getActiveExecutingJobsSet();
+
+  try {
+    const freshRow = db
+      .prepare('SELECT status, server_id FROM backup_jobs WHERE id = ?')
       .get(payload.jobId);
-    if (row?.server_id) {
-      await applyGfsRetentionForServer(
-        Number(row.server_id),
-        payload.retentionPolicy,
-        false
-      );
+    if (!freshRow || freshRow.status === 'CANCELLED') {
+      return;
     }
+
+    executingSet.add(payload.jobId);
+    try {
+      if (payload.jobType === 'RESTORE') {
+        await executeRestoreJob(payload.jobId);
+        return;
+      }
+
+      await executeBackupJob(payload.jobId, { verifyDb: payload.verifyDb });
+
+      if (payload.retentionPolicy) {
+        const afterRow = db
+          .prepare('SELECT server_id, status FROM backup_jobs WHERE id = ?')
+          .get(payload.jobId);
+        if (afterRow?.server_id && afterRow.status === 'COMPLETED') {
+          await applyGfsRetentionForServer(
+            Number(afterRow.server_id),
+            payload.retentionPolicy,
+            false
+          );
+        }
+      }
+    } finally {
+      executingSet.delete(payload.jobId);
+    }
+  } finally {
+    releaseLocks();
   }
 }
 
@@ -225,7 +328,8 @@ export async function initializeQueueAndScheduler(): Promise<{
 
     state.mode = 'BULLMQ_REDIS';
     state.redisUrl = redisUrl;
-    console.log(`[NAS-Sync Engine] Hàng đợi BullMQ đã kết nối Redis (${redisUrl})`);
+    const maskedRedis = redisUrl.replace(/\/\/([^@/]+)@/, '//***@');
+    console.log(`[NAS-Sync Engine] Hàng đợi BullMQ đã kết nối Redis (${maskedRedis})`);
   } else {
     state.mode = 'LOCAL_MEMORY';
     console.log(
@@ -256,7 +360,7 @@ export function getQueueRuntimeInfo() {
   return {
     initialized: state.initialized,
     mode: state.mode,
-    redisUrl: state.redisUrl,
+    redisConnected: state.mode === 'BULLMQ_REDIS',
     activeSchedulesCount: state.cronTasks.size,
   };
 }
@@ -312,6 +416,11 @@ export async function enqueueRestoreOperation(
     throw new Error('Không tìm thấy bản sao lưu domain cần khôi phục.');
   }
 
+  const enrichedPayload: RestoreRequestPayload = {
+    ...payload,
+    sourceJobId: payload.sourceJobId || Number(item.job_id),
+  };
+
   const res = db
     .prepare(
       `INSERT INTO backup_jobs
@@ -324,7 +433,7 @@ export async function enqueueRestoreOperation(
       Number(item.volume_id),
       String(item.snapshot_name),
       String(item.domain_name),
-      JSON.stringify(payload)
+      JSON.stringify(enrichedPayload)
     );
 
   const jobId = Number(res.lastInsertRowid);
@@ -339,6 +448,7 @@ export async function dispatchExistingJob(
   jobType: 'BACKUP' | 'RESTORE',
   extra: { verifyDb?: boolean; retentionPolicy?: RetentionPolicy | null } = {}
 ): Promise<void> {
+  clearCancelledJob(jobId);
   await initializeQueueAndScheduler();
   const state = getEngineState();
 
@@ -365,19 +475,53 @@ export function cancelRunningOrQueuedJob(jobId: number) {
   state.localPending = state.localPending.filter((p) => p.jobId !== jobId);
   requestCancelJob(jobId);
 
+  if (state.bullQueue) {
+    void state.bullQueue
+      .getJobs(['waiting', 'delayed'])
+      .then(async (waitingJobs) => {
+        for (const bj of waitingJobs) {
+          if (bj?.data?.jobId === jobId) {
+            await bj.remove().catch(() => {});
+          }
+        }
+      })
+      .catch(() => {});
+  }
+
   const job = db
-    .prepare('SELECT status, server_id FROM backup_jobs WHERE id = ?')
+    .prepare('SELECT status, server_id, job_type FROM backup_jobs WHERE id = ?')
     .get(jobId);
 
-  if (job && (job.status === 'QUEUED' || job.status === 'INTERRUPTED')) {
+  if (!job) return;
+
+  const isActivelyRunning = getActiveExecutingJobsSet().has(jobId);
+  const statusStr = String(job.status);
+
+  if (
+    statusStr === 'QUEUED' ||
+    statusStr === 'INTERRUPTED' ||
+    (!isActivelyRunning &&
+      (statusStr === 'RUNNING' ||
+        statusStr === 'RESUMING' ||
+        statusStr === 'VERIFYING'))
+  ) {
     db.prepare(
       `UPDATE backup_jobs SET status = 'CANCELLED', current_phase = 'Đã hủy bởi quản trị viên', completed_at = datetime('now') WHERE id = ?`
     ).run(jobId);
-    if (job.server_id) {
-      db.prepare(`UPDATE servers SET status = 'ONLINE' WHERE id = ?`).run(
-        Number(job.server_id)
-      );
+    if (job.server_id && String(job.job_type) === 'BACKUP') {
+      db.prepare(
+        `UPDATE servers SET status = 'ONLINE' WHERE id = ? AND status = 'BACKUP_RUNNING'`
+      ).run(Number(job.server_id));
     }
+    emitJobUpdated(jobId);
+  } else if (
+    statusStr === 'RUNNING' ||
+    statusStr === 'RESUMING' ||
+    statusStr === 'VERIFYING'
+  ) {
+    db.prepare(
+      `UPDATE backup_jobs SET current_phase = 'Đang dừng tiến trình theo yêu cầu quản trị viên...' WHERE id = ?`
+    ).run(jobId);
     emitJobUpdated(jobId);
   }
 }

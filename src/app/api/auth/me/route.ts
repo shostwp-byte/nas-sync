@@ -15,26 +15,13 @@ export async function GET() {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
 
-  try {
-    const db = getDb();
-    const user =
-      db.prepare('SELECT id, username, role FROM users WHERE id = ?').get(session.userId) ||
-      db.prepare('SELECT id, username, role FROM users WHERE username = ?').get(session.username);
-
-    if (user) {
-      return NextResponse.json({
-        user: {
-          userId: Number(user.id),
-          username: String(user.username),
-          role: String(user.role || 'ADMIN'),
-        },
-      });
-    }
-  } catch {
-    // Fallback session payload
-  }
-
-  return NextResponse.json({ user: session });
+  return NextResponse.json({
+    user: {
+      userId: session.userId,
+      username: session.username,
+      role: session.role,
+    },
+  });
 }
 
 export async function PATCH(req: NextRequest) {
@@ -48,10 +35,12 @@ export async function PATCH(req: NextRequest) {
     }
 
     const body = await req.json().catch(() => ({}));
-    const rawCurrentPassword = String(body.currentPassword || '');
+    const rawCurrentPassword =
+      typeof body.currentPassword === 'string' ? body.currentPassword : '';
     const rawNewUsername =
       body.newUsername !== undefined ? String(body.newUsername).trim() : '';
-    const newPassword = String(body.newPassword || '').trim();
+    const rawNewPassword =
+      typeof body.newPassword === 'string' ? body.newPassword : '';
 
     if (!rawCurrentPassword) {
       return NextResponse.json(
@@ -60,22 +49,17 @@ export async function PATCH(req: NextRequest) {
       );
     }
 
+    if (rawCurrentPassword.length > 256) {
+      return NextResponse.json(
+        { error: 'Mật khẩu hiện tại không đúng. Vui lòng kiểm tra lại.' },
+        { status: 400 }
+      );
+    }
+
     const db = getDb();
-    let user = db
+    const user = db
       .prepare('SELECT * FROM users WHERE id = ?')
       .get(session.userId);
-
-    // Fallback tìm theo username hoặc tài khoản ADMIN đầu tiên nếu JWT cũ lệch ID
-    if (!user && session.username) {
-      user = db
-        .prepare('SELECT * FROM users WHERE username = ?')
-        .get(session.username);
-    }
-    if (!user) {
-      user = db
-        .prepare("SELECT * FROM users WHERE role = 'ADMIN' ORDER BY id ASC LIMIT 1")
-        .get();
-    }
 
     if (!user) {
       return NextResponse.json(
@@ -83,15 +67,12 @@ export async function PATCH(req: NextRequest) {
           error:
             'Không tìm thấy tài khoản quản trị trong CSDL. Vui lòng đăng xuất và đăng nhập lại.',
         },
-        { status: 400 }
+        { status: 401 }
       );
     }
 
     const storedHash = String(user.password_hash);
-    const isMatch =
-      verifyPassword(rawCurrentPassword, storedHash) ||
-      (rawCurrentPassword !== rawCurrentPassword.trim() &&
-        verifyPassword(rawCurrentPassword.trim(), storedHash));
+    const isMatch = verifyPassword(rawCurrentPassword, storedHash);
 
     if (!isMatch) {
       return NextResponse.json(
@@ -106,7 +87,7 @@ export async function PATCH(req: NextRequest) {
     const currentUsername = String(user.username);
     const targetUsername = rawNewUsername || currentUsername;
     const isChangingUsername = targetUsername !== currentUsername;
-    const isChangingPassword = newPassword.length > 0;
+    const isChangingPassword = rawNewPassword.trim().length > 0;
 
     if (!isChangingUsername && !isChangingPassword) {
       return NextResponse.json(
@@ -145,22 +126,33 @@ export async function PATCH(req: NextRequest) {
       }
     }
 
-    if (isChangingPassword && newPassword.length < 6) {
+    if (
+      isChangingPassword &&
+      (rawNewPassword.length < 8 || rawNewPassword.length > 256)
+    ) {
       return NextResponse.json(
-        { error: 'Mật khẩu mới phải có ít nhất 6 ký tự.' },
+        { error: 'Mật khẩu mới phải có độ dài từ 8 đến 256 ký tự.' },
         { status: 400 }
       );
     }
 
-    const nextHash = isChangingPassword ? hashPassword(newPassword) : storedHash;
+    const currentTokenVersion = Number(user.token_version ?? 1);
+    const nextTokenVersion = isChangingPassword
+      ? currentTokenVersion + 1
+      : currentTokenVersion;
+    const nextHash = isChangingPassword
+      ? hashPassword(rawNewPassword)
+      : storedHash;
+
     db.prepare(
-      'UPDATE users SET username = ?, password_hash = ? WHERE id = ?'
-    ).run(targetUsername, nextHash, userId);
+      'UPDATE users SET username = ?, password_hash = ?, token_version = ? WHERE id = ?'
+    ).run(targetUsername, nextHash, nextTokenVersion, userId);
 
     const freshToken = await signSessionToken({
       userId,
       username: targetUsername,
       role: String(user.role || 'ADMIN'),
+      tokenVersion: nextTokenVersion,
     });
 
     const changedParts: string[] = [];

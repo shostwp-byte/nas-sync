@@ -2,6 +2,26 @@
 
 Mọi thay đổi đáng chú ý của dự án **NAS-Sync** (<https://github.com/shostwp-byte/nas-sync>) đều được ghi nhận tại tài liệu này theo chuẩn [Keep a Changelog](https://keepachangelog.com/vi/1.1.0/) và [Semantic Versioning](https://semver.org/).
 
+## [1.2.0] - 2026-11-02
+
+### Security & Reliability
+- **Khóa chặt thực thi lệnh SSH/Rsync & Chống leo thang đặc quyền qua Symlink (`src/lib/ssh.ts`, `src/lib/engine/adapters/**`, `backup-worker.ts`, `restore-worker.ts`)**:
+  - Luôn truyền `-F /dev/null` trong `ssh` và `rsync` để vô hiệu hóa tấn công `ProxyCommand` qua `/root/.ssh/config`; chặn đặt tên khóa hệ thống (`config`, `authorized_keys`, `known_hosts`, `rc`, `environment`), kiểm định định dạng khóa bằng `ssh-keygen -lf` và bắt buộc `ssh_key_path` nằm gọn trong thư mục khóa ứng dụng.
+  - Kiểm tra `realpath` vùng giam (Jail) của `webroot` theo tài khoản Linux (`getent passwd`) trước khi Pull/Push nhằm chặn symlink trỏ ra `/root`, `/etc` hoặc sang tài khoản khác; bổ sung `--no-devices --no-specials --safe-links` cho `rsync`, đổi `chown -R` thành `chown -hR` và phân tách quyền thư mục `755` / tập tin `644` trên aaPanel.
+- **Ẩn hoàn toàn mật khẩu Master MySQL khỏi `ps aux` / `/proc/<pid>/cmdline` (`base.ts`, `directadmin.ts`, `cpanel.ts`, `plesk.ts`, `aapanel.ts`, `sandbox-verifier.ts`)**:
+  - Loại bỏ cờ `-p'...'` trên mọi dòng lệnh `mysql` / `mysqldump`, chuyển sang đọc trực tiếp biến môi trường nội bộ `MYSQL_PWD` từ file cấu hình root trên VPS hoặc `env` của tiến trình con trên NAS.
+- **Bảo vệ Phiên đăng nhập (`token_version`), Chống CSRF & Che giấu Secret (`server.ts`, `src/middleware.ts`, `src/lib/db.ts`, `src/app/api/settings/route.ts`, `src/lib/engine/btrfs-worm.ts`)**:
+  - Kiểm tra khớp `Origin` / `Host` trên mọi API thay đổi trạng thái (`POST/PUT/PATCH/DELETE`) và Socket.IO `io.use()`; bổ sung cột `token_version` thu hồi ngay lập tức mọi phiên JWT cũ khi đổi mật khẩu hoặc đăng xuất; chống giả mạo `X-Forwarded-For` khi chưa bật `TRUST_PROXY=true` và giới hạn độ dài mật khẩu `<= 256` ký tự.
+  - Che giấu (`••••••••`) các khóa nhạy cảm (`telegram_bot_token`, `smtp_pass`, `dsm_password`, `github_token`) trên `GET /api/settings`, ẩn `REDIS_URL` khỏi `/api/health`, và chuyển Synology DSM Btrfs WORM API sang phương thức `POST` kèm hỗ trợ HTTPS tự ký nội bộ.
+- **Khóa Mutex theo Máy chủ, An toàn GFS Retention, Chống Gzip Bomb/FIFO & Gia cố Self-Update (`queue.ts`, `retention-gfs.ts`, `explorer.ts`, `updater.ts`, `docker-entrypoint.sh`)**:
+  - Khóa tuần tự FIFO theo `server_id` tránh đụng độ Backup/Restore/Retention trên cùng VPS; bảo vệ không xóa Snapshot đang được tiến trình Restore sử dụng; chỉ cập nhật con trỏ `latest` sau khi vượt qua kiểm tra Ransomware Anomaly & SQL Sandbox; đồng bộ múi giờ Local cho GFS; bổ sung timeout & hủy tiến trình con toàn diện; sao lưu SQLite nguyên tử bằng `VACUUM INTO` khi cập nhật.
+
+### Mobile UX/UI
+- **Chuẩn hóa Giao diện Mobile-First (`320px` – `1024px`) trên toàn bộ 12 tập tin Frontend (`layout.tsx`, `globals.css`, `AppShell.tsx` & 9 màn hình chính)**:
+  - Khai báo `viewport` chuẩn (`viewportFit: 'cover'`, `themeColor`), chặn lỗi iOS Safari tự phóng to khi chạm ô nhập liệu (`font-size: 16px` dưới `768px`), thêm lớp nền mờ `Backdrop Overlay` + khóa cuộn trang nền cho menu ngăn kéo và huy hiệu cảnh báo `CRITICAL` trên thanh Header di động.
+  - Bổ sung giao diện **Thẻ Di động (Mobile Cards)** song song với bảng Desktop cho danh sách **Máy chủ VPS**, **Tiến trình & Lịch sử**, **Phiên gần nhất**, **Quét thử Domain** và **Chi tiết Job** (hiển thị đầy đủ huy hiệu `Verified ✅` và nút `Restore` trên điện thoại).
+  - Bổ sung thanh chuyển nhanh **`📁 Cây thư mục` / `📄 Xem File / Diff`** trên điện thoại cho File Explorer, sửa triệt để lỗi tràn ngang ô nhập GFS trong Modal Tạo Lịch, căn thẳng hàng các ô ngưỡng Volume/Ransomware và tự động cuộn mượt giữa các bước Khôi phục.
+
 ## [1.1.5] - 2026-10-31
 
 ### Security & Changed

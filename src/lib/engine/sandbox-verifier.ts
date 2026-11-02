@@ -5,7 +5,10 @@ import path from 'node:path';
 import zlib from 'node:zlib';
 import mysql from 'mysql2/promise';
 import { getDb } from '@/lib/db';
+import { shellSingleQuote } from '@/lib/ssh';
 import type { BackupItem, DatabaseBackupInfo } from '@/types';
+
+const SANDBOX_IMPORT_TIMEOUT_MS = 10 * 60 * 1000;
 
 export interface DbVerificationSummary {
   itemId: number;
@@ -39,7 +42,7 @@ function streamDumpIntoMariaDb(
 ): Promise<{ ok: boolean; error?: string }> {
   return new Promise((resolve) => {
     const host = process.env.SANDBOX_DB_HOST || 'db_sandbox';
-    const port = process.env.SANDBOX_DB_PORT || '3306';
+    const port = Number(process.env.SANDBOX_DB_PORT || 3306) || 3306;
     const user = process.env.SANDBOX_DB_USER || 'root';
     const pass = process.env.SANDBOX_DB_PASSWORD || 'sandbox_secret_pass';
 
@@ -47,28 +50,69 @@ function streamDumpIntoMariaDb(
     const decompCmd =
       ext === '.zst' ? 'zstd -dc' : ext === '.gz' ? 'gzip -dc' : 'cat';
 
-    // Truyền đường dẫn & thông số qua tham số vị trí ($1..$6) thay vì nội suy vào chuỗi bash:
-    // tên file dump lấy từ tên DB trên VPS (không tin cậy).
-    const fullShell = `set -o pipefail; ${decompCmd} -- "$1" | mariadb -h "$2" -P "$3" -u "$4" -p"$5" "$6"`;
+    // Không truyền mật khẩu qua -p trên argv (chống lộ trong `ps aux`); truyền qua biến môi trường MYSQL_PWD.
+    const pipeline = `${decompCmd} -- "$1" | mariadb -h ${shellSingleQuote(
+      host
+    )} -P ${port} -u ${shellSingleQuote(user)} ${shellSingleQuote(tempDbName)}`;
 
     const child = spawn(
       'bash',
-      ['-c', fullShell, 'sandbox-verify', dumpFilePath, host, port, user, pass, tempDbName],
+      ['-o', 'pipefail', '-c', pipeline, 'sandbox-verify', dumpFilePath],
       {
+        env: { ...process.env, MYSQL_PWD: pass },
         stdio: ['ignore', 'pipe', 'pipe'],
       }
     );
 
     let stderr = '';
+    let settled = false;
+    let timedOut = false;
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try {
+        child.kill('SIGTERM');
+      } catch {
+        // Ignore
+      }
+      const forceKill = setTimeout(() => {
+        try {
+          if (child.exitCode === null) child.kill('SIGKILL');
+        } catch {
+          // Ignore
+        }
+      }, 5000);
+      forceKill.unref();
+    }, SANDBOX_IMPORT_TIMEOUT_MS);
+
     child.stderr.on('data', (d: Buffer) => {
       stderr += d.toString('utf8');
+      if (stderr.length > 32768) {
+        stderr = stderr.slice(-16384);
+      }
     });
 
     child.on('error', (err) => {
-      resolve({ ok: false, error: err.message });
+      clearTimeout(timer);
+      if (!settled) {
+        settled = true;
+        resolve({ ok: false, error: err.message });
+      }
     });
 
     child.on('close', (code) => {
+      clearTimeout(timer);
+      if (settled) return;
+      settled = true;
+
+      if (timedOut) {
+        resolve({
+          ok: false,
+          error: 'Quá thời gian chờ (10 phút) khi nạp kiểm định vào MariaDB Sandbox',
+        });
+        return;
+      }
+
       if (code === 0) {
         resolve({ ok: true });
       } else {
@@ -81,18 +125,28 @@ function streamDumpIntoMariaDb(
   });
 }
 
-function verifySqlFileStructureFallback(dumpFilePath: string): {
+async function verifySqlFileStructureFallback(dumpFilePath: string): Promise<{
   ok: boolean;
   tablesCount: number;
   rowsCount: number;
   error?: string;
-} {
-  if (!fs.existsSync(dumpFilePath)) {
-    return { ok: false, tablesCount: 0, rowsCount: 0, error: 'File SQL không tồn tại' };
+}> {
+  const stat = fs.lstatSync(dumpFilePath, { throwIfNoEntry: false });
+  if (!stat || !stat.isFile()) {
+    return {
+      ok: false,
+      tablesCount: 0,
+      rowsCount: 0,
+      error: 'File SQL không tồn tại hoặc không phải tập tin thông thường',
+    };
   }
-  const stat = fs.statSync(dumpFilePath);
   if (stat.size === 0) {
-    return { ok: false, tablesCount: 0, rowsCount: 0, error: 'File SQL rỗng (0 bytes)' };
+    return {
+      ok: false,
+      tablesCount: 0,
+      rowsCount: 0,
+      error: 'File SQL rỗng (0 bytes)',
+    };
   }
 
   const ext = path.extname(dumpFilePath).toLowerCase();
@@ -100,9 +154,10 @@ function verifySqlFileStructureFallback(dumpFilePath: string): {
     // Kiểm tra magic bytes chuẩn của Zstandard (0xFD2FB528)
     const fd = fs.openSync(dumpFilePath, 'r');
     const magic = Buffer.alloc(4);
-    fs.readSync(fd, magic, 0, 4, 0);
+    const bytesRead = fs.readSync(fd, magic, 0, 4, 0);
     fs.closeSync(fd);
     if (
+      bytesRead < 4 ||
       magic[0] !== 0x28 ||
       magic[1] !== 0xb5 ||
       magic[2] !== 0x2f ||
@@ -118,42 +173,113 @@ function verifySqlFileStructureFallback(dumpFilePath: string): {
     return { ok: true, tablesCount: 1, rowsCount: 1 };
   }
 
-  try {
-    const raw = fs.readFileSync(dumpFilePath);
-    const sqlText =
-      ext === '.gz'
-        ? zlib.gunzipSync(raw).toString('utf8')
-        : raw.toString('utf8');
+  // Giải nén và kiểm tra theo luồng O(1) RAM (head 8KB + rolling tail 8KB) để hỗ trợ cả file .sql.gz hàng chục GB
+  return new Promise((resolve) => {
+    const WINDOW_BYTES = 8192;
+    let headBuf = Buffer.alloc(0);
+    let tailBuf = Buffer.alloc(0);
+    let totalUncompressedBytes = 0;
+    let createCount = 0;
+    let insertCount = 0;
+    let carryText = '';
+    let finished = false;
 
-    const createMatches = sqlText.match(/CREATE\s+TABLE/gi) || [];
-    const insertMatches = sqlText.match(/INSERT\s+INTO/gi) || [];
-    const hasFooter =
-      sqlText.includes('Dump completed') ||
-      sqlText.trim().endsWith(';') ||
-      createMatches.length > 0;
+    const fileStream = fs.createReadStream(dumpFilePath);
+    const sourceStream =
+      ext === '.gz' ? fileStream.pipe(zlib.createGunzip()) : fileStream;
 
-    if (!hasFooter) {
-      return {
+    const fail = (err: Error) => {
+      if (finished) return;
+      finished = true;
+      fileStream.destroy();
+      sourceStream.destroy();
+      resolve({
         ok: false,
         tablesCount: 0,
         rowsCount: 0,
-        error: 'Cấu trúc SQL bị ngắt quãng (thiếu dấu kết thúc hợp lệ)',
-      };
+        error: err.message,
+      });
+    };
+
+    fileStream.on('error', fail);
+    if (sourceStream !== fileStream) {
+      sourceStream.on('error', fail);
     }
 
-    return {
-      ok: true,
-      tablesCount: createMatches.length,
-      rowsCount: insertMatches.length * 15,
-    };
-  } catch (err) {
-    return {
-      ok: false,
-      tablesCount: 0,
-      rowsCount: 0,
-      error: (err as Error).message,
-    };
-  }
+    sourceStream.on('data', (chunk: Buffer | string) => {
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, 'utf8');
+      totalUncompressedBytes += buf.length;
+
+      if (headBuf.length < WINDOW_BYTES) {
+        const needed = WINDOW_BYTES - headBuf.length;
+        headBuf = Buffer.concat([headBuf, buf.subarray(0, needed)]);
+      }
+
+      if (buf.length >= WINDOW_BYTES) {
+        tailBuf = Buffer.from(buf.subarray(buf.length - WINDOW_BYTES));
+      } else if (tailBuf.length + buf.length <= WINDOW_BYTES) {
+        tailBuf = Buffer.concat([tailBuf, buf]);
+      } else {
+        const keepPrev = WINDOW_BYTES - buf.length;
+        tailBuf = Buffer.concat([
+          tailBuf.subarray(tailBuf.length - keepPrev),
+          buf,
+        ]);
+      }
+
+      const combined = carryText + buf.toString('latin1');
+      const scanLimit = Math.max(0, combined.length - 24);
+      const scanPart = combined.slice(0, scanLimit);
+      carryText = combined.slice(scanLimit);
+
+      const creates = scanPart.match(/CREATE\s+TABLE/gi);
+      if (creates) createCount += creates.length;
+      const inserts = scanPart.match(/INSERT\s+INTO/gi);
+      if (inserts) insertCount += inserts.length;
+    });
+
+    sourceStream.on('end', () => {
+      if (finished) return;
+      finished = true;
+
+      if (carryText) {
+        const creates = carryText.match(/CREATE\s+TABLE/gi);
+        if (creates) createCount += creates.length;
+        const inserts = carryText.match(/INSERT\s+INTO/gi);
+        if (inserts) insertCount += inserts.length;
+      }
+
+      if (totalUncompressedBytes === 0) {
+        resolve({
+          ok: false,
+          tablesCount: 0,
+          rowsCount: 0,
+          error: 'Nội dung SQL sau giải nén bị rỗng (0 bytes)',
+        });
+        return;
+      }
+
+      const tailText = tailBuf.toString('utf8');
+      const hasFooter =
+        tailText.includes('Dump completed') || tailText.trim().endsWith(';');
+
+      if (!hasFooter) {
+        resolve({
+          ok: false,
+          tablesCount: 0,
+          rowsCount: 0,
+          error: 'Cấu trúc SQL bị ngắt quãng (thiếu dấu kết thúc hợp lệ ở cuối file)',
+        });
+        return;
+      }
+
+      resolve({
+        ok: true,
+        tablesCount: createCount,
+        rowsCount: insertCount * 15,
+      });
+    });
+  });
 }
 
 /**
@@ -191,25 +317,48 @@ export async function verifyJobDatabasesInSandbox(
 
   try {
     for (const item of items) {
+      const preSecurityFailure =
+        item.verification_status === 'CORRUPTED' &&
+        item.verification_detail?.startsWith('[SECURITY]')
+          ? item.verification_detail
+          : null;
+
       if (!item.databases_list || item.databases_list.length === 0) {
+        const staticStatus = preSecurityFailure ? 'CORRUPTED' : 'PASSED';
+        const staticDetail = preSecurityFailure
+          ? preSecurityFailure
+          : 'Website tĩnh / Không sử dụng MySQL Database';
         db.prepare(
-          `UPDATE backup_items SET verification_status = 'PASSED', verification_detail = ? WHERE id = ?`
-        ).run('Website tĩnh / Không sử dụng MySQL Database', item.id);
+          `UPDATE backup_items SET verification_status = ?, verification_detail = ? WHERE id = ?`
+        ).run(staticStatus, staticDetail, item.id);
         results.push({
           itemId: item.id,
           domainName: item.domain_name,
-          status: 'PASSED',
-          detail: 'Không có DB',
+          status: staticStatus,
+          detail: preSecurityFailure || 'Không có DB',
           databases: [],
         });
         continue;
       }
 
-      let allPassed = true;
-      const details: string[] = [];
+      let allPassed = !preSecurityFailure;
+      const details: string[] = preSecurityFailure ? [preSecurityFailure] : [];
       const updatedDbs: DatabaseBackupInfo[] = [];
 
       for (const dbInfo of item.databases_list) {
+        if (
+          !dbInfo.file ||
+          path.basename(dbInfo.file) !== dbInfo.file ||
+          dbInfo.file.includes('..') ||
+          /[/\\\0]/.test(dbInfo.file)
+        ) {
+          allPassed = false;
+          const badMsg = `Tên file dump không hợp lệ: ${JSON.stringify(dbInfo.file)}`;
+          details.push(`${dbInfo.name}: ${badMsg}`);
+          updatedDbs.push({ ...dbInfo, verified: false, error: badMsg });
+          continue;
+        }
+
         const dumpPath = path.join(
           snapshotBaseDir,
           'home',
@@ -256,7 +405,7 @@ export async function verifyJobDatabasesInSandbox(
             await conn.query(`DROP DATABASE IF EXISTS \`${tempDb}\``).catch(() => {});
           }
         } else {
-          const check = verifySqlFileStructureFallback(dumpPath);
+          const check = await verifySqlFileStructureFallback(dumpPath);
           if (!check.ok) {
             allPassed = false;
             details.push(`${dbInfo.name}: Lỗi (${check.error})`);

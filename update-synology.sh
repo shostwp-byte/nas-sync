@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
 REPO_URL="https://github.com/shostwp-byte/nas-sync.git"
 BRANCH="main"
@@ -35,11 +35,13 @@ if [ -d .git ]; then
 else
   echo "🔄 Thư mục hiện tại được cài từ gói ZIP — Đang tải tarball mới nhất từ GitHub..."
   TMP_UPDATE=$(mktemp -d)
+  trap 'rm -rf "${TMP_UPDATE:-}"' EXIT
   curl -fsSL "https://codeload.github.com/shostwp-byte/nas-sync/tar.gz/refs/heads/$BRANCH" | tar -xz --strip-components=1 -C "$TMP_UPDATE"
   # Bảo toàn file .env, app_data và ssh_keys hiện có của người dùng
   rm -rf "$TMP_UPDATE/app_data" "$TMP_UPDATE/ssh_keys" "$TMP_UPDATE/.env"
   cp -rf "$TMP_UPDATE"/. ./
   rm -rf "$TMP_UPDATE"
+  trap - EXIT
 fi
 
 # Dọn bản live_release cũ để ưu tiên Docker Image mới vừa build

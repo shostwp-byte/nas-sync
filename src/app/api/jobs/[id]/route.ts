@@ -7,8 +7,63 @@ import {
   cancelRunningOrQueuedJob,
   dispatchExistingJob,
 } from '@/lib/engine/queue';
+import { isSafeSnapshotName } from '@/lib/engine/safe-names';
 import { verifyJobDatabasesInSandbox } from '@/lib/engine/sandbox-verifier';
 import { resolveLatestSnapshotDir } from '@/lib/engine/volume-manager';
+
+const ACTIVE_JOB_STATUSES = new Set([
+  'QUEUED',
+  'RUNNING',
+  'RESUMING',
+  'VERIFYING',
+]);
+
+function isReferencedByActiveRestore(
+  jobId: number,
+  serverId: number,
+  snapshotName: string
+): boolean {
+  const db = getDb();
+  const activeRestores = db
+    .prepare(
+      `SELECT server_id, snapshot_name, restore_options
+       FROM backup_jobs
+       WHERE job_type = 'RESTORE'
+         AND status IN ('QUEUED', 'RUNNING', 'RESUMING', 'VERIFYING', 'INTERRUPTED')`
+    )
+    .all();
+
+  const itemStmt = db.prepare('SELECT job_id FROM backup_items WHERE id = ?');
+
+  for (const r of activeRestores) {
+    if (
+      Number(r.server_id) === Number(serverId) &&
+      snapshotName &&
+      String(r.snapshot_name) === snapshotName
+    ) {
+      return true;
+    }
+    if (!r.restore_options) continue;
+    try {
+      const parsed = JSON.parse(String(r.restore_options)) as {
+        sourceJobId?: number;
+        backupItemId?: number;
+      };
+      if (Number(parsed.sourceJobId) === jobId) {
+        return true;
+      }
+      if (parsed.backupItemId) {
+        const it = itemStmt.get(Number(parsed.backupItemId));
+        if (it && Number(it.job_id) === jobId) {
+          return true;
+        }
+      }
+    } catch {
+      // Ignore invalid JSON
+    }
+  }
+  return false;
+}
 
 export async function GET(
   _req: NextRequest,
@@ -90,6 +145,31 @@ export async function PATCH(
     }
 
     if (action === 'retry') {
+      if (ACTIVE_JOB_STATUSES.has(String(job.status))) {
+        return NextResponse.json(
+          {
+            error:
+              'Tiến trình đang chạy hoặc đang trong hàng đợi, không thể thử lại lúc này.',
+          },
+          { status: 409 }
+        );
+      }
+      if (
+        String(job.job_type) === 'BACKUP' &&
+        isReferencedByActiveRestore(
+          jobId,
+          Number(job.server_id),
+          String(job.snapshot_name || '')
+        )
+      ) {
+        return NextResponse.json(
+          {
+            error:
+              'Bản sao lưu này đang được tiến trình Khôi phục (Restore) sử dụng, vui lòng đợi hoàn tất.',
+          },
+          { status: 409 }
+        );
+      }
       db.prepare(
         `UPDATE backup_jobs SET status = 'QUEUED', current_phase = 'Đang xếp hàng thử lại...', error_log = NULL WHERE id = ?`
       ).run(jobId);
@@ -101,6 +181,15 @@ export async function PATCH(
     }
 
     if (action === 'verify_sandbox') {
+      if (ACTIVE_JOB_STATUSES.has(String(job.status))) {
+        return NextResponse.json(
+          {
+            error:
+              'Tiến trình đang chạy hoặc đang thẩm định, vui lòng đợi hoàn tất.',
+          },
+          { status: 409 }
+        );
+      }
       const { snapshotRoot } = resolveSafeSnapshotRoot(jobId);
       const summary = await verifyJobDatabasesInSandbox(
         jobId,
@@ -144,6 +233,33 @@ export async function DELETE(
       return NextResponse.json({ error: 'Không tìm thấy Job.' }, { status: 404 });
     }
 
+    if (ACTIVE_JOB_STATUSES.has(String(row.status))) {
+      return NextResponse.json(
+        {
+          error:
+            'Không thể xóa tiến trình đang chạy hoặc đang trong hàng đợi. Vui lòng hủy tiến trình trước.',
+        },
+        { status: 409 }
+      );
+    }
+
+    if (
+      String(row.job_type) === 'BACKUP' &&
+      isReferencedByActiveRestore(
+        jobId,
+        Number(row.server_id),
+        String(row.snapshot_name || '')
+      )
+    ) {
+      return NextResponse.json(
+        {
+          error:
+            'Không thể xóa bản sao lưu đang được tiến trình Khôi phục (Restore) sử dụng.',
+        },
+        { status: 409 }
+      );
+    }
+
     if (Number(row.is_pinned) === 1) {
       return NextResponse.json(
         {
@@ -155,10 +271,11 @@ export async function DELETE(
     }
 
     if (row.mount_path && row.hostname && row.snapshot_name && row.job_type === 'BACKUP') {
-      const hostDir = path.join(String(row.mount_path), String(row.hostname));
-      const snapDir = path.join(hostDir, String(row.snapshot_name));
+      const snapshotName = String(row.snapshot_name);
+      const hostDir = path.resolve(String(row.mount_path), String(row.hostname));
+      const snapDir = path.resolve(hostDir, snapshotName);
       const latestReal = resolveLatestSnapshotDir(hostDir);
-      if (latestReal && path.resolve(latestReal) === path.resolve(snapDir)) {
+      if (latestReal && path.resolve(latestReal) === snapDir) {
         return NextResponse.json(
           {
             error:
@@ -167,7 +284,11 @@ export async function DELETE(
           { status: 400 }
         );
       }
-      if (fs.existsSync(snapDir)) {
+      if (
+        isSafeSnapshotName(snapshotName) &&
+        path.dirname(snapDir) === hostDir &&
+        fs.existsSync(snapDir)
+      ) {
         fs.rmSync(snapDir, { recursive: true, force: true });
       }
     }

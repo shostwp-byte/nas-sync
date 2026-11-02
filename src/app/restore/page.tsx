@@ -1,14 +1,18 @@
 'use client';
 
-import React, { Suspense, useCallback, useEffect, useState } from 'react';
+import React, {
+  Suspense,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import {
-  ArrowRight,
   CheckCircle2,
   Database,
   FolderSync,
   RotateCcw,
-  Server,
 } from 'lucide-react';
 import { formatBytes, getPanelBadgeClass } from '@/lib/format';
 import type { BackupItem, RestoreMode, ServerRecord } from '@/types';
@@ -43,6 +47,7 @@ function RestoreContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const preselectItemId = searchParams.get('itemId');
+  const step2Ref = useRef<HTMLDivElement | null>(null);
 
   const [items, setItems] = useState<RestorableItem[]>([]);
   const [servers, setServers] = useState<ServerRecord[]>([]);
@@ -55,6 +60,31 @@ function RestoreContent() {
   const [targetWebrootOverride, setTargetWebrootOverride] = useState('');
   const [selectedDbs, setSelectedDbs] = useState<string[]>([]);
   const [submitting, setSubmitting] = useState(false);
+
+  const selectBackupItem = useCallback(
+    (it: RestorableItem, scrollOnMobile = false) => {
+      setSelectedItem(it);
+      setTargetServerId(it.server_id);
+      setTargetUser(it.system_user);
+      setTargetDomain(it.domain_name);
+      setTargetWebrootOverride('');
+      setSelectedDbs(it.databases_list.map((d) => d.name));
+
+      if (
+        scrollOnMobile &&
+        typeof window !== 'undefined' &&
+        window.innerWidth < 1024
+      ) {
+        requestAnimationFrame(() => {
+          step2Ref.current?.scrollIntoView({
+            behavior: 'smooth',
+            block: 'start',
+          });
+        });
+      }
+    },
+    []
+  );
 
   const loadData = useCallback(async () => {
     const [rRes, sRes] = await Promise.all([
@@ -75,22 +105,13 @@ function RestoreContent() {
       const found = preselectItemId
         ? rList.find((x) => x.id === Number(preselectItemId)) || rList[0]
         : rList[0];
-      selectBackupItem(found);
+      selectBackupItem(found, Boolean(preselectItemId));
     }
-  }, [preselectItemId]);
+  }, [preselectItemId, selectBackupItem]);
 
   useEffect(() => {
     void loadData();
   }, [loadData]);
-
-  const selectBackupItem = (it: RestorableItem) => {
-    setSelectedItem(it);
-    setTargetServerId(it.server_id);
-    setTargetUser(it.system_user);
-    setTargetDomain(it.domain_name);
-    setTargetWebrootOverride('');
-    setSelectedDbs(it.databases_list.map((d) => d.name));
-  };
 
   const targetServer = servers.find((s) => s.id === targetServerId);
   const isCrossPanel =
@@ -153,10 +174,12 @@ function RestoreContent() {
 
   return (
     <div className="space-y-6">
-      <div>
-        <h2 className="text-lg font-bold text-white flex items-center gap-2">
-          <RotateCcw className="w-5 h-5 text-blue-400" />
-          Khôi phục Đa năng & Di chuyển Chéo (Cross-Panel Migration)
+      <div className="min-w-0">
+        <h2 className="text-base sm:text-lg font-bold text-white flex items-center gap-2">
+          <RotateCcw className="w-5 h-5 text-blue-400 shrink-0" />
+          <span>
+            Khôi phục Đa năng & Di chuyển Chéo (Cross-Panel Migration)
+          </span>
         </h2>
         <p className="text-xs text-slate-400 mt-0.5">
           Khôi phục riêng lẻ Mã nguồn, Database hoặc di chuyển trực tiếp Website giữa DirectAdmin, cPanel, Plesk và aaPanel.
@@ -164,7 +187,7 @@ function RestoreContent() {
       </div>
 
       {items.length === 0 ? (
-        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-10 text-center text-xs text-slate-400">
+        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 sm:p-10 text-center text-xs text-slate-400">
           Chưa có bản sao lưu hoàn tất nào trên NAS. Hãy chạy ít nhất 1 phiên sao lưu tại mục{' '}
           <strong className="text-white">Tổng quan</strong> hoặc{' '}
           <strong className="text-white">Máy chủ VPS</strong> trước khi thực hiện Restore!
@@ -172,12 +195,12 @@ function RestoreContent() {
       ) : (
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
           {/* Bước 1: Chọn bản sao lưu nguồn */}
-          <div className="lg:col-span-5 bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-4">
-            <div className="flex items-center justify-between">
+          <div className="lg:col-span-5 bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-5 space-y-4 min-w-0">
+            <div className="flex items-center justify-between gap-2">
               <h3 className="text-sm font-bold text-white">
                 1. Chọn Bản Sao lưu Nguồn
               </h3>
-              <span className="text-[11px] text-slate-400">
+              <span className="text-[11px] text-slate-400 shrink-0">
                 {filteredItems.length} bản ghi
               </span>
             </div>
@@ -186,51 +209,51 @@ function RestoreContent() {
               value={filterQuery}
               onChange={(e) => setFilterQuery(e.target.value)}
               placeholder="Tìm theo tên miền, VPS hoặc ngày snapshot..."
-              className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-white"
+              className="w-full min-h-[42px] bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-white"
             />
 
-            <div className="space-y-2 max-h-[500px] overflow-y-auto pr-1">
+            <div className="space-y-2 max-h-72 lg:max-h-[500px] overflow-y-auto pr-1">
               {filteredItems.map((it) => {
                 const isSelected = selectedItem?.id === it.id;
                 return (
                   <button
                     key={it.id}
                     type="button"
-                    onClick={() => selectBackupItem(it)}
+                    onClick={() => selectBackupItem(it, true)}
                     className={`w-full text-left p-3.5 rounded-xl border transition-all text-xs space-y-1.5 ${
                       isSelected
                         ? 'bg-blue-600/15 border-blue-500 text-white'
                         : 'bg-slate-950/80 border-slate-800 hover:border-slate-700 text-slate-300'
                     }`}
                   >
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="font-bold text-sm text-white flex items-center gap-1.5 flex-wrap">
-                        <span>{it.domain_name}</span>
+                    <div className="flex items-start justify-between gap-2">
+                      <span className="font-bold text-sm text-white flex items-center gap-1.5 flex-wrap min-w-0">
+                        <span className="break-all">{it.domain_name}</span>
                         {it.is_subdomain === 1 && (
-                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-violet-500/20 text-violet-300 border border-violet-500/30 font-medium">
+                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-violet-500/20 text-violet-300 border border-violet-500/30 font-medium shrink-0">
                             SUB
                           </span>
                         )}
                       </span>
                       {it.verification_status === 'PASSED' && (
-                        <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
+                        <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 shrink-0 whitespace-nowrap">
                           Verified ✅
                         </span>
                       )}
                     </div>
-                    <div className="flex items-center gap-2 text-[11px] text-slate-400">
+                    <div className="flex flex-wrap items-center gap-2 text-[11px] text-slate-400">
                       <span
-                        className={`px-1.5 py-0.2 rounded border text-[10px] ${getPanelBadgeClass(
+                        className={`px-1.5 py-0.5 rounded border text-[10px] shrink-0 ${getPanelBadgeClass(
                           it.server_panel
                         )}`}
                       >
                         {it.server_panel}
                       </span>
-                      <span>{it.server_hostname}</span>
+                      <span className="break-all">{it.server_hostname}</span>
                     </div>
-                    <div className="flex items-center justify-between text-[11px] text-slate-500 font-mono">
-                      <span>Snap: {it.snapshot_name}</span>
-                      <span>
+                    <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1 text-[11px] text-slate-500 font-mono">
+                      <span className="break-all">Snap: {it.snapshot_name}</span>
+                      <span className="shrink-0">
                         {formatBytes(it.webroot_size_bytes)} •{' '}
                         {it.databases_list.length} DB
                       </span>
@@ -242,7 +265,10 @@ function RestoreContent() {
           </div>
 
           {/* Bước 2 & 3: Chế độ & Máy chủ Đích */}
-          <div className="lg:col-span-7 bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-6 text-xs">
+          <div
+            ref={step2Ref}
+            className="lg:col-span-7 scroll-mt-20 bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-6 space-y-6 text-xs min-w-0"
+          >
             {selectedItem && (
               <>
                 <div className="space-y-3">
@@ -284,8 +310,8 @@ function RestoreContent() {
                           }`}
                         >
                           <div className="font-semibold flex items-center gap-1.5 text-white">
-                            <Icon className="w-4 h-4 text-blue-400" />
-                            {opt.title}
+                            <Icon className="w-4 h-4 text-blue-400 shrink-0" />
+                            <span>{opt.title}</span>
                           </div>
                           <p className="text-[11px] opacity-80">{opt.desc}</p>
                         </button>
@@ -303,7 +329,7 @@ function RestoreContent() {
                           {selectedItem.databases_list.map((d) => (
                             <label
                               key={d.name}
-                              className="inline-flex items-center gap-2 text-cyan-300 font-mono cursor-pointer"
+                              className="inline-flex items-start gap-2 text-cyan-300 font-mono cursor-pointer"
                             >
                               <input
                                 type="checkbox"
@@ -315,8 +341,9 @@ function RestoreContent() {
                                       : prev.filter((x) => x !== d.name)
                                   );
                                 }}
+                                className="mt-0.5 shrink-0"
                               />
-                              <span>
+                              <span className="break-all">
                                 {d.name} ({formatBytes(d.size_bytes)})
                               </span>
                             </label>
@@ -327,7 +354,7 @@ function RestoreContent() {
                 </div>
 
                 <div className="space-y-4 pt-4 border-t border-slate-800">
-                  <div className="flex items-center justify-between">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
                     <h3 className="text-sm font-bold text-white">
                       3. Cấu hình Máy chủ Đích & Chuẩn hóa Panel
                     </h3>
@@ -340,7 +367,7 @@ function RestoreContent() {
                   </div>
 
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                    <div>
+                    <div className="flex flex-col justify-between">
                       <label className="block text-slate-300 mb-1 font-medium">
                         Máy chủ VPS Đích
                       </label>
@@ -356,7 +383,7 @@ function RestoreContent() {
                             setTargetUser(selectedItem.system_user);
                           }
                         }}
-                        className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white"
+                        className="w-full min-h-[42px] bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white"
                       >
                         {servers.map((s) => (
                           <option key={s.id} value={s.id}>
@@ -369,30 +396,30 @@ function RestoreContent() {
                       </select>
                     </div>
 
-                    <div>
+                    <div className="flex flex-col justify-between">
                       <label className="block text-slate-300 mb-1 font-medium">
                         System User trên Máy chủ Đích
                       </label>
                       <input
                         value={targetUser}
                         onChange={(e) => setTargetUser(e.target.value)}
-                        className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white font-mono"
+                        className="w-full min-h-[42px] bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white font-mono"
                       />
                     </div>
                   </div>
 
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                    <div>
+                    <div className="flex flex-col justify-between">
                       <label className="block text-slate-300 mb-1 font-medium">
                         Domain Đích
                       </label>
                       <input
                         value={targetDomain}
                         onChange={(e) => setTargetDomain(e.target.value)}
-                        className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white font-mono"
+                        className="w-full min-h-[42px] bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white font-mono"
                       />
                     </div>
-                    <div>
+                    <div className="flex flex-col justify-between">
                       <label className="block text-slate-300 mb-1 font-medium">
                         Ghi đè Đường dẫn Webroot (Tùy chọn)
                       </label>
@@ -402,27 +429,37 @@ function RestoreContent() {
                           setTargetWebrootOverride(e.target.value)
                         }
                         placeholder={previewWebroot}
-                        className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white font-mono"
+                        className="w-full min-h-[42px] bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white font-mono"
                       />
                     </div>
                   </div>
 
                   {/* Preview Mapping Box */}
-                  <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-2 font-mono text-[11px]">
+                  <div className="p-3.5 sm:p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-2 font-mono text-[11px] min-w-0">
                     <div className="text-slate-400 font-sans font-semibold">
                       Xem trước Ánh xạ Đường dẫn & Phân quyền Tự động:
                     </div>
-                    <div className="flex flex-wrap items-center gap-2 text-slate-300">
-                      <span className="text-cyan-400">
-                        NAS:/.../{selectedItem.snapshot_name}/home/domains/
-                        {selectedItem.domain_name}
-                      </span>
-                      <ArrowRight className="w-3.5 h-3.5 text-slate-500" />
-                      <span className="text-emerald-400">
-                        {targetServer?.hostname}:{previewWebroot}
-                      </span>
+                    <div className="space-y-1.5 text-slate-300">
+                      <div className="break-all">
+                        <span className="text-slate-500 font-sans">
+                          Nguồn (Snapshot):{' '}
+                        </span>
+                        <span className="text-cyan-400">
+                          {selectedItem.source_webroot
+                            ? `NAS:/.../${selectedItem.snapshot_name}/home/domains/${selectedItem.domain_name} (${selectedItem.source_webroot})`
+                            : `NAS:/.../${selectedItem.snapshot_name}/home/domains/${selectedItem.domain_name}`}
+                        </span>
+                      </div>
+                      <div className="break-all">
+                        <span className="text-slate-500 font-sans">
+                          Đích dự kiến:{' '}
+                        </span>
+                        <span className="text-emerald-400">
+                          {targetServer?.hostname}:{previewWebroot}
+                        </span>
+                      </div>
                     </div>
-                    <div className="text-slate-500">
+                    <div className="text-slate-500 font-sans break-words">
                       Tự động chuẩn hóa chủ sở hữu file theo chuẩn{' '}
                       {targetServer?.panel_type} (User: {targetUser})
                     </div>
@@ -432,14 +469,16 @@ function RestoreContent() {
                     type="button"
                     onClick={() => void handleExecuteRestore()}
                     disabled={submitting}
-                    className="w-full py-3 px-4 rounded-xl bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white font-bold text-sm flex items-center justify-center gap-2 shadow-lg shadow-blue-600/25 transition-all"
+                    className="w-full min-h-[48px] py-3 px-4 rounded-xl bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white font-bold text-sm flex items-center justify-center gap-2 shadow-lg shadow-blue-600/25 transition-all"
                   >
-                    <CheckCircle2 className="w-4 h-4" />
-                    {submitting
-                      ? 'Đang khởi tạo tiến trình Khôi phục...'
-                      : isCrossPanel
-                      ? `Thực thi Di chuyển Chéo sang ${targetServer?.hostname} (${targetServer?.panel_type})`
-                      : `Thực thi Khôi phục 1-Click lên ${targetServer?.hostname}`}
+                    <CheckCircle2 className="w-4 h-4 shrink-0" />
+                    <span className="break-words">
+                      {submitting
+                        ? 'Đang khởi tạo tiến trình Khôi phục...'
+                        : isCrossPanel
+                        ? `Thực thi Di chuyển Chéo sang ${targetServer?.hostname} (${targetServer?.panel_type})`
+                        : `Thực thi Khôi phục 1-Click lên ${targetServer?.hostname}`}
+                    </span>
                   </button>
                 </div>
               </>

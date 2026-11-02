@@ -163,13 +163,13 @@ export class MockPanelAdapter implements PanelAdapter {
   ): string {
     switch (this.panelType) {
       case 'DIRECTADMIN':
-        return `chown -R ${systemUser}:${systemUser} ${targetWebroot}`;
+        return `chown -hR ${systemUser}:${systemUser} ${targetWebroot}`;
       case 'CPANEL':
-        return `chown -R ${systemUser}:${systemUser} ${targetWebroot}`;
+        return `chown -hR ${systemUser}:${systemUser} ${targetWebroot}`;
       case 'PLESK':
         return `plesk repair fs ${domain} -y`;
       case 'AAPANEL':
-        return `chown -R www:www ${targetWebroot}`;
+        return `chown -hR www:www ${targetWebroot}`;
     }
   }
 }

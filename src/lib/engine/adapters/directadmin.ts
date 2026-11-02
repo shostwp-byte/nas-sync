@@ -4,6 +4,11 @@ import type {
   MysqlAdminCredentials,
   ServerRecord,
 } from '@/types';
+import {
+  assertSafe,
+  isSafeDomain,
+  isSafeSystemUser,
+} from '../safe-names';
 import { finalizeDiscoveredDomains, type PanelAdapter } from './base';
 
 export class DirectAdminAdapter implements PanelAdapter {
@@ -32,15 +37,20 @@ export class DirectAdminAdapter implements PanelAdapter {
     return {
       user: (user || 'da_admin').trim(),
       password: (password || '').trim(),
+      remoteAuthPrelude:
+        'export MYSQL_PWD="$(grep -E \'^passwd=\' /usr/local/directadmin/conf/mysql.conf | head -n1 | cut -d= -f2- | tr -d \'\\r\\n\')"',
     };
   }
 
   async discoverDomains(server: ServerRecord): Promise<DiscoveredDomain[]> {
     const creds = await this.getMysqlAdminCredentials(server);
-    const escapedPass = (creds.password || '').replace(/'/g, `'\\''`);
+    const quotedMysqlUser = shellSingleQuote(creds.user);
 
     const script = `
-      ALL_DBS=$(MYSQL_PWD='${escapedPass}' mysql -u"${creds.user}" -N -B -e "SHOW DATABASES;" 2>/dev/null | grep -Ev '^(information_schema|performance_schema|mysql|sys)$' || true)
+      DA_MYSQL_CONF="/usr/local/directadmin/conf/mysql.conf"
+      DA_MYSQL_PWD=$(grep -E '^passwd=' "$DA_MYSQL_CONF" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d '\\r\\n')
+      ALL_DBS=$(MYSQL_PWD="$DA_MYSQL_PWD" mysql -u ${quotedMysqlUser} -N -B -e "SHOW DATABASES;" 2>/dev/null | grep -Ev '^(information_schema|performance_schema|mysql|sys)$' || true)
+      unset DA_MYSQL_PWD
       DA_SUB_IN_DOMAINS=$(grep -E '^(create_subdomain_docroot_in_domains_dir|subdomain_docroot_in_domains_dir)=1' /usr/local/directadmin/conf/directadmin.conf 2>/dev/null | head -n1 || true)
 
       detect_dbs_in_webroot() {
@@ -231,20 +241,27 @@ $(head -n 120 "$cf" 2>/dev/null || true)"
     systemUser: string,
     domain: string
   ): Promise<string> {
+    assertSafe(isSafeSystemUser, systemUser, 'systemUser');
+    assertSafe(isSafeDomain, domain, 'domain');
+
     if (!server.is_mock) {
       const checkCmd = `
-        USER_DIR="/usr/local/directadmin/data/users/${systemUser}"
-        CONF="$USER_DIR/domains/${domain}.conf"
+        SYS_USER=${shellSingleQuote(systemUser)}
+        DOM=${shellSingleQuote(domain)}
+        USER_HOME=$(getent passwd "$SYS_USER" 2>/dev/null | cut -d: -f6 || true)
+        [ -z "$USER_HOME" ] && USER_HOME="/home/$SYS_USER"
+        USER_DIR="/usr/local/directadmin/data/users/$SYS_USER"
+        CONF="$USER_DIR/domains/$DOM.conf"
         if [ -f "$CONF" ]; then
           DOC=$(grep -E '^document_root=' "$CONF" | head -n1 | cut -d= -f2- | tr -d '\\r\\n')
           if [ -n "$DOC" ]; then
             case "$DOC" in
-              /home/*) echo "$DOC"; exit 0 ;;
-              /*) echo "/home/${systemUser}$DOC"; exit 0 ;;
-              *) echo "/home/${systemUser}/$DOC"; exit 0 ;;
+              /home*/*) echo "$DOC"; exit 0 ;;
+              /*) echo "$USER_HOME$DOC"; exit 0 ;;
+              *) echo "$USER_HOME/$DOC"; exit 0 ;;
             esac
           fi
-          echo "/home/${systemUser}/domains/${domain}/public_html"
+          echo "$USER_HOME/domains/$DOM/public_html"
           exit 0
         fi
 
@@ -252,35 +269,35 @@ $(head -n 120 "$cf" 2>/dev/null || true)"
         for subf in "$USER_DIR"/domains/*.subdomains; do
           [ -f "$subf" ] || continue
           pdom=$(basename "$subf" .subdomains)
-          case "${domain}" in
+          case "$DOM" in
             *."$pdom")
-              sub_prefix=$(printf "%s" "${domain}" | sed "s/\\.$pdom\$//")
+              sub_prefix="\${DOM%.$pdom}"
               ovf="$USER_DIR/domains/$pdom.subdomains.docroot.override"
               if [ -f "$ovf" ]; then
-                ov_line=$(grep -E "^$\{sub_prefix}=" "$ovf" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d '\\r\\n' || true)
+                ov_line=$(awk -F= -v k="$sub_prefix" '$1 == k { sub(/^[^=]*=/, ""); print; exit }' "$ovf" 2>/dev/null | tr -d '\\r\\n' || true)
                 pub_raw=$(printf "%s" "$ov_line" | tr '&' '\\n' | grep -E '^public_html=' | head -n1 | cut -d= -f2- || true)
                 if [ -n "$pub_raw" ]; then
                   decoded=$(/usr/bin/printf '%b' "$(printf '%s' "$pub_raw" | sed 's/+/ /g; s/%/\\\\x/g')" 2>/dev/null || printf '%s' "$pub_raw" | sed 's/%2F/\\//gi; s/%20/ /g')
                   case "$decoded" in
-                    /home/*) echo "$decoded"; exit 0 ;;
-                    /*) echo "/home/${systemUser}$decoded"; exit 0 ;;
-                    *) echo "/home/${systemUser}/$decoded"; exit 0 ;;
+                    /home*/*) echo "$decoded"; exit 0 ;;
+                    /*) echo "$USER_HOME$decoded"; exit 0 ;;
+                    *) echo "$USER_HOME/$decoded"; exit 0 ;;
                   esac
                 fi
               fi
-              if [ -d "/home/${systemUser}/domains/${domain}/public_html" ]; then
-                echo "/home/${systemUser}/domains/${domain}/public_html"
+              if [ -d "$USER_HOME/domains/$DOM/public_html" ]; then
+                echo "$USER_HOME/domains/$DOM/public_html"
                 exit 0
               fi
-              if [ -d "/home/${systemUser}/domains/$pdom/public_html/$sub_prefix" ]; then
-                echo "/home/${systemUser}/domains/$pdom/public_html/$sub_prefix"
+              if [ -d "$USER_HOME/domains/$pdom/public_html/$sub_prefix" ]; then
+                echo "$USER_HOME/domains/$pdom/public_html/$sub_prefix"
                 exit 0
               fi
               ;;
           esac
         done
 
-        echo "/home/${systemUser}/domains/${domain}/public_html"
+        echo "$USER_HOME/domains/$DOM/public_html"
       `;
       const res = await execRemoteSSH(server, checkCmd, { zeroImpact: true });
       if (res.code === 0 && res.stdout.trim()) {
@@ -295,7 +312,8 @@ $(head -n 120 "$cf" 2>/dev/null || true)"
     _domain: string,
     targetWebroot: string
   ): string {
-    return `chown -R ${shellSingleQuote(`${systemUser}:${systemUser}`)} ${shellSingleQuote(
+    assertSafe(isSafeSystemUser, systemUser, 'systemUser');
+    return `chown -hR ${shellSingleQuote(`${systemUser}:${systemUser}`)} ${shellSingleQuote(
       targetWebroot
     )}`;
   }
