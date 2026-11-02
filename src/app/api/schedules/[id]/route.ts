@@ -1,5 +1,6 @@
 import cron from 'node-cron';
 import { NextRequest, NextResponse } from 'next/server';
+import { requireRole } from '@/lib/auth';
 import { getDb } from '@/lib/db';
 import {
   enqueueServerBackup,
@@ -11,6 +12,9 @@ export async function PATCH(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
+    const guard = await requireRole(['ADMIN']);
+    if (!guard.ok) return guard.response;
+
     const { id } = await params;
     const body = await req.json();
     const db = getDb();
@@ -149,6 +153,9 @@ export async function POST(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
+    const guard = await requireRole(['ADMIN']);
+    if (!guard.ok) return guard.response;
+
     const { id } = await params;
     const db = getDb();
     const sched = db
@@ -194,6 +201,9 @@ export async function DELETE(
   _req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
+  const guard = await requireRole(['ADMIN']);
+  if (!guard.ok) return guard.response;
+
   const { id } = await params;
   getDb().prepare('DELETE FROM backup_schedules WHERE id = ?').run(Number(id));
   reloadCronSchedules();

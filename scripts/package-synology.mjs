@@ -159,11 +159,12 @@ for (const emptyDir of ['app_data', 'ssh_keys']) {
 
 fs.mkdirSync(releaseDir, { recursive: true });
 
-// Dọn các gói nén tên cũ nếu còn tồn tại trong thư mục release/
+// Dọn các gói nén tên cũ nếu còn tồn tại trong thư mục release/ (giữ lại gói prebuilt)
 for (const entry of fs.readdirSync(releaseDir)) {
   if (
     (entry.endsWith('.zip') || entry.endsWith('.tar.gz')) &&
-    !entry.startsWith('nas-sync-synology')
+    !entry.startsWith('nas-sync-synology') &&
+    !entry.startsWith('nas-sync-prebuilt')
   ) {
     fs.unlinkSync(path.join(releaseDir, entry));
   }

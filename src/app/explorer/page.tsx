@@ -3,6 +3,7 @@
 import React, { Suspense, useCallback, useEffect, useState } from 'react';
 import { useSearchParams } from 'next/navigation';
 import {
+  Archive,
   ArrowLeft,
   Download,
   FileCode2,
@@ -212,11 +213,30 @@ function ExplorerInner() {
               </select>
             </div>
 
-            <div className="w-full lg:w-auto lg:max-w-[40%] min-w-0 flex items-center gap-2 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2">
-              <Folder className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-              <div className="w-full lg:w-auto min-w-0 truncate break-all font-mono text-cyan-400">
-                /{currentPath || ''}
+            <div className="flex flex-col sm:flex-row sm:items-center gap-2 w-full lg:w-auto lg:max-w-[55%] min-w-0">
+              <div className="w-full sm:flex-1 min-w-0 min-h-[40px] flex items-center gap-2 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2">
+                <Folder className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                <div className="w-full min-w-0 truncate break-all font-mono text-cyan-400">
+                  /{currentPath || ''}
+                </div>
               </div>
+
+              {selectedJobId > 0 && (
+                <a
+                  href={`/api/explorer/archive?jobId=${selectedJobId}&path=${encodeURIComponent(
+                    currentPath
+                  )}`}
+                  title={
+                    currentPath
+                      ? `Tải thư mục /${currentPath} dạng .tar.gz`
+                      : 'Tải toàn bộ Snapshot dạng .tar.gz'
+                  }
+                  className="w-full sm:w-auto justify-center min-h-[40px] shrink-0 whitespace-nowrap inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-emerald-600/20 hover:bg-emerald-600 text-emerald-300 hover:text-white border border-emerald-500/30 font-semibold transition-colors"
+                >
+                  <Archive className="w-3.5 h-3.5 shrink-0" />
+                  <span>Tải gói .tar.gz</span>
+                </a>
+              )}
             </div>
           </div>
 
@@ -309,6 +329,22 @@ function ExplorerInner() {
                       </div>
 
                       <div className="flex items-center gap-2 shrink-0 ml-2">
+                        {entry.isDirectory && (
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              window.location.href = `/api/explorer/archive?jobId=${selectedJobId}&path=${encodeURIComponent(
+                                entry.relativePath
+                              )}`;
+                            }}
+                            title="Tải thư mục này dạng .tar.gz"
+                            aria-label={`Tải thư mục ${entry.name} dạng .tar.gz`}
+                            className="h-7 w-7 shrink-0 inline-flex items-center justify-center rounded-md bg-slate-800/80 hover:bg-emerald-600 text-slate-300 hover:text-white border border-slate-700/80 hover:border-emerald-500 transition-colors"
+                          >
+                            <Download className="w-3.5 h-3.5" />
+                          </button>
+                        )}
                         {!entry.isDirectory && entry.hardLinkCount > 1 && (
                           <span
                             title={`Hard-linked (${entry.hardLinkCount} snapshots dùng chung inode, tốn 0 byte thêm)`}

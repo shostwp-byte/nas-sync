@@ -1,12 +1,20 @@
 import { SignJWT, jwtVerify } from 'jose';
+import type { UserRole } from '@/types';
 
 export const SESSION_COOKIE_NAME = 'nas_sync_session';
 
 export interface SessionPayload {
   userId: number;
   username: string;
-  role: string;
+  role: UserRole;
   tokenVersion?: number;
+}
+
+export function normalizeUserRole(raw: unknown): UserRole {
+  if (raw === 'ADMIN' || raw === 'OPERATOR' || raw === 'VIEWER') {
+    return raw;
+  }
+  return 'VIEWER';
 }
 
 function getJwtSecret(): Uint8Array {
@@ -44,7 +52,7 @@ export async function verifySessionToken(
     return {
       userId: payload.userId as number,
       username: payload.username as string,
-      role: (payload.role as string) || 'ADMIN',
+      role: normalizeUserRole(payload.role ?? 'ADMIN'),
       tokenVersion:
         typeof payload.tokenVersion === 'number' ? payload.tokenVersion : 1,
     };
@@ -55,4 +63,3 @@ export async function verifySessionToken(
 
 export const signSessionJwt = signSessionToken;
 export const verifySessionJwt = verifySessionToken;
-

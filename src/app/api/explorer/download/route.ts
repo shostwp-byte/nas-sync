@@ -2,6 +2,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import { NextRequest, NextResponse } from 'next/server';
+import { recordAuditLog } from '@/lib/audit';
+import { requireRole } from '@/lib/auth';
 import {
   resolveSafeSnapshotRoot,
   resolveSafeSubPath,
@@ -9,6 +11,12 @@ import {
 
 export async function GET(req: NextRequest) {
   try {
+    const guard = await requireRole(
+      ['ADMIN', 'OPERATOR'],
+      'Tài khoản VIEWER không có quyền tải xuống dữ liệu sao lưu.'
+    );
+    if (!guard.ok) return guard.response;
+
     const sp = req.nextUrl.searchParams;
     const jobId = Number(sp.get('jobId'));
     const relPath = sp.get('path') || '';
@@ -20,7 +28,8 @@ export async function GET(req: NextRequest) {
       );
     }
 
-    const { snapshotRoot } = resolveSafeSnapshotRoot(jobId);
+    const { snapshotRoot, hostname, snapshotName } =
+      resolveSafeSnapshotRoot(jobId);
     const fullPath = resolveSafeSubPath(snapshotRoot, relPath);
 
     if (!fs.existsSync(fullPath)) {
@@ -43,9 +52,21 @@ export async function GET(req: NextRequest) {
 
     const { size } = stat;
     const fileName = path.basename(fullPath);
+
+    recordAuditLog({
+      session: guard.session,
+      action: 'DOWNLOAD_FILE',
+      resourceType: 'SNAPSHOT',
+      resourceId: String(jobId),
+      detail: `Tải tập tin "${relPath}" từ ${hostname}@${snapshotName}`,
+      req,
+    });
+
     // Stream thay vì readFileSync: file backup (SQL dump, archive) có thể nhiều GB — đọc
     // toàn bộ vào RAM sẽ làm sập tiến trình Node trên NAS (Buffer tối đa ~2-4 GB).
-    const body = Readable.toWeb(fs.createReadStream(fullPath)) as ReadableStream<Uint8Array>;
+    const body = Readable.toWeb(
+      fs.createReadStream(fullPath)
+    ) as ReadableStream<Uint8Array>;
 
     return new NextResponse(body, {
       status: 200,

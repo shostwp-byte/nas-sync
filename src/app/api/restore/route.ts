@@ -1,9 +1,14 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { recordAuditLog } from '@/lib/audit';
+import { requireRole } from '@/lib/auth';
 import { getDb } from '@/lib/db';
 import { enqueueRestoreOperation } from '@/lib/engine/queue';
 import type { RestoreRequestPayload } from '@/types';
 
 export async function GET(req: NextRequest) {
+  const guard = await requireRole(['ADMIN', 'OPERATOR', 'VIEWER']);
+  if (!guard.ok) return guard.response;
+
   const serverId = req.nextUrl.searchParams.get('serverId');
   const db = getDb();
 
@@ -43,8 +48,11 @@ export async function GET(req: NextRequest) {
 
 export async function POST(req: NextRequest) {
   try {
-    const body = (await req.json()) as RestoreRequestPayload;
-    if (!body.backupItemId || !body.targetServerId || !body.mode) {
+    const guard = await requireRole(['ADMIN']);
+    if (!guard.ok) return guard.response;
+
+    const rawBody = (await req.json()) as RestoreRequestPayload;
+    if (!rawBody.backupItemId || !rawBody.targetServerId || !rawBody.mode) {
       return NextResponse.json(
         {
           error:
@@ -54,7 +62,34 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const jobId = await enqueueRestoreOperation(body);
+    const payload: RestoreRequestPayload = {
+      ...rawBody,
+      autoPatchConfig: Boolean(rawBody.autoPatchConfig),
+    };
+
+    const jobId = await enqueueRestoreOperation(payload);
+
+    const db = getDb();
+    const item = db
+      .prepare('SELECT domain_name, snapshot_name FROM backup_items WHERE id = ?')
+      .get(payload.backupItemId);
+    const targetSrv = db
+      .prepare('SELECT hostname FROM servers WHERE id = ?')
+      .get(payload.targetServerId);
+
+    recordAuditLog({
+      session: guard.session,
+      action: 'RESTORE_ENQUEUE',
+      resourceType: 'JOB',
+      resourceId: String(jobId),
+      detail: `Khởi tạo khôi phục ${payload.mode} cho "${
+        item?.domain_name || `#${payload.backupItemId}`
+      }" (${item?.snapshot_name || ''}) ➔ ${
+        targetSrv?.hostname || `Server #${payload.targetServerId}`
+      }${payload.autoPatchConfig ? ' [Auto-Patch Config: ON]' : ''}`,
+      req,
+    });
+
     return NextResponse.json({ ok: true, jobId });
   } catch (err) {
     return NextResponse.json(
@@ -63,4 +98,3 @@ export async function POST(req: NextRequest) {
     );
   }
 }
-

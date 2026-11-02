@@ -2,6 +2,20 @@
 
 Mọi thay đổi đáng chú ý của dự án **NAS-Sync** (<https://github.com/shostwp-byte/nas-sync>) đều được ghi nhận tại tài liệu này theo chuẩn [Keep a Changelog](https://keepachangelog.com/vi/1.1.0/) và [Semantic Versioning](https://semver.org/).
 
+## [1.3.0] - 2026-11-02
+
+### Added & Improved (Giai đoạn 1 — 5 Nâng cấp Lõi Ưu tiên Cao)
+- **Tải trọn bộ Website / Thư mục dạng `.tar.gz` Stream trực tiếp (`src/app/api/explorer/archive/route.ts`, `explorer/page.tsx`, `jobs/page.tsx`, `restore/page.tsx`)**:
+  - Bổ sung API `GET /api/explorer/archive` nén stream trực tiếp thư mục bất kỳ hoặc trọn bộ 1 Domain (`public_html` + `databases` + `metadata.json`) về trình duyệt mà không tạo file tạm trên ổ cứng NAS, không đi theo symlink ngoại lai và tự động hủy tiến trình `tar` ngay khi đóng/hủy tải.
+- **Bộ lọc Loại trừ File Rác (`Custom Rsync Exclude Rules` — `src/lib/engine/exclude-rules.ts`, `backup-worker.ts`, `settings/page.tsx`, `servers/page.tsx`)**:
+  - Hỗ trợ cấu hình mẫu loại trừ toàn cục (`global_exclude_patterns` kèm nút chèn nhanh bộ lọc rác chuẩn WordPress/Hosting) kết hợp với mẫu loại trừ riêng từng VPS (`servers.custom_excludes`), tự động kiểm duyệt an toàn trước khi truyền `--exclude` vào `rsync`.
+- **Tự động Cập nhật File Cấu hình khi Di chuyển Chéo Panel (`src/lib/engine/config-rewriter.ts`, `restore-worker.ts`, `restore/page.tsx`)**:
+  - Tự động tạo bản dự phòng `.nas-sync.bak` (`0600`) và cập nhật tên Database (`targetDbMap`) cùng đường dẫn vật lý mới trong `wp-config.php`, `.env`, `configuration.php`, `config.php`, `app/etc/env.php` sau khi khôi phục sang VPS đích.
+- **Cập nhật Siêu tốc `Prebuilt Release + SHA-256` & Khôi phục `1-Click Rollback` (`scripts/package-prebuilt.mjs`, `.github/workflows/release.yml`, `updater.ts`, `settings/page.tsx`)**:
+  - Đóng gói sẵn bản biên dịch Production (`nas-sync-prebuilt.tar.gz`) kèm chữ ký băm `.sha256` trên GitHub Releases; trình cập nhật tự kiểm tra `SHA-256` bằng `timingSafeEqual` và nạp trực tiếp trong **~5 giây** không tốn CPU/RAM chạy `next build` trên NAS, đồng thời lưu giữ bản trước đó hỗ trợ **1-Click Rollback**.
+- **Bảo mật 2 lớp (`2FA TOTP`), Phân quyền Đa Tài khoản (`RBAC`) & Nhật ký Kiểm toán (`Audit Logs`) (`src/lib/totp.ts`, `src/lib/audit.ts`, `server.ts`, `api/auth/2fa`, `api/users`, `api/audit-logs`, `login/page.tsx`, `settings/page.tsx`, `AppShell.tsx`)**:
+  - Hỗ trợ xác thực 2 lớp chuẩn **RFC 6238 (`HMAC-SHA1`, mã QR SVG, 8 mã khôi phục dự phòng mã hóa `AES-256-GCM`)**, biến khẩn cấp `FORCE_RESET_ADMIN_2FA=true`, phân quyền 3 cấp (`ADMIN`, `OPERATOR`, `VIEWER`) kiểm tra trực tiếp từ SQLite ở tầng HTTP Server và bảng nhật ký kiểm toán `audit_logs` lưu vết toàn bộ thao tác nhạy cảm.
+
 ## [1.2.0] - 2026-11-02
 
 ### Security & Reliability

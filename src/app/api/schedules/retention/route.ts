@@ -1,13 +1,26 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { recordAuditLog } from '@/lib/audit';
+import { requireRole } from '@/lib/auth';
+import { getDb } from '@/lib/db';
 import { acquireServerLock } from '@/lib/engine/queue';
 import { applyGfsRetentionForServer } from '@/lib/engine/retention-gfs';
 
 export async function POST(req: NextRequest) {
   try {
+    const guard = await requireRole(['ADMIN', 'OPERATOR']);
+    if (!guard.ok) return guard.response;
+
     const body = await req.json();
     const serverId = Number(body.serverId);
     const dryRun = Boolean(body.dryRun);
     const rawPolicy = body.policy || { daily: 7, weekly: 4, monthly: 6 };
+
+    if (!dryRun && guard.session.role !== 'ADMIN') {
+      return NextResponse.json(
+        { error: 'Thao tác này yêu cầu quyền Quản trị viên (ADMIN).' },
+        { status: 403 }
+      );
+    }
 
     if (!Number.isInteger(serverId) || serverId <= 0) {
       return NextResponse.json(
@@ -49,6 +62,21 @@ export async function POST(req: NextRequest) {
     const release = await acquireServerLock(serverId);
     try {
       const result = await applyGfsRetentionForServer(serverId, policy, false);
+      const srv = getDb()
+        .prepare('SELECT hostname FROM servers WHERE id = ?')
+        .get(serverId);
+
+      recordAuditLog({
+        session: guard.session,
+        action: 'RETENTION_PURGE',
+        resourceType: 'SERVER',
+        resourceId: String(serverId),
+        detail: `Thực thi dọn dẹp GFS trên "${
+          srv?.hostname || `Server #${serverId}`
+        }" (Daily:${daily}, Weekly:${weekly}, Monthly:${monthly})`,
+        req,
+      });
+
       return NextResponse.json({ ok: true, ...result });
     } finally {
       release();
@@ -60,4 +88,3 @@ export async function POST(req: NextRequest) {
     );
   }
 }
-

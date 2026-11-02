@@ -30,6 +30,7 @@ import {
   clearCancelledJob,
   isJobCancelled,
 } from './backup-worker';
+import { patchRestoredWebConfigOverSsh } from './config-rewriter';
 import {
   assertSafe,
   isSafeDbName,
@@ -410,6 +411,20 @@ export async function executeRestoreJob(jobId: number): Promise<void> {
         : `♻️ Bắt đầu Khôi phục dữ liệu (${payload.mode}) cho ${targetDomain} về ${targetServer.hostname} (${targetServer.panel_type})`
     );
 
+    const permCmd = targetAdapter.buildPermissionFixCommand(
+      targetUser,
+      targetDomain,
+      resolvedWebroot
+    );
+
+    const mockRestoreDest = path.join(
+      getDataDir(),
+      'restored_preview',
+      targetServer.hostname,
+      targetDomain,
+      'public_html'
+    );
+
     // 1. Khôi phục Mã nguồn (Files)
     if (payload.mode === 'FILES_ONLY' || payload.mode === 'FULL') {
       if (isJobCancelled(jobId)) {
@@ -427,21 +442,8 @@ export async function executeRestoreJob(jobId: number): Promise<void> {
         `[Files Restore] Nguồn NAS: ${localPublicHtml} ➔ Đích VPS: ${targetServer.hostname}:${resolvedWebroot}`
       );
 
-      const permCmd = targetAdapter.buildPermissionFixCommand(
-        targetUser,
-        targetDomain,
-        resolvedWebroot
-      );
-
       if (targetServer.is_mock) {
         await new Promise((r) => setTimeout(r, 450));
-        const mockRestoreDest = path.join(
-          getDataDir(),
-          'restored_preview',
-          targetServer.hostname,
-          targetDomain,
-          'public_html'
-        );
         fs.mkdirSync(mockRestoreDest, { recursive: true });
         fs.cpSync(localPublicHtml, mockRestoreDest, {
           recursive: true,
@@ -587,6 +589,42 @@ export async function executeRestoreJob(jobId: number): Promise<void> {
             );
           }
         }
+      }
+    }
+
+    // 3. Tự động cập nhật cấu hình kết nối DB & đường dẫn Webroot khi Di chuyển Chéo (Cross-Panel Config Rewriter)
+    if (payload.autoPatchConfig && payload.mode !== 'DB_ONLY') {
+      setStep(96, 'Đang tự động hiệu chỉnh cấu hình kết nối Web / Database...');
+      const patchRes = await patchRestoredWebConfigOverSsh({
+        server: targetServer,
+        targetUser,
+        targetDomain,
+        targetWebroot: resolvedWebroot,
+        sourceWebroot: item.source_webroot || '',
+        dbRenameMap: payload.targetDbMap || {},
+        isMock: Boolean(targetServer.is_mock),
+        mockWebrootDir: targetServer.is_mock ? mockRestoreDest : undefined,
+        onLog: appendLog,
+      });
+
+      if (patchRes.patchedFiles.length > 0) {
+        if (!targetServer.is_mock) {
+          const reChown = await execRemoteSSH(targetServer, permCmd, {
+            zeroImpact: true,
+          });
+          if (reChown.code !== 0) {
+            appendLog(
+              `[Cảnh báo] Lệnh chuẩn hóa lại quyền sau khi cập nhật cấu hình trả về mã ${reChown.code}: ${reChown.stderr.trim()}`
+            );
+          }
+        }
+        appendLog(
+          `[Config Rewriter] ✅ Đã cập nhật thành công ${patchRes.patchedFiles.length} tệp cấu hình: ${patchRes.patchedFiles.join(', ')}.`
+        );
+      } else {
+        appendLog(
+          `[Config Rewriter] Không phát hiện thông số DB / đường dẫn cũ cần sửa đổi trong các tệp cấu hình.`
+        );
       }
     }
 

@@ -1,5 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { recordAuditLog } from '@/lib/audit';
+import { requireRole } from '@/lib/auth';
 import { getAllSettings, getDb, getSetting, setSettings } from '@/lib/db';
+import {
+  DEFAULT_WORDPRESS_HOSTING_EXCLUDES,
+  validateExcludePatternsInput,
+} from '@/lib/engine/exclude-rules';
 import { reloadCronSchedules } from '@/lib/engine/queue';
 import {
   detectTelegramChatId,
@@ -40,9 +46,13 @@ const ALLOWED_SETTING_KEYS = new Set([
   'dsm_worm_enabled',
   'dsm_worm_lock_days',
   'github_token',
+  'global_exclude_patterns',
 ]);
 
 export async function GET() {
+  const guard = await requireRole(['ADMIN']);
+  if (!guard.ok) return guard.response;
+
   const rawSettings = getAllSettings();
   const settings: Record<string, string> = { ...rawSettings };
   for (const key of SECRET_SETTING_KEYS) {
@@ -55,11 +65,18 @@ export async function GET() {
     .prepare('SELECT * FROM system_alerts ORDER BY id DESC LIMIT 50')
     .all();
 
-  return NextResponse.json({ settings, alerts });
+  return NextResponse.json({
+    settings,
+    alerts,
+    defaultExcludePreset: DEFAULT_WORDPRESS_HOSTING_EXCLUDES,
+  });
 }
 
 export async function PUT(req: NextRequest) {
   try {
+    const guard = await requireRole(['ADMIN']);
+    if (!guard.ok) return guard.response;
+
     const body = await req.json();
     if (body.settings && typeof body.settings === 'object') {
       const sanitized: Record<string, string> = {};
@@ -71,10 +88,30 @@ export async function PUT(req: NextRequest) {
         if (SECRET_SETTING_KEYS.has(k) && strVal === SECRET_MASK) {
           continue;
         }
+        if (k === 'global_exclude_patterns') {
+          const check = validateExcludePatternsInput(strVal);
+          if (!check.ok) {
+            return NextResponse.json(
+              { error: check.error || 'Quy tắc loại trừ không hợp lệ.' },
+              { status: 400 }
+            );
+          }
+          sanitized[k] = check.normalized;
+          continue;
+        }
         sanitized[k] = strVal;
       }
-      if (Object.keys(sanitized).length > 0) {
+
+      const updatedKeys = Object.keys(sanitized);
+      if (updatedKeys.length > 0) {
         setSettings(sanitized);
+        recordAuditLog({
+          session: guard.session,
+          action: 'SETTINGS_UPDATE',
+          resourceType: 'SETTINGS',
+          detail: `Cập nhật cấu hình hệ thống (${updatedKeys.join(', ')})`,
+          req,
+        });
       }
       reloadCronSchedules();
     }
@@ -89,6 +126,9 @@ export async function PUT(req: NextRequest) {
 
 export async function POST(req: NextRequest) {
   try {
+    const guard = await requireRole(['ADMIN']);
+    if (!guard.ok) return guard.response;
+
     const body = await req.json();
     const action = String(body.action || '');
 

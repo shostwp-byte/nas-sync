@@ -11,8 +11,10 @@ import { useRouter, useSearchParams } from 'next/navigation';
 import {
   CheckCircle2,
   Database,
+  Download,
   FolderSync,
   RotateCcw,
+  Wrench,
 } from 'lucide-react';
 import { formatBytes, getPanelBadgeClass } from '@/lib/format';
 import type { BackupItem, RestoreMode, ServerRecord } from '@/types';
@@ -59,6 +61,8 @@ function RestoreContent() {
   const [targetDomain, setTargetDomain] = useState('');
   const [targetWebrootOverride, setTargetWebrootOverride] = useState('');
   const [selectedDbs, setSelectedDbs] = useState<string[]>([]);
+  const [targetDbMap, setTargetDbMap] = useState<Record<string, string>>({});
+  const [autoPatchConfig, setAutoPatchConfig] = useState(true);
   const [submitting, setSubmitting] = useState(false);
 
   const selectBackupItem = useCallback(
@@ -69,6 +73,7 @@ function RestoreContent() {
       setTargetDomain(it.domain_name);
       setTargetWebrootOverride('');
       setSelectedDbs(it.databases_list.map((d) => d.name));
+      setTargetDbMap({});
 
       if (
         scrollOnMobile &&
@@ -140,6 +145,14 @@ function RestoreContent() {
 
     setSubmitting(true);
     try {
+      const cleanedDbMap: Record<string, string> = {};
+      for (const [srcDb, dstDb] of Object.entries(targetDbMap)) {
+        const trimmed = dstDb.trim();
+        if (trimmed && trimmed !== srcDb && selectedDbs.includes(srcDb)) {
+          cleanedDbMap[srcDb] = trimmed;
+        }
+      }
+
       const resp = await fetch('/api/restore', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -152,6 +165,9 @@ function RestoreContent() {
           targetDomainName: targetDomain,
           targetWebrootOverride: targetWebrootOverride || undefined,
           selectedDatabases: selectedDbs,
+          targetDbMap:
+            Object.keys(cleanedDbMap).length > 0 ? cleanedDbMap : undefined,
+          autoPatchConfig,
         }),
       });
       const json = await resp.json();
@@ -216,11 +232,18 @@ function RestoreContent() {
               {filteredItems.map((it) => {
                 const isSelected = selectedItem?.id === it.id;
                 return (
-                  <button
+                  <div
                     key={it.id}
-                    type="button"
+                    role="button"
+                    tabIndex={0}
                     onClick={() => selectBackupItem(it, true)}
-                    className={`w-full text-left p-3.5 rounded-xl border transition-all text-xs space-y-1.5 ${
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        selectBackupItem(it, true);
+                      }
+                    }}
+                    className={`w-full text-left p-3.5 rounded-xl border transition-all text-xs space-y-1.5 cursor-pointer outline-none focus-visible:ring-2 focus-visible:ring-blue-500 ${
                       isSelected
                         ? 'bg-blue-600/15 border-blue-500 text-white'
                         : 'bg-slate-950/80 border-slate-800 hover:border-slate-700 text-slate-300'
@@ -235,11 +258,24 @@ function RestoreContent() {
                           </span>
                         )}
                       </span>
-                      {it.verification_status === 'PASSED' && (
-                        <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 shrink-0 whitespace-nowrap">
-                          Verified ✅
-                        </span>
-                      )}
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        {it.verification_status === 'PASSED' && (
+                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 shrink-0 whitespace-nowrap">
+                            Verified ✅
+                          </span>
+                        )}
+                        <a
+                          href={`/api/explorer/archive?jobId=${it.job_id}&domain=${encodeURIComponent(
+                            it.domain_name
+                          )}`}
+                          onClick={(e) => e.stopPropagation()}
+                          title={`Tải gói ${it.domain_name} (.tar.gz)`}
+                          className="inline-flex items-center gap-1 px-2 py-0.5 min-h-[24px] rounded bg-emerald-600/15 hover:bg-emerald-600 text-emerald-300 hover:text-white border border-emerald-500/30 text-[10px] font-medium whitespace-nowrap transition-colors"
+                        >
+                          <Download className="w-3 h-3 shrink-0" />
+                          <span>Tải .tar.gz</span>
+                        </a>
+                      </div>
                     </div>
                     <div className="flex flex-wrap items-center gap-2 text-[11px] text-slate-400">
                       <span
@@ -258,7 +294,7 @@ function RestoreContent() {
                         {it.databases_list.length} DB
                       </span>
                     </div>
-                  </button>
+                  </div>
                 );
               })}
             </div>
@@ -321,33 +357,52 @@ function RestoreContent() {
 
                   {(mode === 'FULL' || mode === 'DB_ONLY') &&
                     selectedItem.databases_list.length > 0 && (
-                      <div className="p-3.5 rounded-xl bg-slate-950 border border-slate-800 space-y-2">
+                      <div className="p-3.5 rounded-xl bg-slate-950 border border-slate-800 space-y-2.5">
                         <div className="font-medium text-slate-300">
-                          Chọn Database cần khôi phục:
+                          Chọn Database cần khôi phục & ánh xạ tên DB đích (tùy chọn):
                         </div>
-                        <div className="flex flex-wrap gap-3">
-                          {selectedItem.databases_list.map((d) => (
-                            <label
-                              key={d.name}
-                              className="inline-flex items-start gap-2 text-cyan-300 font-mono cursor-pointer"
-                            >
-                              <input
-                                type="checkbox"
-                                checked={selectedDbs.includes(d.name)}
-                                onChange={(e) => {
-                                  setSelectedDbs((prev) =>
-                                    e.target.checked
-                                      ? [...prev, d.name]
-                                      : prev.filter((x) => x !== d.name)
-                                  );
-                                }}
-                                className="mt-0.5 shrink-0"
-                              />
-                              <span className="break-all">
-                                {d.name} ({formatBytes(d.size_bytes)})
-                              </span>
-                            </label>
-                          ))}
+                        <div className="space-y-2">
+                          {selectedItem.databases_list.map((d) => {
+                            const isChecked = selectedDbs.includes(d.name);
+                            return (
+                              <div
+                                key={d.name}
+                                className="flex flex-col sm:flex-row sm:items-center gap-2"
+                              >
+                                <label className="inline-flex items-start sm:items-center gap-2 text-cyan-300 font-mono cursor-pointer min-w-0 sm:w-1/2">
+                                  <input
+                                    type="checkbox"
+                                    checked={isChecked}
+                                    onChange={(e) => {
+                                      setSelectedDbs((prev) =>
+                                        e.target.checked
+                                          ? [...prev, d.name]
+                                          : prev.filter((x) => x !== d.name)
+                                      );
+                                    }}
+                                    className="mt-0.5 sm:mt-0 shrink-0"
+                                  />
+                                  <span className="break-all">
+                                    {d.name} ({formatBytes(d.size_bytes)})
+                                  </span>
+                                </label>
+                                {isChecked && (
+                                  <input
+                                    type="text"
+                                    value={targetDbMap[d.name] || ''}
+                                    onChange={(e) =>
+                                      setTargetDbMap((prev) => ({
+                                        ...prev,
+                                        [d.name]: e.target.value,
+                                      }))
+                                    }
+                                    placeholder={`Đích: ${d.name} (để trống nếu giữ nguyên)`}
+                                    className="w-full sm:w-1/2 min-h-[36px] bg-slate-900 border border-slate-800 focus:border-blue-500 rounded-lg px-2.5 py-1.5 text-[11px] text-white font-mono outline-none"
+                                  />
+                                )}
+                              </div>
+                            );
+                          })}
                         </div>
                       </div>
                     )}
@@ -464,6 +519,37 @@ function RestoreContent() {
                       {targetServer?.panel_type} (User: {targetUser})
                     </div>
                   </div>
+
+                  {mode !== 'DB_ONLY' && (
+                    <label className="flex items-start gap-3 p-3.5 sm:p-4 rounded-xl bg-emerald-500/10 border border-emerald-500/30 cursor-pointer transition-colors hover:bg-emerald-500/15">
+                      <input
+                        type="checkbox"
+                        checked={autoPatchConfig}
+                        onChange={(e) => setAutoPatchConfig(e.target.checked)}
+                        className="mt-1 shrink-0 rounded border-emerald-500/50"
+                      />
+                      <div className="space-y-1 min-w-0">
+                        <div className="font-semibold text-emerald-200 flex items-center gap-1.5 flex-wrap">
+                          <Wrench className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                          <span className="break-words">
+                            Tự động cập nhật tên Database &amp; đường dẫn trong
+                            wp-config.php / .env / configuration.php
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-slate-300 leading-relaxed break-words">
+                          Tự động tạo bản sao lưu gốc{' '}
+                          <code className="font-mono text-amber-300">
+                            .nas-sync.bak
+                          </code>{' '}
+                          (<code className="font-mono text-slate-200">chmod 600</code>)
+                          trước khi đổi{' '}
+                          <code className="font-mono text-cyan-300">DB_NAME</code>{' '}
+                          (theo bảng ánh xạ DB) và đường dẫn vật lý cũ sang đường
+                          dẫn mới trên VPS đích.
+                        </p>
+                      </div>
+                    </label>
+                  )}
 
                   <button
                     type="button"

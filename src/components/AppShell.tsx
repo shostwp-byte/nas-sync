@@ -17,11 +17,14 @@ import {
   RotateCcw,
   Server,
   Settings,
+  ShieldAlert,
   ShieldCheck,
+  User,
   Wifi,
   WifiOff,
   X,
 } from 'lucide-react';
+import type { UserRole } from '@/types';
 import { useRealtime } from './SocketProvider';
 
 const NAV_ITEMS = [
@@ -35,16 +38,35 @@ const NAV_ITEMS = [
   { href: '/settings', label: 'Cấu hình & Cập nhật', icon: Settings },
 ];
 
+function getRoleBadgeStyle(role: UserRole): string {
+  switch (role) {
+    case 'ADMIN':
+      return 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30';
+    case 'OPERATOR':
+      return 'bg-cyan-500/15 text-cyan-300 border-cyan-500/30';
+    case 'VIEWER':
+      return 'bg-slate-700/60 text-slate-300 border-slate-600/60';
+    default:
+      return 'bg-blue-500/15 text-blue-300 border-blue-500/30';
+  }
+}
+
 export function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const router = useRouter();
   const { connected, progressMap, latestAlert } = useRealtime();
   const [mobileOpen, setMobileOpen] = useState(false);
   const [criticalAlertIds, setCriticalAlertIds] = useState<number[]>([]);
+  const [currentUser, setCurrentUser] = useState<{
+    userId: number;
+    username: string;
+    role: UserRole;
+    totpEnabled: boolean;
+  } | null>(null);
   const [versionInfo, setVersionInfo] = useState<{
     currentVersion: string;
     hasUpdate: boolean;
-  }>({ currentVersion: '1.1.0', hasUpdate: false });
+  }>({ currentVersion: '1.3.0', hasUpdate: false });
 
   useEffect(() => {
     setMobileOpen(false);
@@ -79,6 +101,23 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     if (pathname === '/login') return;
     let active = true;
+
+    fetch('/api/auth/me', { cache: 'no-store' })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (active && data?.user) {
+          setCurrentUser({
+            userId: Number(data.user.userId ?? data.user.id ?? 0),
+            username: String(data.user.username || 'admin'),
+            role: (data.user.role as UserRole) || 'ADMIN',
+            totpEnabled: Boolean(
+              data.user.totpEnabled ?? data.user.totp_enabled
+            ),
+          });
+        }
+      })
+      .catch(() => {});
+
     fetch('/api/system/update')
       .then((r) => (r.ok ? r.json() : null))
       .then((data) => {
@@ -90,6 +129,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         }
       })
       .catch(() => {});
+
     return () => {
       active = false;
     };
@@ -191,22 +231,24 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                     {runningCount}
                   </span>
                 )}
-                {item.href === '/settings' && versionInfo.hasUpdate && (
-                  <span
-                    title="Có bản cập nhật mới trên GitHub"
-                    className="inline-flex items-center gap-1 px-1.5 py-0.5 text-[10px] rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/40 shrink-0"
-                  >
-                    <ArrowUpCircle className="w-3 h-3" />
-                    Mới
-                  </span>
-                )}
+                {item.href === '/settings' &&
+                  versionInfo.hasUpdate &&
+                  (!currentUser || currentUser.role === 'ADMIN') && (
+                    <span
+                      title="Có bản cập nhật mới trên GitHub"
+                      className="inline-flex items-center gap-1 px-1.5 py-0.5 text-[10px] rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/40 shrink-0"
+                    >
+                      <ArrowUpCircle className="w-3 h-3" />
+                      Mới
+                    </span>
+                  )}
               </Link>
             );
           })}
         </nav>
 
-        <div className="p-4 pb-[max(1rem,env(safe-area-inset-bottom))] border-t border-slate-800 space-y-3 shrink-0">
-          <div className="px-3 py-2.5 rounded-lg bg-slate-950/80 border border-slate-800 text-xs space-y-1.5">
+        <div className="p-3.5 pb-[max(0.875rem,env(safe-area-inset-bottom))] border-t border-slate-800 space-y-2.5 shrink-0">
+          <div className="px-3 py-2 rounded-lg bg-slate-950/80 border border-slate-800 text-xs space-y-1.5">
             <div className="flex items-center justify-between gap-2">
               <span className="text-slate-400">Realtime Socket</span>
               {connected ? (
@@ -230,13 +272,52 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             </a>
           </div>
 
+          {currentUser && (
+            <div className="px-3 py-2 rounded-lg bg-slate-950/90 border border-slate-800/90 text-xs space-y-1.5">
+              <div className="flex items-center justify-between gap-2 min-w-0">
+                <span className="inline-flex items-center gap-1.5 font-semibold text-white min-w-0">
+                  <User className="w-3.5 h-3.5 text-blue-400 shrink-0" />
+                  <span className="truncate font-mono">
+                    {currentUser.username}
+                  </span>
+                </span>
+                <span
+                  className={`px-1.5 py-0.5 rounded border text-[10px] font-bold tracking-wide shrink-0 ${getRoleBadgeStyle(
+                    currentUser.role
+                  )}`}
+                >
+                  {currentUser.role}
+                </span>
+              </div>
+              <div className="flex items-center justify-between gap-2 pt-1 border-t border-slate-800/70">
+                <span className="text-[11px] text-slate-400">Bảo mật 2 lớp</span>
+                {currentUser.totpEnabled ? (
+                  <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-emerald-500/15 border border-emerald-500/30 text-[10px] font-semibold text-emerald-300 shrink-0">
+                    <ShieldCheck className="w-3 h-3 shrink-0" />
+                    2FA ON
+                  </span>
+                ) : (
+                  <Link
+                    href="/settings"
+                    onClick={() => setMobileOpen(false)}
+                    title="Nhấn để bật bảo mật 2 lớp (2FA TOTP)"
+                    className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-slate-800 hover:bg-amber-500/20 border border-slate-700 hover:border-amber-500/40 text-[10px] font-medium text-slate-300 hover:text-amber-300 transition-colors shrink-0"
+                  >
+                    <ShieldAlert className="w-3 h-3 shrink-0" />
+                    2FA OFF
+                  </Link>
+                )}
+              </div>
+            </div>
+          )}
+
           <button
             type="button"
             onClick={handleLogout}
             className="w-full min-h-[40px] flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-xs font-medium text-slate-300 hover:text-white bg-slate-800/70 hover:bg-rose-600/20 hover:border-rose-500/40 border border-slate-700/70 transition-colors"
           >
             <LogOut className="w-3.5 h-3.5 shrink-0" />
-            Đăng xuất quản trị
+            Đăng xuất an toàn
           </button>
         </div>
       </aside>
@@ -267,15 +348,16 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           </div>
 
           <div className="flex items-center gap-2 shrink-0">
-            {versionInfo.hasUpdate && (
-              <Link
-                href="/settings"
-                className="hidden md:inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium bg-amber-500/15 border border-amber-500/40 text-amber-300 hover:bg-amber-500/25 whitespace-nowrap"
-              >
-                <ArrowUpCircle className="w-3.5 h-3.5 shrink-0" />
-                Có bản cập nhật GitHub
-              </Link>
-            )}
+            {versionInfo.hasUpdate &&
+              (!currentUser || currentUser.role === 'ADMIN') && (
+                <Link
+                  href="/settings"
+                  className="hidden md:inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium bg-amber-500/15 border border-amber-500/40 text-amber-300 hover:bg-amber-500/25 whitespace-nowrap"
+                >
+                  <ArrowUpCircle className="w-3.5 h-3.5 shrink-0" />
+                  Có bản cập nhật GitHub
+                </Link>
+              )}
             {criticalCount > 0 && (
               <>
                 <Link
@@ -298,12 +380,21 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                 </Link>
               </>
             )}
-            <Link
-              href="/restore"
-              className="shrink-0 whitespace-nowrap min-h-[38px] flex items-center px-3 sm:px-3.5 py-2 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors"
-            >
-              1-Click Restore
-            </Link>
+            {currentUser?.role === 'VIEWER' ? (
+              <span
+                title="Tài khoản chế độ chỉ xem (Read-Only NOC)"
+                className="shrink-0 whitespace-nowrap min-h-[38px] inline-flex items-center px-3 py-2 rounded-lg text-xs font-medium bg-slate-800/60 text-slate-400 border border-slate-800"
+              >
+                Chế độ Xem (NOC)
+              </span>
+            ) : (
+              <Link
+                href="/restore"
+                className="shrink-0 whitespace-nowrap min-h-[38px] flex items-center px-3 sm:px-3.5 py-2 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors"
+              >
+                1-Click Restore
+              </Link>
+            )}
           </div>
         </header>
 

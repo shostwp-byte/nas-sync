@@ -1,8 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { requireRole } from '@/lib/auth';
 import { compareSnapshotFilesDiff } from '@/lib/engine/explorer';
 
 export async function GET(req: NextRequest) {
   try {
+    const guard = await requireRole(['ADMIN', 'OPERATOR']);
+    if (!guard.ok) return guard.response;
+
     const sp = req.nextUrl.searchParams;
     const baseJobId = Number(sp.get('baseJobId'));
     const targetJobId = Number(sp.get('targetJobId'));
@@ -24,4 +28,3 @@ export async function GET(req: NextRequest) {
     );
   }
 }
-

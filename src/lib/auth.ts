@@ -1,9 +1,11 @@
 import { cookies } from 'next/headers';
-import type { NextRequest } from 'next/server';
+import { type NextRequest, NextResponse } from 'next/server';
+import type { UserRole } from '@/types';
 import { getDb } from './db';
 import {
   SESSION_COOKIE_NAME,
   SessionPayload,
+  normalizeUserRole,
   signSessionToken,
   verifySessionToken,
 } from './jwt-edge';
@@ -11,6 +13,7 @@ import { hashPassword, verifyPassword } from './password';
 
 export {
   SESSION_COOKIE_NAME,
+  normalizeUserRole,
   signSessionToken,
   verifySessionToken,
   hashPassword,
@@ -19,6 +22,16 @@ export {
 };
 
 export const SESSION_MAX_AGE_SECONDS = 7 * 24 * 3600;
+
+export const VALID_USER_ROLES: ReadonlySet<UserRole> = new Set<UserRole>([
+  'ADMIN',
+  'OPERATOR',
+  'VIEWER',
+]);
+
+export function isValidUserRole(val: unknown): val is UserRole {
+  return typeof val === 'string' && VALID_USER_ROLES.has(val as UserRole);
+}
 
 export function validateSessionAgainstDb(
   session: SessionPayload
@@ -37,7 +50,7 @@ export function validateSessionAgainstDb(
     return {
       userId: Number(row.id),
       username: String(row.username),
-      role: String(row.role || 'ADMIN'),
+      role: normalizeUserRole(row.role || 'ADMIN'),
       tokenVersion: dbTokenVersion,
     };
   } catch {
@@ -52,6 +65,41 @@ export async function getCurrentSession(): Promise<SessionPayload | null> {
   const session = await verifySessionToken(token);
   if (!session) return null;
   return validateSessionAgainstDb(session);
+}
+
+export async function requireRole(
+  allowedRoles: readonly UserRole[],
+  customForbiddenError?: string
+): Promise<
+  | { ok: true; session: SessionPayload }
+  | { ok: false; response: NextResponse }
+> {
+  const session = await getCurrentSession();
+  if (!session) {
+    return {
+      ok: false,
+      response: NextResponse.json(
+        { error: 'Chưa đăng nhập hoặc phiên làm việc đã hết hạn.' },
+        { status: 401 }
+      ),
+    };
+  }
+
+  if (!allowedRoles.includes(session.role)) {
+    const defaultMsg =
+      allowedRoles.length === 1 && allowedRoles[0] === 'ADMIN'
+        ? 'Thao tác này yêu cầu quyền Quản trị viên (ADMIN).'
+        : 'Tài khoản của bạn không có quyền thực hiện thao tác này.';
+    return {
+      ok: false,
+      response: NextResponse.json(
+        { error: customForbiddenError || defaultMsg },
+        { status: 403 }
+      ),
+    };
+  }
+
+  return { ok: true, session };
 }
 
 /**

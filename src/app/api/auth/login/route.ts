@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { extractRequestIp, recordAuditLog } from '@/lib/audit';
 import {
   SESSION_COOKIE_NAME,
+  normalizeUserRole,
   sessionCookieOptions,
   signSessionToken,
   verifyPassword,
@@ -11,31 +13,18 @@ import {
   getLoginLockSeconds,
   recordLoginFailure,
 } from '@/lib/login-throttle';
-
-function getClientIp(req: NextRequest): string {
-  const socketIp = req.headers.get('x-nas-client-ip')?.trim() || '';
-  if (process.env.TRUST_PROXY === 'true') {
-    const xff = req.headers.get('x-forwarded-for');
-    if (xff) {
-      const hops = xff
-        .split(',')
-        .map((s) => s.trim())
-        .filter(Boolean);
-      if (hops.length > 0) {
-        return hops[hops.length - 1];
-      }
-    }
-    const realIp = req.headers.get('x-real-ip')?.trim();
-    if (realIp) return realIp;
-  }
-  return socketIp || 'local-client';
-}
+import {
+  decryptTotpSecret,
+  verifyAndConsumeRecoveryCode,
+  verifyTotpCode,
+} from '@/lib/totp';
 
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
     const username = String(body.username || '').trim();
     const password = String(body.password || '');
+    const totpCode = String(body.totpCode ?? body.code ?? '').trim();
 
     if (!username || !password) {
       return NextResponse.json(
@@ -44,14 +33,15 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    if (username.length > 64 || password.length > 256) {
+    if (username.length > 64 || password.length > 256 || totpCode.length > 64) {
       return NextResponse.json(
-        { error: 'Tên đăng nhập hoặc mật khẩu vượt quá độ dài cho phép.' },
+        { error: 'Thông tin đăng nhập vượt quá độ dài cho phép.' },
         { status: 400 }
       );
     }
 
-    const throttleKey = `${getClientIp(req)}|${username.toLowerCase()}`;
+    const clientIp = extractRequestIp(req);
+    const throttleKey = `${clientIp}|${username.toLowerCase()}`;
     const lockSeconds = getLoginLockSeconds(throttleKey);
     if (lockSeconds > 0) {
       return NextResponse.json(
@@ -71,31 +61,109 @@ export async function POST(req: NextRequest) {
 
     if (!user || !verifyPassword(password, String(user.password_hash))) {
       recordLoginFailure(throttleKey);
+      recordAuditLog({
+        userId: user ? Number(user.id) : null,
+        username,
+        action: 'AUTH_LOGIN_FAILED',
+        resourceType: 'AUTH',
+        detail: 'Đăng nhập thất bại: Sai tên đăng nhập hoặc mật khẩu',
+        ipAddress: clientIp,
+      });
       return NextResponse.json(
         { error: 'Tên đăng nhập hoặc mật khẩu không chính xác.' },
         { status: 401 }
       );
     }
 
+    const userId = Number(user.id);
+    const dbUsername = String(user.username);
+    const role = normalizeUserRole(user.role || 'ADMIN');
+    const totpEnabled = Number(user.totp_enabled) === 1 && Boolean(user.totp_secret);
+
+    let loginDetail = `Đăng nhập thành công (${role})`;
+
+    if (totpEnabled) {
+      if (!totpCode) {
+        return NextResponse.json({
+          ok: false,
+          requiresTwoFactor: true,
+          message:
+            'Vui lòng nhập mã xác thực 2 lớp (6 số TOTP hoặc Mã khôi phục).',
+        });
+      }
+
+      let isSecondFactorValid = false;
+      try {
+        const plainSecret = decryptTotpSecret(String(user.totp_secret));
+        isSecondFactorValid = verifyTotpCode(plainSecret, totpCode);
+      } catch {
+        isSecondFactorValid = false;
+      }
+
+      if (!isSecondFactorValid) {
+        const recoveryCheck = verifyAndConsumeRecoveryCode(
+          totpCode,
+          String(user.recovery_codes_json || '[]')
+        );
+        if (recoveryCheck.matched) {
+          isSecondFactorValid = true;
+          db.prepare(
+            'UPDATE users SET recovery_codes_json = ? WHERE id = ?'
+          ).run(recoveryCheck.remainingJson, userId);
+          loginDetail = `Đăng nhập bằng Mã khôi phục 2FA (còn lại ${recoveryCheck.remainingCount} mã)`;
+        }
+      } else {
+        loginDetail = `Đăng nhập thành công qua 2FA TOTP (${role})`;
+      }
+
+      if (!isSecondFactorValid) {
+        recordLoginFailure(throttleKey);
+        recordAuditLog({
+          userId,
+          username: dbUsername,
+          action: 'AUTH_2FA_FAILED',
+          resourceType: 'AUTH',
+          resourceId: String(userId),
+          detail: 'Xác thực 2 lớp (2FA) thất bại: Mã TOTP hoặc Mã khôi phục không hợp lệ',
+          ipAddress: clientIp,
+        });
+        return NextResponse.json(
+          { error: 'Mã xác thực 2 lớp (2FA) không chính xác hoặc đã hết hạn.' },
+          { status: 401 }
+        );
+      }
+    }
+
     clearLoginFailures(throttleKey);
 
     db.prepare(`UPDATE users SET last_login_at = datetime('now') WHERE id = ?`).run(
-      Number(user.id)
+      userId
     );
 
     const token = await signSessionToken({
-      userId: Number(user.id),
-      username: String(user.username),
-      role: String(user.role || 'ADMIN'),
+      userId,
+      username: dbUsername,
+      role,
       tokenVersion: Number(user.token_version ?? 1),
+    });
+
+    recordAuditLog({
+      userId,
+      username: dbUsername,
+      action: 'AUTH_LOGIN',
+      resourceType: 'AUTH',
+      resourceId: String(userId),
+      detail: loginDetail,
+      ipAddress: clientIp,
     });
 
     const res = NextResponse.json({
       ok: true,
       user: {
-        id: Number(user.id),
-        username: String(user.username),
-        role: String(user.role),
+        id: userId,
+        username: dbUsername,
+        role,
+        totpEnabled,
       },
     });
 
@@ -109,4 +177,3 @@ export async function POST(req: NextRequest) {
     );
   }
 }
-

@@ -6,8 +6,13 @@ import { getDb } from './src/lib/db';
 import { initializeQueueAndScheduler } from './src/lib/engine/queue';
 import { refreshAllVolumes } from './src/lib/engine/volume-manager';
 import { attachSocketIO } from './src/lib/events';
-import { SESSION_COOKIE_NAME, verifySessionToken } from './src/lib/jwt-edge';
+import {
+  SESSION_COOKIE_NAME,
+  normalizeUserRole,
+  verifySessionToken,
+} from './src/lib/jwt-edge';
 import { ensureJwtSecret } from './src/lib/jwt-secret';
+import type { UserRole } from './src/types';
 
 const dev = process.env.NODE_ENV !== 'production';
 const hostname = '0.0.0.0';
@@ -69,16 +74,119 @@ function matchesSocketOrigin(origin: string, rawHostHeader: string): boolean {
   }
 }
 
-function isTokenVersionValidInDb(userId: number, tokenVersion?: number): boolean {
+interface LiveUserAuthState {
+  id: number;
+  username: string;
+  role: UserRole;
+  tokenVersion: number;
+}
+
+function getUserAuthStateFromDb(
+  userId: number,
+  tokenVersion?: number
+): LiveUserAuthState | null {
   try {
     const row = getDb()
-      .prepare('SELECT id, COALESCE(token_version, 1) AS tv FROM users WHERE id = ?')
+      .prepare(
+        'SELECT id, username, role, COALESCE(token_version, 1) AS tv FROM users WHERE id = ?'
+      )
       .get(userId);
-    if (!row) return false;
-    return Number(row.tv ?? 1) === (tokenVersion ?? 1);
+    if (!row) return null;
+    const dbTv = Number(row.tv ?? 1);
+    if (dbTv !== (tokenVersion ?? 1)) {
+      return null;
+    }
+    return {
+      id: Number(row.id),
+      username: String(row.username),
+      role: normalizeUserRole(row.role || 'ADMIN'),
+      tokenVersion: dbTv,
+    };
   } catch {
-    return false;
+    return null;
   }
+}
+
+function evaluateApiRbac(
+  method: string,
+  rawPathname: string,
+  role: UserRole
+): { allowed: boolean; error?: string } {
+  const m = method.toUpperCase();
+  const p =
+    rawPathname.length > 1 ? rawPathname.replace(/\/+$/, '') : rawPathname;
+
+  // 1. Public & Logout
+  if (
+    p === '/api/health' ||
+    p === '/api/auth/login' ||
+    p === '/api/auth/logout'
+  ) {
+    return { allowed: true };
+  }
+
+  // 2. Tài khoản cá nhân & 2FA (Mọi vai trò đã xác thực: ADMIN, OPERATOR, VIEWER)
+  if (
+    (p === '/api/auth/me' && (m === 'GET' || m === 'PATCH')) ||
+    (p === '/api/auth/2fa' && (m === 'GET' || m === 'POST'))
+  ) {
+    return { allowed: true };
+  }
+
+  // 3. Xem NOC Read-Only (ADMIN, OPERATOR, VIEWER)
+  if (
+    m === 'GET' &&
+    (p === '/api/dashboard' ||
+      p === '/api/servers' ||
+      p === '/api/volumes' ||
+      p === '/api/jobs' ||
+      /^\/api\/jobs\/[^/]+$/.test(p) ||
+      p === '/api/schedules' ||
+      p === '/api/restore')
+  ) {
+    return { allowed: true };
+  }
+
+  // 4. Quyền Vận hành viên trở lên (ADMIN + OPERATOR; chặn VIEWER)
+  if (
+    m === 'GET' &&
+    (p === '/api/explorer/download' || p === '/api/explorer/archive')
+  ) {
+    if (role === 'ADMIN' || role === 'OPERATOR') {
+      return { allowed: true };
+    }
+    return {
+      allowed: false,
+      error: 'Tài khoản VIEWER không có quyền tải xuống dữ liệu sao lưu.',
+    };
+  }
+
+  if (
+    (m === 'GET' && (p === '/api/explorer' || p === '/api/explorer/diff')) ||
+    (m === 'POST' && /^\/api\/servers\/[^/]+\/test$/.test(p)) ||
+    (m === 'POST' && p === '/api/jobs') ||
+    (m === 'PATCH' && /^\/api\/jobs\/[^/]+$/.test(p)) ||
+    (m === 'POST' && p === '/api/schedules/retention')
+  ) {
+    if (role === 'ADMIN' || role === 'OPERATOR') {
+      return { allowed: true };
+    }
+    return {
+      allowed: false,
+      error:
+        'Tài khoản VIEWER chỉ có quyền xem (Read-Only), không có quyền thực hiện thao tác này.',
+    };
+  }
+
+  // 5. Mặc định Fail-Closed: Chỉ ADMIN được phép (Users, Audit Logs, SSH Keys, Settings, Update/Rollback, Restore, CRUD Server/Volume/Schedule, Xóa Job)
+  if (role === 'ADMIN') {
+    return { allowed: true };
+  }
+
+  return {
+    allowed: false,
+    error: 'Thao tác này yêu cầu quyền Quản trị viên (ADMIN).',
+  };
 }
 
 async function bootstrap() {
@@ -99,21 +207,22 @@ async function bootstrap() {
       const qIdx = rawUrl.indexOf('?');
       const pathname = qIdx >= 0 ? rawUrl.slice(0, qIdx) : rawUrl;
 
-      const skipRevocationCheck =
+      const skipAuthAndRbacCheck =
         pathname.startsWith('/_next') ||
         pathname === '/favicon.ico' ||
         pathname === '/api/health' ||
         pathname === '/api/auth/login' ||
         pathname === '/api/auth/logout';
 
-      if (!skipRevocationCheck) {
+      if (!skipAuthAndRbacCheck) {
         const token = readCookie(req.headers.cookie, SESSION_COOKIE_NAME);
         if (token) {
           const session = await verifySessionToken(token);
-          if (
-            session &&
-            !isTokenVersionValidInDb(session.userId, session.tokenVersion)
-          ) {
+          const liveUser = session
+            ? getUserAuthStateFromDb(session.userId, session.tokenVersion)
+            : null;
+
+          if (!session || !liveUser) {
             res.setHeader(
               'Set-Cookie',
               `${SESSION_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax`
@@ -138,7 +247,34 @@ async function bootstrap() {
             } else {
               delete req.headers.cookie;
             }
+          } else if (pathname.startsWith('/api/')) {
+            const rbac = evaluateApiRbac(
+              req.method || 'GET',
+              pathname,
+              liveUser.role
+            );
+            if (!rbac.allowed) {
+              res.statusCode = 403;
+              res.setHeader('Content-Type', 'application/json; charset=utf-8');
+              res.end(
+                JSON.stringify({
+                  error:
+                    rbac.error ||
+                    'Thao tác này yêu cầu quyền Quản trị viên (ADMIN).',
+                })
+              );
+              return;
+            }
           }
+        } else if (pathname.startsWith('/api/')) {
+          res.statusCode = 401;
+          res.setHeader('Content-Type', 'application/json; charset=utf-8');
+          res.end(
+            JSON.stringify({
+              error: 'Chưa đăng nhập hoặc phiên làm việc đã hết hạn.',
+            })
+          );
+          return;
         }
       }
 
@@ -173,7 +309,7 @@ async function bootstrap() {
     const session = token ? await verifySessionToken(token) : null;
     if (
       !session ||
-      !isTokenVersionValidInDb(session.userId, session.tokenVersion)
+      !getUserAuthStateFromDb(session.userId, session.tokenVersion)
     ) {
       nextFn(new Error('unauthorized'));
       return;

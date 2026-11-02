@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import zlib from 'node:zlib';
-import { getDb } from '@/lib/db';
+import { getDb, getSetting } from '@/lib/db';
 import { emitJobLog, emitJobProgress, emitJobUpdated } from '@/lib/events';
 import { createSystemAlert } from '@/lib/notifications';
 import {
@@ -26,6 +26,7 @@ import {
   verifyRemoteWebrootSafety,
 } from './adapters/base';
 import { evaluateBackupAnomaly } from './anomaly-detector';
+import { parseSafeExcludePatterns } from './exclude-rules';
 import { assertSafe, isSafeSnapshotName } from './safe-names';
 import { verifyJobDatabasesInSandbox } from './sandbox-verifier';
 import {
@@ -179,6 +180,7 @@ function runRsyncPullDomain(params: {
   destPublicHtmlDir: string;
   linkDestPublicHtmlDir: string | null;
   excludedSubpaths?: string[];
+  customExcludes?: string[];
   onProgress: (pct: number, speedBps: number, etaSec: number) => void;
   onLog: (msg: string) => void;
 }): Promise<{
@@ -194,6 +196,7 @@ function runRsyncPullDomain(params: {
     destPublicHtmlDir,
     linkDestPublicHtmlDir,
     excludedSubpaths,
+    customExcludes,
     onProgress,
     onLog,
   } = params;
@@ -218,6 +221,14 @@ function runRsyncPullDomain(params: {
       const cleanRel = rel.replace(/^\/+|\/+$/g, '');
       if (cleanRel && !cleanRel.includes('..')) {
         args.push(`--exclude=/${cleanRel}`);
+      }
+    }
+  }
+
+  if (customExcludes && customExcludes.length > 0) {
+    for (const pattern of customExcludes) {
+      if (pattern && !pattern.startsWith('-') && !/[\r\n\0]/.test(pattern)) {
+        args.push(`--exclude=${pattern}`);
       }
     }
   }
@@ -995,6 +1006,19 @@ export async function executeBackupJob(
       } domain chính/addon, ${subCount} subdomain) trên máy chủ ${server.hostname}.`
     );
 
+    const globalExcludes = getSetting('global_exclude_patterns', '');
+    const customExcludePatterns = parseSafeExcludePatterns(
+      globalExcludes,
+      server.custom_excludes
+    );
+    if (customExcludePatterns.length > 0) {
+      appendLog(
+        `[Exclude Rules] Kích hoạt ${customExcludePatterns.length} quy tắc loại trừ Rsync tùy chỉnh (${customExcludePatterns
+          .slice(0, 5)
+          .join(', ')}${customExcludePatterns.length > 5 ? ', ...' : ''}).`
+      );
+    }
+
     if (domains.length === 0) {
       appendLog(`[Cảnh báo] Không tìm thấy domain nào trên ${server.hostname}.`);
     }
@@ -1152,6 +1176,7 @@ export async function executeBackupJob(
                 destPublicHtmlDir,
                 linkDestPublicHtmlDir,
                 excludedSubpaths: dom.excludedSubpaths,
+                customExcludes: customExcludePatterns,
                 onProgress: (subPct, speedBps, etaSec) => {
                   updateProgress({
                     progressPercent: Math.min(

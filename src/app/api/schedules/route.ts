@@ -1,5 +1,6 @@
 import cron from 'node-cron';
 import { NextRequest, NextResponse } from 'next/server';
+import { requireRole } from '@/lib/auth';
 import { getDb } from '@/lib/db';
 import { reloadCronSchedules } from '@/lib/engine/queue';
 
@@ -24,6 +25,9 @@ export async function GET() {
 
 export async function POST(req: NextRequest) {
   try {
+    const guard = await requireRole(['ADMIN']);
+    if (!guard.ok) return guard.response;
+
     const body = await req.json();
     const name = String(body.name || '').trim();
     const cronExp = String(body.cron_expression || '0 1 * * *').trim();

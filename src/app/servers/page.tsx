@@ -1,6 +1,7 @@
 'use client';
 
 import React, { useCallback, useEffect, useState } from 'react';
+import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import {
   CheckCircle2,
@@ -23,6 +24,7 @@ import type {
   ServerRecord,
   SSHKeyRecord,
   StorageVolume,
+  UserRole,
 } from '@/types';
 
 interface ExtendedServer extends ServerRecord {
@@ -37,6 +39,7 @@ export default function ServersPage() {
   const [volumes, setVolumes] = useState<StorageVolume[]>([]);
   const [sshKeys, setSshKeys] = useState<SSHKeyRecord[]>([]);
   const [loading, setLoading] = useState(true);
+  const [userRole, setUserRole] = useState<UserRole>('ADMIN');
 
   // Server Modal
   const [showServerModal, setShowServerModal] = useState(false);
@@ -52,6 +55,7 @@ export default function ServersPage() {
     bw_limit_kbps: 25600,
     is_mock: false,
     notes: '',
+    custom_excludes: '',
   });
 
   // SSH Keys Modal
@@ -87,6 +91,21 @@ export default function ServersPage() {
   }, []);
 
   useEffect(() => {
+    let active = true;
+    fetch('/api/auth/me')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (active && data?.user?.role) {
+          setUserRole(data.user.role as UserRole);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
     void loadData();
   }, [loadData, lastUpdateCounter]);
 
@@ -103,6 +122,7 @@ export default function ServersPage() {
       bw_limit_kbps: 25600,
       is_mock: false,
       notes: '',
+      custom_excludes: '',
     });
     setShowServerModal(true);
   };
@@ -120,6 +140,7 @@ export default function ServersPage() {
       bw_limit_kbps: srv.bw_limit_kbps,
       is_mock: srv.is_mock === 1,
       notes: srv.notes || '',
+      custom_excludes: srv.custom_excludes || '',
     });
     setShowServerModal(true);
   };
@@ -254,22 +275,26 @@ export default function ServersPage() {
             <RefreshCw className="w-3.5 h-3.5 shrink-0" />
             Làm mới
           </button>
-          <button
-            type="button"
-            onClick={() => setShowKeyModal(true)}
-            className="flex-1 sm:flex-initial justify-center whitespace-nowrap min-h-[40px] inline-flex items-center gap-2 px-3.5 py-2 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors"
-          >
-            <KeyRound className="w-4 h-4 text-amber-400 shrink-0" />
-            Quản lý SSH Keys ({sshKeys.length})
-          </button>
-          <button
-            type="button"
-            onClick={openAddServer}
-            className="w-full sm:w-auto flex-1 sm:flex-initial justify-center whitespace-nowrap min-h-[40px] inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold bg-blue-600 hover:bg-blue-500 text-white shadow-lg shadow-blue-600/20 transition-colors"
-          >
-            <Plus className="w-4 h-4 shrink-0" />
-            Thêm Máy chủ VPS
-          </button>
+          {userRole === 'ADMIN' && (
+            <>
+              <button
+                type="button"
+                onClick={() => setShowKeyModal(true)}
+                className="flex-1 sm:flex-initial justify-center whitespace-nowrap min-h-[40px] inline-flex items-center gap-2 px-3.5 py-2 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors"
+              >
+                <KeyRound className="w-4 h-4 text-amber-400 shrink-0" />
+                Quản lý SSH Keys ({sshKeys.length})
+              </button>
+              <button
+                type="button"
+                onClick={openAddServer}
+                className="w-full sm:w-auto flex-1 sm:flex-initial justify-center whitespace-nowrap min-h-[40px] inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold bg-blue-600 hover:bg-blue-500 text-white shadow-lg shadow-blue-600/20 transition-colors"
+              >
+                <Plus className="w-4 h-4 shrink-0" />
+                Thêm Máy chủ VPS
+              </button>
+            </>
+          )}
         </div>
       </div>
 
@@ -386,38 +411,50 @@ export default function ServersPage() {
                 </div>
 
                 <div className="pt-3 border-t border-slate-800/80 flex flex-wrap items-center gap-2 text-xs">
-                  <button
-                    type="button"
-                    onClick={() => void handleTestDiscovery(srv)}
-                    className="min-h-[40px] inline-flex items-center gap-1.5 px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-cyan-300 border border-slate-700 transition-colors"
-                  >
-                    <SearchCode className="w-3.5 h-3.5 shrink-0" />
-                    Quét thử
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => void handleStartBackup(srv)}
-                    className="min-h-[40px] inline-flex items-center gap-1.5 px-3 py-2 rounded-lg bg-emerald-600/20 hover:bg-emerald-600 text-emerald-300 hover:text-white border border-emerald-500/30 font-medium transition-colors"
-                  >
-                    <Play className="w-3.5 h-3.5 fill-current shrink-0" />
-                    Sao lưu ngay
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => openEditServer(srv)}
-                    className="min-h-[40px] inline-flex items-center gap-1.5 px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors"
-                  >
-                    <Edit3 className="w-3.5 h-3.5 shrink-0" />
-                    Sửa
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => void deleteServer(srv)}
-                    aria-label={`Xóa máy chủ ${srv.hostname}`}
-                    className="ml-auto min-h-[40px] min-w-[40px] px-2.5 py-2 inline-flex items-center justify-center rounded-lg bg-slate-800 hover:bg-rose-600/30 text-rose-400 border border-slate-700/80 transition-colors"
-                  >
-                    <Trash2 className="w-4 h-4" />
-                  </button>
+                  {userRole === 'VIEWER' ? (
+                    <span className="text-[11px] text-slate-500 italic py-1">
+                      Chế độ Xem giám sát NOC (Read-Only)
+                    </span>
+                  ) : (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => void handleTestDiscovery(srv)}
+                        className="min-h-[40px] inline-flex items-center gap-1.5 px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-cyan-300 border border-slate-700 transition-colors"
+                      >
+                        <SearchCode className="w-3.5 h-3.5 shrink-0" />
+                        Quét thử
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void handleStartBackup(srv)}
+                        className="min-h-[40px] inline-flex items-center gap-1.5 px-3 py-2 rounded-lg bg-emerald-600/20 hover:bg-emerald-600 text-emerald-300 hover:text-white border border-emerald-500/30 font-medium transition-colors"
+                      >
+                        <Play className="w-3.5 h-3.5 fill-current shrink-0" />
+                        Sao lưu ngay
+                      </button>
+                    </>
+                  )}
+                  {userRole === 'ADMIN' && (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => openEditServer(srv)}
+                        className="min-h-[40px] inline-flex items-center gap-1.5 px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors"
+                      >
+                        <Edit3 className="w-3.5 h-3.5 shrink-0" />
+                        Sửa
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void deleteServer(srv)}
+                        aria-label={`Xóa máy chủ ${srv.hostname}`}
+                        className="ml-auto min-h-[40px] min-w-[40px] px-2.5 py-2 inline-flex items-center justify-center rounded-lg bg-slate-800 hover:bg-rose-600/30 text-rose-400 border border-slate-700/80 transition-colors"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    </>
+                  )}
                 </div>
               </div>
             ))}
@@ -514,37 +551,51 @@ export default function ServersPage() {
 
                     <td className="p-4">
                       <div className="flex items-center justify-end gap-2">
-                        <button
-                          type="button"
-                          onClick={() => void handleTestDiscovery(srv)}
-                          title="Kiểm tra kết nối SSH & Quét thử danh sách Domain/DB"
-                          className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-cyan-300 border border-slate-700"
-                        >
-                          <SearchCode className="w-3.5 h-3.5" />
-                          Quét thử
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => void handleStartBackup(srv)}
-                          className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-emerald-600/20 hover:bg-emerald-600 text-emerald-300 hover:text-white border border-emerald-500/30 font-medium transition-colors"
-                        >
-                          <Play className="w-3.5 h-3.5 fill-current" />
-                          Backup ngay
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => openEditServer(srv)}
-                          className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300"
-                        >
-                          <Edit3 className="w-3.5 h-3.5" />
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => void deleteServer(srv)}
-                          className="p-1.5 rounded-lg bg-slate-800 hover:bg-rose-600/30 text-rose-400"
-                        >
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </button>
+                        {userRole === 'VIEWER' ? (
+                          <span className="text-[11px] text-slate-500 italic">
+                            Chỉ xem (NOC)
+                          </span>
+                        ) : (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() => void handleTestDiscovery(srv)}
+                              title="Kiểm tra kết nối SSH & Quét thử danh sách Domain/DB"
+                              className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-cyan-300 border border-slate-700"
+                            >
+                              <SearchCode className="w-3.5 h-3.5" />
+                              Quét thử
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => void handleStartBackup(srv)}
+                              className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-emerald-600/20 hover:bg-emerald-600 text-emerald-300 hover:text-white border border-emerald-500/30 font-medium transition-colors"
+                            >
+                              <Play className="w-3.5 h-3.5 fill-current" />
+                              Backup ngay
+                            </button>
+                          </>
+                        )}
+                        {userRole === 'ADMIN' && (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() => openEditServer(srv)}
+                              title="Chỉnh sửa cấu hình máy chủ"
+                              className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300"
+                            >
+                              <Edit3 className="w-3.5 h-3.5" />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => void deleteServer(srv)}
+                              title="Xóa máy chủ"
+                              className="p-1.5 rounded-lg bg-slate-800 hover:bg-rose-600/30 text-rose-400"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </>
+                        )}
                       </div>
                     </td>
                   </tr>
@@ -719,6 +770,33 @@ export default function ServersPage() {
                   Chế độ <strong>Demo Mô phỏng (Mock Adapter)</strong> — Dùng để chạy thử luồng Backup/Restore/Diff trên máy Local không cần SSH thật.
                 </span>
               </label>
+
+              <div>
+                <label className="block text-slate-300 mb-1 font-medium">
+                  Mẫu loại trừ file riêng cho VPS này (Tùy chọn — mỗi dòng 1 mẫu)
+                </label>
+                <textarea
+                  rows={3}
+                  value={form.custom_excludes}
+                  onChange={(e) =>
+                    setForm({ ...form, custom_excludes: e.target.value })
+                  }
+                  placeholder={
+                    'Ví dụ:\nwp-content/uploads/wc-logs/\nbackup-*.zip'
+                  }
+                  className="w-full bg-slate-950 border border-slate-700 focus:border-blue-500 rounded-lg px-3 py-2 text-white font-mono text-xs outline-none"
+                />
+                <p className="text-[11px] text-slate-500 mt-1 leading-relaxed">
+                  Các mẫu đường dẫn tại đây sẽ được tự động gộp chung với{' '}
+                  <Link
+                    href="/settings"
+                    className="text-cyan-400 hover:underline"
+                  >
+                    Bộ lọc loại trừ toàn cục (Global Exclude Rules)
+                  </Link>{' '}
+                  khi chạy Rsync cho VPS này.
+                </p>
+              </div>
 
               <div>
                 <label className="block text-slate-300 mb-1 font-medium">

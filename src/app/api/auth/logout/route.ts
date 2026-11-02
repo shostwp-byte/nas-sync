@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { recordAuditLog } from '@/lib/audit';
 import {
   SESSION_COOKIE_NAME,
   getCurrentSession,
@@ -15,6 +16,14 @@ export async function POST(req: NextRequest) {
           'UPDATE users SET token_version = COALESCE(token_version, 1) + 1 WHERE id = ?'
         )
         .run(session.userId);
+      recordAuditLog({
+        session,
+        action: 'AUTH_LOGOUT',
+        resourceType: 'AUTH',
+        resourceId: String(session.userId),
+        detail: 'Đăng xuất khỏi hệ thống',
+        req,
+      });
     }
   } catch {
     // Đảm bảo vẫn xóa cookie kể cả khi không đọc được phiên cũ

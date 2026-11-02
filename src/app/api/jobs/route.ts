@@ -1,8 +1,13 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { recordAuditLog } from '@/lib/audit';
+import { requireRole } from '@/lib/auth';
 import { getDb } from '@/lib/db';
 import { enqueueServerBackup } from '@/lib/engine/queue';
 
 export async function GET(req: NextRequest) {
+  const guard = await requireRole(['ADMIN', 'OPERATOR', 'VIEWER']);
+  if (!guard.ok) return guard.response;
+
   const sp = req.nextUrl.searchParams;
   const serverId = sp.get('serverId');
   const status = sp.get('status');
@@ -54,6 +59,9 @@ export async function GET(req: NextRequest) {
 
 export async function POST(req: NextRequest) {
   try {
+    const guard = await requireRole(['ADMIN', 'OPERATOR']);
+    if (!guard.ok) return guard.response;
+
     const body = await req.json();
     const serverId = Number(body.serverId);
     const verifyDb = body.verifyDb !== false;
@@ -66,6 +74,21 @@ export async function POST(req: NextRequest) {
     }
 
     const jobId = await enqueueServerBackup({ serverId, verifyDb });
+    const srv = getDb()
+      .prepare('SELECT hostname FROM servers WHERE id = ?')
+      .get(serverId);
+
+    recordAuditLog({
+      session: guard.session,
+      action: 'JOB_BACKUP_ENQUEUE',
+      resourceType: 'JOB',
+      resourceId: String(jobId),
+      detail: `Kích hoạt sao lưu thủ công máy chủ "${
+        srv?.hostname || `Server #${serverId}`
+      }"`,
+      req,
+    });
+
     return NextResponse.json({ ok: true, jobId });
   } catch (err) {
     return NextResponse.json(
@@ -74,4 +97,3 @@ export async function POST(req: NextRequest) {
     );
   }
 }
-

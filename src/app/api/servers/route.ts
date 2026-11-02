@@ -1,10 +1,16 @@
 import fs from 'node:fs';
 import { NextRequest, NextResponse } from 'next/server';
+import { recordAuditLog } from '@/lib/audit';
+import { requireRole } from '@/lib/auth';
 import { getDb } from '@/lib/db';
+import { validateExcludePatternsInput } from '@/lib/engine/exclude-rules';
 import { validateServerConnectionFields } from '@/lib/engine/safe-names';
 import { resolveValidatedSshKeyPath } from '@/lib/ssh';
 
 export async function GET() {
+  const guard = await requireRole(['ADMIN', 'OPERATOR', 'VIEWER']);
+  if (!guard.ok) return guard.response;
+
   const servers = getDb()
     .prepare(
       `SELECT
@@ -24,6 +30,9 @@ export async function GET() {
 
 export async function POST(req: NextRequest) {
   try {
+    const guard = await requireRole(['ADMIN']);
+    if (!guard.ok) return guard.response;
+
     const body = await req.json();
     const hostname = String(body.hostname || '').trim();
     const ipAddress = String(body.ip_address || '').trim();
@@ -34,6 +43,8 @@ export async function POST(req: NextRequest) {
     const bwLimit = Number(body.bw_limit_kbps ?? 25600);
     const isMock = body.is_mock ? 1 : 0;
     const notes = String(body.notes || '');
+    const rawCustomExcludes =
+      body.custom_excludes !== undefined ? String(body.custom_excludes) : '';
 
     if (!hostname || !ipAddress) {
       return NextResponse.json(
@@ -54,6 +65,14 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: invalidField }, { status: 400 });
     }
 
+    const excludeCheck = validateExcludePatternsInput(rawCustomExcludes);
+    if (!excludeCheck.ok) {
+      return NextResponse.json(
+        { error: excludeCheck.error || 'Quy tắc loại trừ không hợp lệ.' },
+        { status: 400 }
+      );
+    }
+
     let sshKeyPath = '';
     if (rawSshKeyPath) {
       try {
@@ -66,7 +85,10 @@ export async function POST(req: NextRequest) {
       }
       if (!fs.existsSync(sshKeyPath)) {
         return NextResponse.json(
-          { error: 'Không tìm thấy tệp khóa SSH được chỉ định trong thư mục SSH Keys.' },
+          {
+            error:
+              'Không tìm thấy tệp khóa SSH được chỉ định trong thư mục SSH Keys.',
+          },
           { status: 400 }
         );
       }
@@ -89,8 +111,8 @@ export async function POST(req: NextRequest) {
     const res = db
       .prepare(
         `INSERT INTO servers
-         (hostname, ip_address, ssh_port, ssh_user, ssh_key_path, panel_type, assigned_volume_id, bw_limit_kbps, status, is_mock, notes)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ONLINE', ?, ?)`
+         (hostname, ip_address, ssh_port, ssh_user, ssh_key_path, panel_type, assigned_volume_id, bw_limit_kbps, status, is_mock, notes, custom_excludes)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ONLINE', ?, ?, ?)`
       )
       .run(
         hostname,
@@ -102,12 +124,24 @@ export async function POST(req: NextRequest) {
         assignedVolId,
         bwLimit,
         isMock,
-        notes
+        notes,
+        excludeCheck.normalized
       );
+
+    const serverId = Number(res.lastInsertRowid);
+
+    recordAuditLog({
+      session: guard.session,
+      action: 'SERVER_CREATE',
+      resourceType: 'SERVER',
+      resourceId: String(serverId),
+      detail: `Thêm máy chủ VPS "${hostname}" (${ipAddress}:${sshPort} - ${panelType})`,
+      req,
+    });
 
     return NextResponse.json({
       ok: true,
-      serverId: Number(res.lastInsertRowid),
+      serverId,
     });
   } catch (err) {
     return NextResponse.json(
@@ -116,4 +150,3 @@ export async function POST(req: NextRequest) {
     );
   }
 }
-

@@ -1,6 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { NextRequest, NextResponse } from 'next/server';
+import { recordAuditLog } from '@/lib/audit';
+import { requireRole } from '@/lib/auth';
 import { getDb } from '@/lib/db';
 import { resolveSafeSnapshotRoot } from '@/lib/engine/explorer';
 import {
@@ -110,6 +112,9 @@ export async function PATCH(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
+    const guard = await requireRole(['ADMIN', 'OPERATOR']);
+    if (!guard.ok) return guard.response;
+
     const { id } = await params;
     const jobId = Number(id);
     const body = await req.json();
@@ -212,10 +217,13 @@ export async function PATCH(
 }
 
 export async function DELETE(
-  _req: NextRequest,
+  req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
+    const guard = await requireRole(['ADMIN']);
+    if (!guard.ok) return guard.response;
+
     const { id } = await params;
     const jobId = Number(id);
     const db = getDb();
@@ -294,6 +302,18 @@ export async function DELETE(
     }
 
     db.prepare('DELETE FROM backup_jobs WHERE id = ?').run(jobId);
+
+    recordAuditLog({
+      session: guard.session,
+      action: 'JOB_DELETE',
+      resourceType: 'JOB',
+      resourceId: String(jobId),
+      detail: `Xóa bản ghi tiến trình / Snapshot #${jobId} (${
+        row.hostname || 'unknown'
+      }@${row.snapshot_name || ''})`,
+      req,
+    });
+
     return NextResponse.json({ ok: true });
   } catch (err) {
     return NextResponse.json(

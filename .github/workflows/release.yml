@@ -29,10 +29,11 @@ jobs:
           npm run typecheck
           npm run build
 
-      - name: Package Synology ZIP & TAR.GZ bundles
+      - name: Package Synology ZIP, TAR.GZ & Prebuilt SHA-256 bundles
         run: |
           sudo apt-get update && sudo apt-get install -y zip
           npm run pack:synology
+          node scripts/package-prebuilt.mjs
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
@@ -41,4 +42,5 @@ jobs:
           files: |
             release/nas-sync-synology.zip
             release/nas-sync-synology.tar.gz
-
+            release/nas-sync-prebuilt.tar.gz
+            release/nas-sync-prebuilt.tar.gz.sha256

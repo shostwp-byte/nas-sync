@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { requireRole } from '@/lib/auth';
 import {
   listSnapshotDirectory,
   readSnapshotFilePreview,
@@ -6,6 +7,9 @@ import {
 
 export async function GET(req: NextRequest) {
   try {
+    const guard = await requireRole(['ADMIN', 'OPERATOR']);
+    if (!guard.ok) return guard.response;
+
     const sp = req.nextUrl.searchParams;
     const jobId = Number(sp.get('jobId'));
     const relPath = sp.get('path') || '';
@@ -32,4 +36,3 @@ export async function GET(req: NextRequest) {
     );
   }
 }
-

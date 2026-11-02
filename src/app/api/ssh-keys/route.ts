@@ -1,6 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { NextRequest, NextResponse } from 'next/server';
+import { recordAuditLog } from '@/lib/audit';
+import { requireRole } from '@/lib/auth';
 import { getDb, getSshKeysDir } from '@/lib/db';
 import {
   execLocalCommand,
@@ -19,6 +21,9 @@ const VALID_SSH_PUBKEY_PREFIXES = [
 ];
 
 export async function GET() {
+  const guard = await requireRole(['ADMIN']);
+  if (!guard.ok) return guard.response;
+
   const keys = getDb()
     .prepare('SELECT * FROM ssh_keys ORDER BY id DESC')
     .all();
@@ -27,6 +32,9 @@ export async function GET() {
 
 export async function POST(req: NextRequest) {
   try {
+    const guard = await requireRole(['ADMIN']);
+    if (!guard.ok) return guard.response;
+
     const body = await req.json();
     const mode = String(body.mode || 'generate');
     const rawName = String(body.name || '').trim();
@@ -181,6 +189,20 @@ export async function POST(req: NextRequest) {
         generated.fingerprint
       );
     }
+
+    recordAuditLog({
+      session: guard.session,
+      action: 'SSH_KEY_CREATE',
+      resourceType: 'SSH_KEY',
+      resourceId: safeName,
+      detail:
+        mode === 'import'
+          ? `Nhập khóa SSH "${safeName}" (imported)`
+          : `Sinh cặp khóa SSH mới "${safeName}" (${
+              body.keyType === 'rsa' ? 'rsa' : 'ed25519'
+            })`,
+      req,
+    });
 
     const keys = db
       .prepare('SELECT * FROM ssh_keys ORDER BY id DESC')

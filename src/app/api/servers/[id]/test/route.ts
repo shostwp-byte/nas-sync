@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { requireRole } from '@/lib/auth';
 import { getDb } from '@/lib/db';
 import { getPanelAdapter } from '@/lib/engine/adapters';
 import { testSshConnection } from '@/lib/ssh';
@@ -9,6 +10,9 @@ export async function POST(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
+    const guard = await requireRole(['ADMIN', 'OPERATOR']);
+    if (!guard.ok) return guard.response;
+
     const { id } = await params;
     const db = getDb();
     const server = db
@@ -57,4 +61,3 @@ export async function POST(
     );
   }
 }
-

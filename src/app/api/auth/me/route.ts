@@ -1,8 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { recordAuditLog } from '@/lib/audit';
 import {
   SESSION_COOKIE_NAME,
   getCurrentSession,
   hashPassword,
+  normalizeUserRole,
   sessionCookieOptions,
   signSessionToken,
   verifyPassword,
@@ -15,11 +17,16 @@ export async function GET() {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
 
+  const row = getDb()
+    .prepare('SELECT totp_enabled FROM users WHERE id = ?')
+    .get(session.userId);
+
   return NextResponse.json({
     user: {
       userId: session.userId,
       username: session.username,
       role: session.role,
+      totpEnabled: Boolean(row?.totp_enabled),
     },
   });
 }
@@ -65,7 +72,7 @@ export async function PATCH(req: NextRequest) {
       return NextResponse.json(
         {
           error:
-            'Không tìm thấy tài khoản quản trị trong CSDL. Vui lòng đăng xuất và đăng nhập lại.',
+            'Không tìm thấy tài khoản trong CSDL. Vui lòng đăng xuất và đăng nhập lại.',
         },
         { status: 401 }
       );
@@ -143,6 +150,7 @@ export async function PATCH(req: NextRequest) {
     const nextHash = isChangingPassword
       ? hashPassword(rawNewPassword)
       : storedHash;
+    const userRole = normalizeUserRole(user.role || 'ADMIN');
 
     db.prepare(
       'UPDATE users SET username = ?, password_hash = ?, token_version = ? WHERE id = ?'
@@ -151,7 +159,7 @@ export async function PATCH(req: NextRequest) {
     const freshToken = await signSessionToken({
       userId,
       username: targetUsername,
-      role: String(user.role || 'ADMIN'),
+      role: userRole,
       tokenVersion: nextTokenVersion,
     });
 
@@ -162,6 +170,16 @@ export async function PATCH(req: NextRequest) {
     if (isChangingPassword) {
       changedParts.push('Mật khẩu mới');
     }
+
+    recordAuditLog({
+      userId,
+      username: targetUsername,
+      action: 'USER_SELF_UPDATE',
+      resourceType: 'USER',
+      resourceId: String(userId),
+      detail: `Cập nhật thông tin cá nhân (${changedParts.join(' & ')})`,
+      req,
+    });
 
     const res = NextResponse.json({
       ok: true,

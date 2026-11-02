@@ -1,5 +1,7 @@
 export type PanelType = 'DIRECTADMIN' | 'CPANEL' | 'PLESK' | 'AAPANEL';
 
+export type UserRole = 'ADMIN' | 'OPERATOR' | 'VIEWER';
+
 export type VolumeStatus = 'ACTIVE' | 'FULL' | 'MAINTENANCE';
 
 export type ServerStatus = 'ONLINE' | 'OFFLINE' | 'BACKUP_RUNNING' | 'ERROR';
@@ -63,6 +65,28 @@ export interface ServerRecord {
   is_mock: number;
   last_connected_at: string | null;
   notes: string;
+  custom_excludes?: string;
+  created_at: string;
+}
+
+export interface UserRecord {
+  id: number;
+  username: string;
+  role: UserRole;
+  totp_enabled: number;
+  last_login_at: string | null;
+  created_at: string;
+}
+
+export interface AuditLogRecord {
+  id: number;
+  user_id: number | null;
+  username: string;
+  action: string;
+  resource_type: string;
+  resource_id: string | null;
+  detail: string;
+  ip_address: string;
   created_at: string;
 }
 
@@ -222,6 +246,7 @@ export interface RestoreRequestPayload {
   targetWebrootOverride?: string;
   selectedDatabases?: string[];
   targetDbMap?: Record<string, string>;
+  autoPatchConfig?: boolean;
 }
 
 export interface SystemAlert {
@@ -264,6 +289,10 @@ export interface SystemUpdateInfo {
   updateInProgress: boolean;
   canUpdateNow: boolean;
   blockingReason: string | null;
+  prebuiltAvailable?: boolean;
+  canRollback?: boolean;
+  rollbackVersion?: string | null;
+  rollbackUpdatedAt?: string | null;
   checkedAt: string;
 }
 

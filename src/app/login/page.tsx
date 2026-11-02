@@ -1,14 +1,22 @@
 'use client';
 
 import React, { useState } from 'react';
-import { useRouter } from 'next/navigation';
-import { Eye, EyeOff, GitBranch, Lock, ShieldCheck, User } from 'lucide-react';
+import {
+  Eye,
+  EyeOff,
+  GitBranch,
+  KeyRound,
+  Lock,
+  ShieldCheck,
+  User,
+} from 'lucide-react';
 
 export default function LoginPage() {
-  const router = useRouter();
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
+  const [requires2fa, setRequires2fa] = useState(false);
+  const [totpCode, setTotpCode] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
@@ -17,18 +25,38 @@ export default function LoginPage() {
     setLoading(true);
     setError('');
     try {
+      const payload: {
+        username: string;
+        password: string;
+        totpCode?: string;
+      } = {
+        username,
+        password,
+      };
+      if (requires2fa) {
+        payload.totpCode = totpCode.trim();
+      }
+
       const resp = await fetch('/api/auth/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username, password }),
+        body: JSON.stringify(payload),
       });
-      const data = await resp.json();
-      if (!resp.ok) {
+      const data = await resp.json().catch(() => ({}));
+
+      if (resp.ok && data.requiresTwoFactor === true) {
+        setRequires2fa(true);
+        setTotpCode('');
+        setError('');
+        return;
+      }
+
+      if (!resp.ok || data.ok === false) {
         setError(data.error || 'Đăng nhập thất bại.');
         return;
       }
-      router.push('/');
-      router.refresh();
+
+      window.location.href = '/';
     } catch (err) {
       setError((err as Error).message);
     } finally {
@@ -66,61 +94,122 @@ export default function LoginPage() {
         )}
 
         <form onSubmit={handleSubmit} className="space-y-4">
-          <div>
-            <label className="block text-xs font-medium text-slate-300 mb-1.5">
-              Tài khoản Quản trị
-            </label>
-            <div className="relative">
-              <User className="w-4 h-4 text-slate-500 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
-              <input
-                type="text"
-                autoComplete="username"
-                value={username}
-                onChange={(e) => setUsername(e.target.value)}
-                required
-                className="w-full min-h-[44px] bg-slate-950 border border-slate-800 focus:border-blue-500 rounded-lg pl-10 pr-3.5 py-2.5 text-sm text-white outline-none transition-colors"
-                placeholder="Nhập tên đăng nhập..."
-              />
-            </div>
-          </div>
+          {!requires2fa ? (
+            <>
+              <div>
+                <label className="block text-xs font-medium text-slate-300 mb-1.5">
+                  Tài khoản Quản trị / Vận hành
+                </label>
+                <div className="relative">
+                  <User className="w-4 h-4 text-slate-500 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                  <input
+                    type="text"
+                    autoComplete="username"
+                    value={username}
+                    onChange={(e) => setUsername(e.target.value)}
+                    required
+                    className="w-full min-h-[44px] bg-slate-950 border border-slate-800 focus:border-blue-500 rounded-lg pl-10 pr-3.5 py-2.5 text-sm text-white outline-none transition-colors"
+                    placeholder="Nhập tên đăng nhập..."
+                  />
+                </div>
+              </div>
 
-          <div>
-            <label className="block text-xs font-medium text-slate-300 mb-1.5">
-              Mật khẩu
-            </label>
-            <div className="relative">
-              <Lock className="w-4 h-4 text-slate-500 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
-              <input
-                type={showPassword ? 'text' : 'password'}
-                autoComplete="current-password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                required
-                className="w-full min-h-[44px] bg-slate-950 border border-slate-800 focus:border-blue-500 rounded-lg pl-10 pr-11 py-2.5 text-sm text-white outline-none transition-colors"
-                placeholder="Nhập mật khẩu quản trị..."
-              />
+              <div>
+                <label className="block text-xs font-medium text-slate-300 mb-1.5">
+                  Mật khẩu
+                </label>
+                <div className="relative">
+                  <Lock className="w-4 h-4 text-slate-500 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                  <input
+                    type={showPassword ? 'text' : 'password'}
+                    autoComplete="current-password"
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    required
+                    className="w-full min-h-[44px] bg-slate-950 border border-slate-800 focus:border-blue-500 rounded-lg pl-10 pr-11 py-2.5 text-sm text-white outline-none transition-colors"
+                    placeholder="Nhập mật khẩu..."
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowPassword((prev) => !prev)}
+                    aria-label={showPassword ? 'Ẩn mật khẩu' : 'Hiện mật khẩu'}
+                    className="h-10 w-10 inline-flex items-center justify-center rounded-md text-slate-400 hover:text-white absolute right-1 top-1/2 -translate-y-1/2 transition-colors"
+                  >
+                    {showPassword ? (
+                      <EyeOff className="w-4 h-4" />
+                    ) : (
+                      <Eye className="w-4 h-4" />
+                    )}
+                  </button>
+                </div>
+              </div>
+
+              <button
+                type="submit"
+                disabled={loading}
+                className="w-full min-h-[44px] py-2.5 px-4 rounded-lg bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white font-semibold text-sm shadow-lg shadow-blue-600/20 transition-all"
+              >
+                {loading ? 'Đang xác thực...' : 'Đăng nhập Hệ thống'}
+              </button>
+            </>
+          ) : (
+            <div className="space-y-4">
+              <div className="p-3.5 rounded-xl bg-blue-500/10 border border-blue-500/30 text-xs text-slate-200 space-y-1.5">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="inline-flex items-center gap-1.5 font-semibold text-cyan-300">
+                    <KeyRound className="w-3.5 h-3.5 shrink-0" />
+                    <span>Xác thực Bảo mật 2 lớp (2FA)</span>
+                  </span>
+                  <span className="font-mono text-[11px] px-2 py-0.5 rounded bg-slate-950 border border-slate-800 text-slate-300 truncate max-w-[140px]">
+                    {username}
+                  </span>
+                </div>
+                <p className="text-slate-300 leading-relaxed break-words">
+                  Tài khoản đã bật Bảo mật 2 lớp (2FA). Nhập mã 6 chữ số từ ứng
+                  dụng Authenticator (hoặc Mã khôi phục dự phòng{' '}
+                  <code className="font-mono text-amber-300">XXXX-XXXX</code>).
+                </p>
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-300 mb-1.5 text-center">
+                  Mã TOTP 6 chữ số hoặc Mã khôi phục dự phòng
+                </label>
+                <input
+                  type="text"
+                  inputMode="text"
+                  autoComplete="one-time-code"
+                  maxLength={16}
+                  autoFocus
+                  required
+                  value={totpCode}
+                  onChange={(e) => setTotpCode(e.target.value)}
+                  placeholder="123456 / XXXX-XXXX"
+                  className="w-full min-h-[48px] bg-slate-950 border border-blue-500/50 focus:border-blue-400 rounded-xl px-4 py-2.5 text-center text-base sm:text-lg font-mono tracking-widest text-white outline-none transition-colors"
+                />
+              </div>
+
+              <button
+                type="submit"
+                disabled={loading || !totpCode.trim()}
+                className="w-full min-h-[44px] py-2.5 px-4 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-semibold text-sm shadow-lg shadow-emerald-600/20 transition-all"
+              >
+                {loading ? 'Đang kiểm tra mã 2FA...' : 'Xác nhận Mã 2FA'}
+              </button>
+
               <button
                 type="button"
-                onClick={() => setShowPassword((prev) => !prev)}
-                aria-label={showPassword ? 'Ẩn mật khẩu' : 'Hiện mật khẩu'}
-                className="h-10 w-10 inline-flex items-center justify-center rounded-md text-slate-400 hover:text-white absolute right-1 top-1/2 -translate-y-1/2 transition-colors"
+                onClick={() => {
+                  setRequires2fa(false);
+                  setTotpCode('');
+                  setError('');
+                }}
+                className="w-full min-h-[40px] inline-flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg text-xs font-medium text-slate-400 hover:text-white hover:bg-slate-800/70 transition-colors"
               >
-                {showPassword ? (
-                  <EyeOff className="w-4 h-4" />
-                ) : (
-                  <Eye className="w-4 h-4" />
-                )}
+                <span>← Quay lại đổi tài khoản</span>
               </button>
             </div>
-          </div>
-
-          <button
-            type="submit"
-            disabled={loading}
-            className="w-full min-h-[44px] py-2.5 px-4 rounded-lg bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white font-semibold text-sm shadow-lg shadow-blue-600/20 transition-all"
-          >
-            {loading ? 'Đang xác thực...' : 'Đăng nhập Hệ thống'}
-          </button>
+          )}
         </form>
 
         <div className="mt-6 pt-5 border-t border-slate-800/80 flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-500">

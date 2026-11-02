@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { NextRequest, NextResponse } from 'next/server';
+import { requireRole } from '@/lib/auth';
 import { getDataDir, getDb, getSshKeysDir } from '@/lib/db';
 import { refreshAllVolumes } from '@/lib/engine/volume-manager';
 
@@ -130,6 +131,9 @@ export async function GET(req: NextRequest) {
 
 export async function POST(req: NextRequest) {
   try {
+    const guard = await requireRole(['ADMIN']);
+    if (!guard.ok) return guard.response;
+
     const body = await req.json();
     const name = String(body.name || '').trim();
     const rawMountPath = String(body.mount_path || '').trim();

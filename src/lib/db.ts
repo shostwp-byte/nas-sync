@@ -108,7 +108,23 @@ function initializeSchema(db: SqliteDatabase) {
       password_hash TEXT NOT NULL,
       role TEXT NOT NULL DEFAULT 'ADMIN',
       token_version INTEGER NOT NULL DEFAULT 1,
+      totp_secret TEXT,
+      totp_pending_secret TEXT,
+      totp_enabled INTEGER NOT NULL DEFAULT 0,
+      recovery_codes_json TEXT NOT NULL DEFAULT '[]',
       last_login_at TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS audit_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER,
+      username TEXT NOT NULL,
+      action TEXT NOT NULL,
+      resource_type TEXT NOT NULL DEFAULT 'SYSTEM',
+      resource_id TEXT,
+      detail TEXT NOT NULL DEFAULT '',
+      ip_address TEXT NOT NULL DEFAULT '',
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
@@ -153,6 +169,7 @@ function initializeSchema(db: SqliteDatabase) {
       is_mock INTEGER NOT NULL DEFAULT 0,
       last_connected_at TEXT,
       notes TEXT NOT NULL DEFAULT '',
+      custom_excludes TEXT NOT NULL DEFAULT '',
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
@@ -243,18 +260,31 @@ function initializeSchema(db: SqliteDatabase) {
     CREATE INDEX IF NOT EXISTS idx_items_job ON backup_items(job_id);
     CREATE INDEX IF NOT EXISTS idx_items_server_domain ON backup_items(server_id, domain_name);
     CREATE INDEX IF NOT EXISTS idx_alerts_created ON system_alerts(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs(created_at DESC, id DESC);
   `);
 
-  // Tự động nâng cấp lược đồ CSDL an toàn cho các bản cài đặt từ v1.0.0 / v1.1.x
+  // Tự động nâng cấp lược đồ CSDL an toàn cho các bản cài đặt từ v1.0.0 / v1.1.x / v1.2.x
   try {
-    const userCols = db.prepare('PRAGMA table_info(users)').all();
-    const hasTokenVersion = userCols.some(
-      (col) => String(col.name) === 'token_version'
+    const userCols = new Set(
+      db
+        .prepare('PRAGMA table_info(users)')
+        .all()
+        .map((col) => String(col.name))
     );
-    if (!hasTokenVersion) {
-      db.exec(
-        'ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 1'
-      );
+    const userColumnMigrations: Array<[string, string]> = [
+      ['token_version', 'ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 1'],
+      ['totp_secret', 'ALTER TABLE users ADD COLUMN totp_secret TEXT'],
+      ['totp_pending_secret', 'ALTER TABLE users ADD COLUMN totp_pending_secret TEXT'],
+      ['totp_enabled', 'ALTER TABLE users ADD COLUMN totp_enabled INTEGER NOT NULL DEFAULT 0'],
+      [
+        'recovery_codes_json',
+        "ALTER TABLE users ADD COLUMN recovery_codes_json TEXT NOT NULL DEFAULT '[]'",
+      ],
+    ];
+    for (const [colName, alterSql] of userColumnMigrations) {
+      if (!userCols.has(colName)) {
+        db.exec(alterSql);
+      }
     }
   } catch {
     // Bỏ qua nếu cột đã tồn tại
@@ -263,6 +293,7 @@ function initializeSchema(db: SqliteDatabase) {
   const migrations = [
     `ALTER TABLE backup_items ADD COLUMN is_subdomain INTEGER NOT NULL DEFAULT 0`,
     `ALTER TABLE backup_items ADD COLUMN parent_domain TEXT`,
+    `ALTER TABLE servers ADD COLUMN custom_excludes TEXT NOT NULL DEFAULT ''`,
   ];
   for (const sql of migrations) {
     try {
@@ -295,7 +326,7 @@ function initializeSchema(db: SqliteDatabase) {
 }
 
 function seedDefaults(db: SqliteDatabase) {
-  // 1. Seed Admin User (hỗ trợ đặt lại mật khẩu khẩn cấp qua biến môi trường FORCE_RESET_ADMIN_PASSWORD=true)
+  // 1. Seed Admin User (hỗ trợ đặt lại mật khẩu / 2FA khẩn cấp qua biến môi trường FORCE_RESET_ADMIN_PASSWORD=true & FORCE_RESET_ADMIN_2FA=true)
   const adminUser = process.env.ADMIN_USERNAME || 'admin';
   const adminPass = process.env.ADMIN_PASSWORD || 'nas-sync@2026';
   const userCount = db.prepare('SELECT COUNT(*) as cnt FROM users').get()?.cnt as number;
@@ -303,18 +334,28 @@ function seedDefaults(db: SqliteDatabase) {
     db.prepare(
       'INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)'
     ).run(adminUser, hashPassword(adminPass), 'ADMIN');
-  } else if (process.env.FORCE_RESET_ADMIN_PASSWORD === 'true' && process.env.ADMIN_PASSWORD) {
+  } else {
     const firstAdmin = db
       .prepare("SELECT id FROM users WHERE role = 'ADMIN' ORDER BY id ASC LIMIT 1")
       .get();
     if (firstAdmin) {
-      db.prepare(
-        'UPDATE users SET username = ?, password_hash = ?, token_version = COALESCE(token_version, 1) + 1 WHERE id = ?'
-      ).run(
-        adminUser,
-        hashPassword(process.env.ADMIN_PASSWORD),
-        Number(firstAdmin.id)
-      );
+      const targetAdminId = Number(firstAdmin.id);
+      if (process.env.FORCE_RESET_ADMIN_PASSWORD === 'true' && process.env.ADMIN_PASSWORD) {
+        db.prepare(
+          'UPDATE users SET username = ?, password_hash = ?, token_version = COALESCE(token_version, 1) + 1 WHERE id = ?'
+        ).run(adminUser, hashPassword(process.env.ADMIN_PASSWORD), targetAdminId);
+      }
+      if (process.env.FORCE_RESET_ADMIN_2FA === 'true') {
+        db.prepare(
+          `UPDATE users
+           SET totp_enabled = 0,
+               totp_secret = NULL,
+               totp_pending_secret = NULL,
+               recovery_codes_json = '[]',
+               token_version = COALESCE(token_version, 1) + 1
+           WHERE id = ?`
+        ).run(targetAdminId);
+      }
     }
   }
 
@@ -378,6 +419,7 @@ function seedDefaults(db: SqliteDatabase) {
     dsm_backup_shares: process.env.DSM_BACKUP_SHARES || 'VPS_Backups',
     btrfs_cron_time: '0 6 * * *',
     btrfs_auto_enabled: 'false',
+    global_exclude_patterns: '',
   };
 
   const insertSetting = db.prepare(
