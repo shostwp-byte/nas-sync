@@ -100,6 +100,17 @@ export function getDb(): SqliteDatabase {
   return db;
 }
 
+export function resetDbConnectionForTests(): void {
+  if (globalThis.__nasSyncDb) {
+    try {
+      globalThis.__nasSyncDb.close();
+    } catch {
+      // Ignore close errors in test teardown
+    }
+    globalThis.__nasSyncDb = undefined;
+  }
+}
+
 function initializeSchema(db: SqliteDatabase) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS users (
@@ -170,6 +181,11 @@ function initializeSchema(db: SqliteDatabase) {
       last_connected_at TEXT,
       notes TEXT NOT NULL DEFAULT '',
       custom_excludes TEXT NOT NULL DEFAULT '',
+      host_key_fingerprint TEXT NOT NULL DEFAULT '',
+      known_host_entry TEXT NOT NULL DEFAULT '',
+      host_key_status TEXT NOT NULL DEFAULT 'UNPINNED',
+      host_key_pending_fingerprint TEXT NOT NULL DEFAULT '',
+      host_key_pending_entry TEXT NOT NULL DEFAULT '',
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
@@ -256,6 +272,18 @@ function initializeSchema(db: SqliteDatabase) {
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    CREATE TABLE IF NOT EXISTS storage_daily_stats (
+      stat_date TEXT PRIMARY KEY,
+      logical_bytes INTEGER NOT NULL DEFAULT 0,
+      physical_delta_bytes INTEGER NOT NULL DEFAULT 0,
+      volumes_used_bytes INTEGER NOT NULL DEFAULT 0,
+      volumes_total_bytes INTEGER NOT NULL DEFAULT 0,
+      completed_jobs_count INTEGER NOT NULL DEFAULT 0,
+      failed_jobs_count INTEGER NOT NULL DEFAULT 0,
+      verified_dbs_count INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
     CREATE INDEX IF NOT EXISTS idx_jobs_server_status ON backup_jobs(server_id, status);
     CREATE INDEX IF NOT EXISTS idx_items_job ON backup_items(job_id);
     CREATE INDEX IF NOT EXISTS idx_items_server_domain ON backup_items(server_id, domain_name);
@@ -294,6 +322,11 @@ function initializeSchema(db: SqliteDatabase) {
     `ALTER TABLE backup_items ADD COLUMN is_subdomain INTEGER NOT NULL DEFAULT 0`,
     `ALTER TABLE backup_items ADD COLUMN parent_domain TEXT`,
     `ALTER TABLE servers ADD COLUMN custom_excludes TEXT NOT NULL DEFAULT ''`,
+    `ALTER TABLE servers ADD COLUMN host_key_fingerprint TEXT NOT NULL DEFAULT ''`,
+    `ALTER TABLE servers ADD COLUMN known_host_entry TEXT NOT NULL DEFAULT ''`,
+    `ALTER TABLE servers ADD COLUMN host_key_status TEXT NOT NULL DEFAULT 'UNPINNED'`,
+    `ALTER TABLE servers ADD COLUMN host_key_pending_fingerprint TEXT NOT NULL DEFAULT ''`,
+    `ALTER TABLE servers ADD COLUMN host_key_pending_entry TEXT NOT NULL DEFAULT ''`,
   ];
   for (const sql of migrations) {
     try {
@@ -301,6 +334,18 @@ function initializeSchema(db: SqliteDatabase) {
     } catch {
       // Cột đã tồn tại
     }
+  }
+
+  // Nâng cấp v1.4.0: Đảm bảo các máy chủ Demo mô phỏng (is_mock = 1) có sẵn khóa TOFU mẫu
+  try {
+    db.prepare(
+      `UPDATE servers
+       SET host_key_status = 'VERIFIED',
+           host_key_fingerprint = 'SHA256:MockEd25519HostKeyPinningDemoV140'
+       WHERE is_mock = 1 AND (host_key_fingerprint = '' OR host_key_status = 'UNPINNED')`
+    ).run();
+  } catch {
+    // Bỏ qua nếu bảng chưa sẵn sàng
   }
 
   // Nâng cấp v1.1.2: Hạ ngưỡng min_free_gb mặc định cũ (200 GB) xuống 10 GB để tránh báo FULL sai trên ổ cứng / Quota < 2TB
@@ -420,6 +465,8 @@ function seedDefaults(db: SqliteDatabase) {
     btrfs_cron_time: '0 6 * * *',
     btrfs_auto_enabled: 'false',
     global_exclude_patterns: '',
+    digest_enabled: 'false',
+    digest_cron_time: '0 7 * * *',
   };
 
   const insertSetting = db.prepare(
@@ -439,8 +486,8 @@ function seedDefaults(db: SqliteDatabase) {
       .get()?.id as number | undefined;
 
     const insServer = db.prepare(
-      `INSERT INTO servers (hostname, ip_address, ssh_port, ssh_user, ssh_key_path, panel_type, assigned_volume_id, bw_limit_kbps, status, is_mock, notes)
-       VALUES (?, ?, ?, 'root', '', ?, ?, ?, 'ONLINE', 1, ?)`
+      `INSERT INTO servers (hostname, ip_address, ssh_port, ssh_user, ssh_key_path, panel_type, assigned_volume_id, bw_limit_kbps, status, is_mock, notes, host_key_status, host_key_fingerprint)
+       VALUES (?, ?, ?, 'root', '', ?, ?, ?, 'ONLINE', 1, ?, 'VERIFIED', 'SHA256:MockEd25519HostKeyPinningDemoV140')`
     );
 
     const s1 = insServer.run(

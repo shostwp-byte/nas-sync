@@ -7,6 +7,7 @@ import { createSystemAlert } from '@/lib/notifications';
 import {
   buildRsyncSshTransport,
   buildSshBaseArgs,
+  ensureServerHostKeyPinned,
   execRemoteSSH,
   shellSingleQuote,
 } from '@/lib/ssh';
@@ -26,10 +27,6 @@ import {
   buildRemoteMysqlEnvPrelude,
   verifyRemoteWebrootSafety,
 } from './adapters/base';
-import {
-  clearCancelledJob,
-  isJobCancelled,
-} from './backup-worker';
 import { patchRestoredWebConfigOverSsh } from './config-rewriter';
 import {
   assertSafe,
@@ -39,26 +36,14 @@ import {
   isSafeSystemUser,
   isSafeWebroot,
 } from './safe-names';
+import {
+  clearCancelledJob,
+  isJobCancelled,
+  registerJobChildProcess,
+  terminateChildGracefully,
+} from './worker-state';
 
 const RESTORE_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
-
-function terminateChildGracefully(child: ReturnType<typeof spawn>) {
-  try {
-    child.kill('SIGTERM');
-  } catch {
-    return;
-  }
-  const forceTimer = setTimeout(() => {
-    try {
-      if (child.exitCode === null) {
-        child.kill('SIGKILL');
-      }
-    } catch {
-      // Ignore
-    }
-  }, 5000);
-  forceTimer.unref();
-}
 
 function pushFilesViaRsync(params: {
   jobId: number;
@@ -108,6 +93,7 @@ function pushFilesViaRsync(params: {
 
   return new Promise((resolve, reject) => {
     const child = spawn('rsync', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    registerJobChildProcess(jobId, child);
     let stderr = '';
     let lastActivityAt = Date.now();
     let idleTimedOut = false;
@@ -178,7 +164,6 @@ function streamRestoreDatabaseOverSsh(params: {
     const authFlags = buildMysqlAuthFlags(creds);
     const envPrelude = buildRemoteMysqlEnvPrelude(creds);
 
-    // Không đặt mật khẩu trên argv: nạp MYSQL_PWD nội bộ qua envPrelude trong bash phía VPS.
     const remoteInner = `${envPrelude}mysql ${authFlags} ${shellSingleQuote(targetDbName)}`;
     const remoteMysqlCmd = `bash -o pipefail -c ${shellSingleQuote(remoteInner)}`;
     const pipeline = `set -o pipefail; dump="$1"; shift; ${decompCmd} -- "$dump" | ssh "$@"`;
@@ -199,6 +184,7 @@ function streamRestoreDatabaseOverSsh(params: {
         stdio: ['ignore', 'pipe', 'pipe'],
       }
     );
+    registerJobChildProcess(jobId, child);
 
     let stderr = '';
     let lastActivityAt = Date.now();
@@ -255,7 +241,7 @@ function streamRestoreDatabaseOverSsh(params: {
 }
 
 /**
- * Mục 8: Cơ chế Khôi phục Đa năng (Files Only / DB Only / Cross-Panel Migration)
+ * Mục 8: Cơ chế Khôi phục Đa năng (Files Only / DB Only / Cross-Panel Migration + SSH TOFU Pinning)
  */
 export async function executeRestoreJob(jobId: number): Promise<void> {
   const db = getDb();
@@ -283,7 +269,7 @@ export async function executeRestoreJob(jobId: number): Promise<void> {
   const sourceServer = db
     .prepare('SELECT * FROM servers WHERE id = ?')
     .get(item.server_id) as unknown as ServerRecord;
-  const targetServer = db
+  let targetServer = db
     .prepare('SELECT * FROM servers WHERE id = ?')
     .get(payload.targetServerId) as unknown as ServerRecord;
   const sourceVolume = db
@@ -361,9 +347,21 @@ export async function executeRestoreJob(jobId: number): Promise<void> {
     );
     assertSafe(isSafeDomain, item.domain_name, 'Tên miền nguồn trong bản sao lưu');
     assertSafe(isSafeSnapshotName, item.snapshot_name, 'Snapshot nguồn');
+
+    // Xác thực khóa định danh SSH Host Key (TOFU Pinning & Chống MITM) cho máy chủ đích trước khi kết nối SSH
+    setStep(10, 'Đang xác thực khóa định danh SSH Host Key máy chủ đích (TOFU)...');
+    const pinnedTarget = await ensureServerHostKeyPinned(targetServer.id);
+    targetServer =
+      (db
+        .prepare('SELECT * FROM servers WHERE id = ?')
+        .get(targetServer.id) as unknown as ServerRecord | undefined) ||
+      targetServer;
+    appendLog(
+      `[SSH TOFU] Xác thực khóa định danh máy chủ đích ${targetServer.hostname} (${pinnedTarget.status}: ${pinnedTarget.fingerprint}).`
+    );
+
     const targetAdapter = getPanelAdapter(targetServer);
 
-    // Webroot đích nhận rsync --delete và chown -hR với quyền root: chặn "/", "/home", ".."...
     const resolvedWebroot = assertSafe(
       (v) => isSafeWebroot(v.replace(/\/+$/, '')),
       payload.targetWebrootOverride?.trim() ||
@@ -455,7 +453,6 @@ export async function executeRestoreJob(jobId: number): Promise<void> {
           `[Permissions] Đã thực thi chuẩn hóa quyền trên ${targetServer.panel_type}: ${permCmd}`
         );
       } else {
-        // Kiểm tra Symlink Webroot Jail trước khi mkdir -p và rsync --delete trên VPS đích
         const safety = await verifyRemoteWebrootSafety(
           targetServer,
           targetServer.panel_type,
@@ -686,4 +683,3 @@ export async function executeRestoreJob(jobId: number): Promise<void> {
     clearCancelledJob(jobId);
   }
 }
-

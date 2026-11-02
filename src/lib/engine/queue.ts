@@ -11,6 +11,10 @@ import {
   RetryableNetworkError,
 } from './backup-worker';
 import { triggerSynologyBtrfsImmutableSnapshot } from './btrfs-worm';
+import {
+  captureDailyStorageSnapshot,
+  sendDailyMorningDigest,
+} from './morning-digest';
 import { executeRestoreJob } from './restore-worker';
 import { applyGfsRetentionForServer } from './retention-gfs';
 
@@ -601,6 +605,34 @@ export function reloadCronSchedules() {
       void triggerSynologyBtrfsImmutableSnapshot(7);
     });
     state.cronTasks.set('btrfs-worm-daily', wormTask);
+  }
+
+  // Lịch chụp thống kê dung lượng ngày cố định lúc 23:55 hằng đêm (v1.4.0 30-Day Storage Trend)
+  const snapshotStatsTask = cron.schedule('55 23 * * *', () => {
+    try {
+      captureDailyStorageSnapshot();
+    } catch (err) {
+      console.error(
+        '[Cron Storage Snapshot] Không thể lưu thống kê dung lượng ngày:',
+        err
+      );
+    }
+  });
+  state.cronTasks.set('storage-snapshot-daily', snapshotStatsTask);
+
+  // Lịch gửi Báo cáo NOC Buổi sáng (Daily Morning Digest) qua Telegram / Email
+  const digestEnabled = getSetting('digest_enabled', 'false') === 'true';
+  const digestCron = getSetting('digest_cron_time', '0 7 * * *');
+  if (digestEnabled && cron.validate(digestCron)) {
+    const digestTask = cron.schedule(digestCron, () => {
+      void sendDailyMorningDigest().catch((err) => {
+        console.error(
+          '[Morning Digest Cron] Lỗi gửi Báo cáo NOC Buổi sáng:',
+          err
+        );
+      });
+    });
+    state.cronTasks.set('morning-digest-daily', digestTask);
   }
 }
 

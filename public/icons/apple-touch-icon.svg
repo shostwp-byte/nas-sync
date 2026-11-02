@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="180" height="180" viewBox="0 0 180 180" fill="none">
+  <defs>
+    <linearGradient id="bgApple" x1="0" y1="0" x2="180" y2="180" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#0f172a" />
+      <stop offset="100%" stop-color="#020617" />
+    </linearGradient>
+    <linearGradient id="shieldApple" x1="44" y1="26" x2="136" y2="154" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#22d3ee" />
+      <stop offset="55%" stop-color="#10b981" />
+      <stop offset="100%" stop-color="#059669" />
+    </linearGradient>
+  </defs>
+
+  <!-- Full-bleed iOS Home Screen Canvas -->
+  <rect width="180" height="180" fill="url(#bgApple)" />
+  <circle cx="90" cy="90" r="64" fill="#10b981" fill-opacity="0.08" />
+
+  <!-- Security Shield -->
+  <path
+    d="M90 26L140 45V87C140 120 118.6 146 90 156.5C61.4 146 40 120 40 87V45L90 26Z"
+    fill="#020617"
+    stroke="url(#shieldApple)"
+    stroke-width="5.2"
+    stroke-linejoin="round"
+  />
+
+  <!-- NAS Rack Bay 1 -->
+  <rect x="59" y="58" width="62" height="21" rx="5" fill="#0f172a" stroke="#38bdf8" stroke-width="2.3" />
+  <circle cx="69" cy="68.5" r="2.8" fill="#10b981" />
+  <circle cx="78.5" cy="68.5" r="2.8" fill="#22d3ee" />
+  <rect x="90" y="66.5" width="21" height="4" rx="2" fill="#334155" />
+
+  <!-- NAS Rack Bay 2 -->
+  <rect x="59" y="85" width="62" height="21" rx="5" fill="#0f172a" stroke="#10b981" stroke-width="2.3" />
+  <circle cx="69" cy="95.5" r="2.8" fill="#10b981" />
+  <circle cx="78.5" cy="95.5" r="2.8" fill="#10b981" />
+  <rect x="90" y="93.5" width="21" height="4" rx="2" fill="#334155" />
+
+  <!-- Verified Sync Emblem -->
+  <circle cx="90" cy="126" r="13.5" fill="#064e3b" stroke="#10b981" stroke-width="2.4" />
+  <path
+    d="M83.8 126.2L88.1 130.5L96.8 121.6"
+    stroke="#34d399"
+    stroke-width="3"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+</svg>

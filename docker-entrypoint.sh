@@ -59,7 +59,7 @@ if [ -f "$PERSIST_DIR/package.json" ] && [ -d "$PERSIST_DIR/.next" ]; then
     fi
 
     if [ "$APPLY_OK" = "1" ]; then
-      for item in src .next server.ts package.json package-lock.json next.config.mjs postcss.config.mjs tailwind.config.ts tsconfig.json BUILD_INFO.json; do
+      for item in src public .next server.ts package.json package-lock.json next.config.mjs postcss.config.mjs tailwind.config.ts tsconfig.json BUILD_INFO.json; do
         if [ -e "$PERSIST_DIR/$item" ]; then
           rm -rf "/app/$item"
           cp -a "$PERSIST_DIR/$item" "/app/$item"

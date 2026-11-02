@@ -1,11 +1,16 @@
 import fs from 'node:fs';
 import { NextRequest, NextResponse } from 'next/server';
+import { safeErrorJson, sanitizeErrorMessage } from '@/lib/api-error';
 import { recordAuditLog } from '@/lib/audit';
 import { requireRole } from '@/lib/auth';
 import { getDb } from '@/lib/db';
 import { validateExcludePatternsInput } from '@/lib/engine/exclude-rules';
 import { validateServerConnectionFields } from '@/lib/engine/safe-names';
-import { resolveValidatedSshKeyPath } from '@/lib/ssh';
+import {
+  MOCK_HOST_KEY_FINGERPRINT,
+  removeServerKnownHostsCache,
+  resolveValidatedSshKeyPath,
+} from '@/lib/ssh';
 
 export async function PATCH(
   req: NextRequest,
@@ -36,6 +41,8 @@ export async function PATCH(
     const nextPanelType = String(body.panel_type ?? curr.panel_type).trim();
     const nextSshPort = Number(body.ssh_port ?? curr.ssh_port);
     const nextBwLimit = Number(body.bw_limit_kbps ?? curr.bw_limit_kbps);
+    const nextIsMock =
+      body.is_mock !== undefined ? (body.is_mock ? 1 : 0) : Number(curr.is_mock || 0);
     const rawSshKeyPath = String(
       body.ssh_key_path !== undefined ? body.ssh_key_path : curr.ssh_key_path || ''
     ).trim();
@@ -72,7 +79,7 @@ export async function PATCH(
         nextSshKeyPath = resolveValidatedSshKeyPath(rawSshKeyPath);
       } catch (err) {
         return NextResponse.json(
-          { error: (err as Error).message },
+          { error: sanitizeErrorMessage(err, 'Đường dẫn khóa SSH không hợp lệ.') },
           { status: 400 }
         );
       }
@@ -87,44 +94,80 @@ export async function PATCH(
       }
     }
 
-    db.prepare(
-      `UPDATE servers
-       SET hostname = ?, ip_address = ?, ssh_port = ?, ssh_user = ?, ssh_key_path = ?,
-           panel_type = ?, assigned_volume_id = ?, bw_limit_kbps = ?, is_mock = ?, notes = ?,
-           custom_excludes = ?
-       WHERE id = ?`
-    ).run(
-      nextHostname,
-      nextIp,
-      nextSshPort,
-      nextSshUser,
-      nextSshKeyPath,
-      nextPanelType,
-      body.assigned_volume_id !== undefined
-        ? body.assigned_volume_id
-        : curr.assigned_volume_id,
-      nextBwLimit,
-      body.is_mock !== undefined ? (body.is_mock ? 1 : 0) : curr.is_mock,
-      body.notes !== undefined ? String(body.notes) : curr.notes,
-      nextCustomExcludes,
-      serverId
-    );
+    const endpointChanged =
+      nextIp !== String(curr.ip_address) ||
+      nextSshPort !== Number(curr.ssh_port);
+
+    if (endpointChanged) {
+      removeServerKnownHostsCache(serverId);
+      const resetStatus = nextIsMock ? 'VERIFIED' : 'UNPINNED';
+      const resetFp = nextIsMock ? MOCK_HOST_KEY_FINGERPRINT : '';
+
+      db.prepare(
+        `UPDATE servers
+         SET hostname = ?, ip_address = ?, ssh_port = ?, ssh_user = ?, ssh_key_path = ?,
+             panel_type = ?, assigned_volume_id = ?, bw_limit_kbps = ?, is_mock = ?, notes = ?,
+             custom_excludes = ?,
+             host_key_status = ?, host_key_fingerprint = ?, known_host_entry = '',
+             host_key_pending_fingerprint = '', host_key_pending_entry = ''
+         WHERE id = ?`
+      ).run(
+        nextHostname,
+        nextIp,
+        nextSshPort,
+        nextSshUser,
+        nextSshKeyPath,
+        nextPanelType,
+        body.assigned_volume_id !== undefined
+          ? body.assigned_volume_id
+          : curr.assigned_volume_id,
+        nextBwLimit,
+        nextIsMock,
+        body.notes !== undefined ? String(body.notes) : curr.notes,
+        nextCustomExcludes,
+        resetStatus,
+        resetFp,
+        serverId
+      );
+    } else {
+      db.prepare(
+        `UPDATE servers
+         SET hostname = ?, ip_address = ?, ssh_port = ?, ssh_user = ?, ssh_key_path = ?,
+             panel_type = ?, assigned_volume_id = ?, bw_limit_kbps = ?, is_mock = ?, notes = ?,
+             custom_excludes = ?
+         WHERE id = ?`
+      ).run(
+        nextHostname,
+        nextIp,
+        nextSshPort,
+        nextSshUser,
+        nextSshKeyPath,
+        nextPanelType,
+        body.assigned_volume_id !== undefined
+          ? body.assigned_volume_id
+          : curr.assigned_volume_id,
+        nextBwLimit,
+        nextIsMock,
+        body.notes !== undefined ? String(body.notes) : curr.notes,
+        nextCustomExcludes,
+        serverId
+      );
+    }
 
     recordAuditLog({
       session: guard.session,
       action: 'SERVER_UPDATE',
       resourceType: 'SERVER',
       resourceId: String(serverId),
-      detail: `Cập nhật máy chủ VPS "${nextHostname}" (${nextIp}:${nextSshPort} - ${nextPanelType})`,
+      detail: `Cập nhật máy chủ VPS "${nextHostname}" (${nextIp}:${nextSshPort} - ${nextPanelType})${
+        endpointChanged ? ' [Đặt lại TOFU Host Key do đổi IP/Port]' : ''
+      }`,
       req,
     });
 
     return NextResponse.json({ ok: true });
   } catch (err) {
-    return NextResponse.json(
-      { error: (err as Error).message },
-      { status: 500 }
-    );
+    return safeErrorJson(err, 'Không thể cập nhật thông tin máy chủ VPS.');
   }
 }
 
@@ -132,28 +175,33 @@ export async function DELETE(
   req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const guard = await requireRole(['ADMIN']);
-  if (!guard.ok) return guard.response;
+  try {
+    const guard = await requireRole(['ADMIN']);
+    if (!guard.ok) return guard.response;
 
-  const { id } = await params;
-  const serverId = Number(id);
-  const db = getDb();
-  const curr = db
-    .prepare('SELECT hostname, ip_address FROM servers WHERE id = ?')
-    .get(serverId);
+    const { id } = await params;
+    const serverId = Number(id);
+    const db = getDb();
+    const curr = db
+      .prepare('SELECT hostname, ip_address FROM servers WHERE id = ?')
+      .get(serverId);
 
-  db.prepare('DELETE FROM servers WHERE id = ?').run(serverId);
+    db.prepare('DELETE FROM servers WHERE id = ?').run(serverId);
+    removeServerKnownHostsCache(serverId);
 
-  if (curr) {
-    recordAuditLog({
-      session: guard.session,
-      action: 'SERVER_DELETE',
-      resourceType: 'SERVER',
-      resourceId: String(serverId),
-      detail: `Xóa máy chủ VPS "${curr.hostname}" (${curr.ip_address})`,
-      req,
-    });
+    if (curr) {
+      recordAuditLog({
+        session: guard.session,
+        action: 'SERVER_DELETE',
+        resourceType: 'SERVER',
+        resourceId: String(serverId),
+        detail: `Xóa máy chủ VPS "${curr.hostname}" (${curr.ip_address})`,
+        req,
+      });
+    }
+
+    return NextResponse.json({ ok: true });
+  } catch (err) {
+    return safeErrorJson(err, 'Không thể xóa máy chủ VPS.');
   }
-
-  return NextResponse.json({ ok: true });
 }

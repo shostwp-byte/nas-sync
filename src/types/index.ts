@@ -49,6 +49,8 @@ export interface SSHKeyRecord {
   created_at: string;
 }
 
+export type HostKeyStatus = 'UNPINNED' | 'VERIFIED' | 'MISMATCH';
+
 export interface ServerRecord {
   id: number;
   hostname: string;
@@ -66,6 +68,11 @@ export interface ServerRecord {
   last_connected_at: string | null;
   notes: string;
   custom_excludes?: string;
+  host_key_fingerprint?: string;
+  known_host_entry?: string;
+  host_key_status?: HostKeyStatus;
+  host_key_pending_fingerprint?: string;
+  host_key_pending_entry?: string;
   created_at: string;
 }
 
@@ -303,5 +310,55 @@ export interface UpdateProgressEvent {
   logLine?: string;
   targetVersion?: string;
 }
+
+export interface StorageDailyStat {
+  stat_date: string;
+  logical_bytes: number;
+  physical_delta_bytes: number;
+  volumes_used_bytes: number;
+  volumes_total_bytes: number;
+  completed_jobs_count: number;
+  failed_jobs_count: number;
+  verified_dbs_count: number;
+}
+
+export interface TopDomainStat {
+  domain_name: string;
+  server_id: number;
+  server_hostname: string;
+  server_panel: PanelType;
+  webroot_size_bytes: number;
+  db_size_bytes: number;
+  total_domain_bytes: number;
+  databases_count: number;
+  verification_status: VerificationStatus;
+  snapshot_name: string;
+}
+
+export interface MorningDigestSummary {
+  generatedAt: string;
+  windowHours: number;
+  totalServers: number;
+  onlineServers: number;
+  hostKeyMismatchCount: number;
+  jobsSucceeded24h: number;
+  jobsFailed24h: number;
+  netDeltaBytes24h: number;
+  totalLogicalBytes: number;
+  totalPhysicalDeltaBytes: number;
+  savingsPercent: number;
+  verifiedDbs24h: number;
+  corruptedDbs24h: number;
+  anomalies24h: number;
+  volumes: Array<{
+    name: string;
+    mount_path: string;
+    used_bytes: number;
+    free_bytes: number;
+    total_bytes: number;
+    status: VolumeStatus;
+  }>;
+}
+
 
 

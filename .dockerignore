@@ -2,6 +2,7 @@ node_modules
 .next
 release
 scripts
+tests
 app_data
 redis_data
 ssh_keys

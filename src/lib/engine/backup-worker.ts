@@ -1,32 +1,18 @@
-import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import zlib from 'node:zlib';
 import { getDb, getSetting } from '@/lib/db';
-import { emitJobLog, emitJobProgress, emitJobUpdated } from '@/lib/events';
+import { emitJobUpdated } from '@/lib/events';
 import { createSystemAlert } from '@/lib/notifications';
-import {
-  buildRsyncSshTransport,
-  buildSshBaseArgs,
-  shellSingleQuote,
-} from '@/lib/ssh';
-import type {
-  BackupJob,
-  DatabaseBackupInfo,
-  DiscoveredDomain,
-  DomainMetadataJson,
-  InProgressState,
-  MysqlAdminCredentials,
-  ServerRecord,
-} from '@/types';
+import { ensureServerHostKeyPinned } from '@/lib/ssh';
+import type { BackupJob, DomainMetadataJson, ServerRecord } from '@/types';
 import { getPanelAdapter } from './adapters';
-import {
-  buildMysqlAuthFlags,
-  buildRemoteMysqlEnvPrelude,
-  verifyRemoteWebrootSafety,
-} from './adapters/base';
+import { verifyRemoteWebrootSafety } from './adapters/base';
 import { evaluateBackupAnomaly } from './anomaly-detector';
 import { parseSafeExcludePatterns } from './exclude-rules';
+import { executeMockServerBackup } from './mock-runner';
+import { captureDailyStorageSnapshot } from './morning-digest';
+import { streamRemoteMysqlDumpToZst } from './mysql-streamer';
+import { getDirectorySizeAndCount, runRsyncPullDomain } from './rsync-runner';
 import { assertSafe, isSafeSnapshotName } from './safe-names';
 import { verifyJobDatabasesInSandbox } from './sandbox-verifier';
 import {
@@ -35,789 +21,32 @@ import {
   resolveLatestSnapshotDir,
   updateLatestSymlink,
 } from './volume-manager';
+import {
+  RetryableNetworkError,
+  clearCancelledJob,
+  createJobLogger,
+  createJobProgressUpdater,
+  isJobCancelled,
+  killJobChildProcesses,
+  loadOrCreateState,
+  registerJobChildProcess,
+  requestCancelJob,
+  saveState,
+  throwIfCancelled,
+} from './worker-state';
 
-export class RetryableNetworkError extends Error {
-  readonly rsyncExitCode: number;
-  constructor(message: string, exitCode: number) {
-    super(message);
-    this.name = 'RetryableNetworkError';
-    this.rsyncExitCode = exitCode;
-  }
-}
-
-declare global {
-  // eslint-disable-next-line no-var
-  var __nasSyncCancelledJobIds: Set<number> | undefined;
-}
-
-function getCancelledJobIdsSet(): Set<number> {
-  if (!globalThis.__nasSyncCancelledJobIds) {
-    globalThis.__nasSyncCancelledJobIds = new Set<number>();
-  }
-  return globalThis.__nasSyncCancelledJobIds;
-}
-
-export function requestCancelJob(jobId: number) {
-  getCancelledJobIdsSet().add(jobId);
-}
-
-export function clearCancelledJob(jobId: number) {
-  getCancelledJobIdsSet().delete(jobId);
-}
-
-export function isJobCancelled(jobId: number): boolean {
-  return getCancelledJobIdsSet().has(jobId);
-}
-
-const RETRYABLE_RSYNC_CODES = new Set([10, 12, 23, 30, 35, 255]);
-const STREAM_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
-
-function terminateChildGracefully(child: ReturnType<typeof spawn>) {
-  try {
-    child.kill('SIGTERM');
-  } catch {
-    return;
-  }
-  const forceTimer = setTimeout(() => {
-    try {
-      if (child.exitCode === null) {
-        child.kill('SIGKILL');
-      }
-    } catch {
-      // Ignore if already exited
-    }
-  }, 5000);
-  forceTimer.unref();
-}
-
-function parseSpeedToBps(speedStr: string): number {
-  const m = speedStr.trim().match(/^([\d.]+)\s*([kKmMgGtT]?)[Bb]\/s$/);
-  if (!m) return 0;
-  const val = parseFloat(m[1]);
-  const unit = m[2].toUpperCase();
-  switch (unit) {
-    case 'K':
-      return Math.round(val * 1024);
-    case 'M':
-      return Math.round(val * 1024 ** 2);
-    case 'G':
-      return Math.round(val * 1024 ** 3);
-    case 'T':
-      return Math.round(val * 1024 ** 4);
-    default:
-      return Math.round(val);
-  }
-}
-
-function parseEtaToSeconds(etaStr: string): number {
-  const parts = etaStr.trim().split(':').map(Number);
-  if (parts.length === 3 && parts.every((n) => !Number.isNaN(n))) {
-    return parts[0] * 3600 + parts[1] * 60 + parts[2];
-  }
-  return 0;
-}
-
-function getDirectorySizeAndCount(dirPath: string): {
-  totalBytes: number;
-  fileCount: number;
-} {
-  let totalBytes = 0;
-  let fileCount = 0;
-  if (!fs.existsSync(dirPath)) return { totalBytes: 0, fileCount: 0 };
-
-  const stack = [dirPath];
-  while (stack.length > 0) {
-    const curr = stack.pop()!;
-    const entries = fs.readdirSync(curr, { withFileTypes: true });
-    for (const entry of entries) {
-      if (entry.name === '.rsync-partial') continue;
-      const full = path.join(curr, entry.name);
-      const st = fs.lstatSync(full, { throwIfNoEntry: false });
-      if (!st || st.isSymbolicLink()) continue;
-      if (st.isDirectory()) {
-        stack.push(full);
-      } else if (st.isFile()) {
-        fileCount++;
-        totalBytes += st.size;
-      }
-    }
-  }
-  return { totalBytes, fileCount };
-}
-
-function loadOrCreateState(
-  stateFilePath: string,
-  jobId: number,
-  snapshotName: string
-): InProgressState {
-  if (fs.existsSync(stateFilePath)) {
-    try {
-      return JSON.parse(fs.readFileSync(stateFilePath, 'utf8')) as InProgressState;
-    } catch {
-      // Tạo mới nếu file state hỏng
-    }
-  }
-  return {
-    jobId,
-    snapshotName,
-    startedAt: new Date().toISOString(),
-    completedDomains: {},
-  };
-}
-
-function saveState(stateFilePath: string, state: InProgressState) {
-  fs.writeFileSync(stateFilePath, JSON.stringify(state, null, 2), 'utf8');
-}
+export {
+  RetryableNetworkError,
+  clearCancelledJob,
+  isJobCancelled,
+  killJobChildProcesses,
+  registerJobChildProcess,
+  requestCancelJob,
+  throwIfCancelled,
+};
 
 /**
- * Mục 5.2: Thực thi rsync Incremental (--link-dest) kéo mã nguồn từ VPS về NAS
- * kèm bắt luồng --info=progress2 thời gian thực.
- */
-function runRsyncPullDomain(params: {
-  jobId: number;
-  server: ServerRecord;
-  remoteWebroot: string;
-  destPublicHtmlDir: string;
-  linkDestPublicHtmlDir: string | null;
-  excludedSubpaths?: string[];
-  customExcludes?: string[];
-  onProgress: (pct: number, speedBps: number, etaSec: number) => void;
-  onLog: (msg: string) => void;
-}): Promise<{
-  filesTotal: number;
-  filesChanged: number;
-  totalBytes: number;
-  deltaBytes: number;
-}> {
-  const {
-    jobId,
-    server,
-    remoteWebroot,
-    destPublicHtmlDir,
-    linkDestPublicHtmlDir,
-    excludedSubpaths,
-    customExcludes,
-    onProgress,
-    onLog,
-  } = params;
-
-  fs.mkdirSync(destPublicHtmlDir, { recursive: true });
-
-  const args: string[] = [
-    '-az',
-    '--delete',
-    '--no-devices',
-    '--no-specials',
-    '--safe-links',
-    '--stats',
-    '--info=progress2',
-    '--partial',
-    '--partial-dir=.rsync-partial',
-    '--timeout=60',
-  ];
-
-  if (excludedSubpaths && excludedSubpaths.length > 0) {
-    for (const rel of excludedSubpaths) {
-      const cleanRel = rel.replace(/^\/+|\/+$/g, '');
-      if (cleanRel && !cleanRel.includes('..')) {
-        args.push(`--exclude=/${cleanRel}`);
-      }
-    }
-  }
-
-  if (customExcludes && customExcludes.length > 0) {
-    for (const pattern of customExcludes) {
-      if (pattern && !pattern.startsWith('-') && !/[\r\n\0]/.test(pattern)) {
-        args.push(`--exclude=${pattern}`);
-      }
-    }
-  }
-
-  if (server.bw_limit_kbps && server.bw_limit_kbps > 0) {
-    args.push(`--bwlimit=${server.bw_limit_kbps}`);
-  }
-
-  if (linkDestPublicHtmlDir && fs.existsSync(linkDestPublicHtmlDir)) {
-    args.push(`--link-dest=${linkDestPublicHtmlDir}/`);
-  }
-
-  args.push('-e', buildRsyncSshTransport(server));
-  args.push('--rsync-path=ionice -c2 -n7 nice -n19 rsync');
-  args.push(
-    `${server.ssh_user || 'root'}@${server.ip_address}:${remoteWebroot.replace(
-      /\/+$/,
-      ''
-    )}/`,
-    `${destPublicHtmlDir.replace(/\/+$/, '')}/`
-  );
-
-  return new Promise((resolve, reject) => {
-    const child = spawn('rsync', args, {
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-
-    let fullStdout = '';
-    let fullStderr = '';
-    let lastEmit = 0;
-    let lastActivityAt = Date.now();
-    let idleTimedOut = false;
-
-    const cancelWatcher = setInterval(() => {
-      if (isJobCancelled(jobId)) {
-        terminateChildGracefully(child);
-        return;
-      }
-      if (Date.now() - lastActivityAt > STREAM_IDLE_TIMEOUT_MS) {
-        idleTimedOut = true;
-        terminateChildGracefully(child);
-      }
-    }, 3000);
-
-    child.stdout.on('data', (chunk: Buffer) => {
-      lastActivityAt = Date.now();
-      const str = chunk.toString('utf8');
-      fullStdout += str;
-      if (fullStdout.length > 65536) {
-        fullStdout = fullStdout.slice(-32768);
-      }
-
-      // Parse dòng --info=progress2: e.g. "  1,245,184,000  64%   24.50MB/s    0:00:42"
-      const lines = str.split(/[\r\n]+/);
-      for (const line of lines) {
-        const m = line.match(
-          /([\d,]+)\s+(\d+)%\s+([\d.]+[kKmMgGtT]?B\/s)\s+(\d+:\d+:\d+)/
-        );
-        if (m) {
-          const now = Date.now();
-          if (now - lastEmit >= 900) {
-            lastEmit = now;
-            const pct = Math.min(100, Number(m[2]));
-            const speedBps = parseSpeedToBps(m[3]);
-            const etaSec = parseEtaToSeconds(m[4]);
-            onProgress(pct, speedBps, etaSec);
-          }
-        }
-      }
-    });
-
-    child.stderr.on('data', (chunk: Buffer) => {
-      lastActivityAt = Date.now();
-      const s = chunk.toString('utf8');
-      fullStderr += s;
-      if (fullStderr.length > 65536) {
-        fullStderr = fullStderr.slice(-32768);
-      }
-    });
-
-    child.on('error', (err) => {
-      clearInterval(cancelWatcher);
-      reject(err);
-    });
-
-    child.on('close', (code) => {
-      clearInterval(cancelWatcher);
-      const exitCode = code ?? 1;
-
-      if (isJobCancelled(jobId)) {
-        reject(new Error('Job đã bị hủy bởi quản trị viên.'));
-        return;
-      }
-
-      if (idleTimedOut) {
-        reject(
-          new RetryableNetworkError(
-            'Tiến trình Rsync không phản hồi dữ liệu quá 30 phút (Idle Timeout).',
-            30
-          )
-        );
-        return;
-      }
-
-      // Mã lỗi 24 của rsync: "Partial transfer due to vanished source files" (file cache tạm bị xóa khi web đang chạy) -> Hợp lệ
-      if (exitCode !== 0 && exitCode !== 24) {
-        if (RETRYABLE_RSYNC_CODES.has(exitCode)) {
-          reject(
-            new RetryableNetworkError(
-              `Kết nối Rsync/SSH bị gián đoạn (Mã lỗi ${exitCode}): ${fullStderr.trim()}`,
-              exitCode
-            )
-          );
-          return;
-        }
-        reject(
-          new Error(`Rsync thất bại (Mã lỗi ${exitCode}): ${fullStderr.trim()}`)
-        );
-        return;
-      }
-
-      // Phân tích thông số từ cờ --stats (Mục 9.3 Anomaly Detection)
-      const numFilesMatch = fullStdout.match(
-        /Number of regular files transferred:\s*([\d,]+)/i
-      );
-      const totalFilesMatch = fullStdout.match(
-        /Number of files:\s*([\d,]+)/i
-      );
-      const totalSizeMatch = fullStdout.match(
-        /Total file size:\s*([\d,]+)/i
-      );
-      const deltaSizeMatch = fullStdout.match(
-        /Total transferred file size:\s*([\d,]+)/i
-      );
-
-      const parseNum = (s?: string) =>
-        s ? Number(s.replace(/,/g, '')) || 0 : 0;
-
-      const filesTotal = parseNum(totalFilesMatch?.[1]);
-      const filesChanged = parseNum(numFilesMatch?.[1]);
-      const totalBytes = parseNum(totalSizeMatch?.[1]);
-      const deltaBytes = parseNum(deltaSizeMatch?.[1]);
-
-      if (exitCode === 24) {
-        onLog(
-          `[Rsync] Ghi chú: Một số file cache tạm thời tự xóa trên VPS trong lúc đồng bộ (code 24 - an toàn).`
-        );
-      }
-
-      resolve({
-        filesTotal,
-        filesChanged,
-        totalBytes,
-        deltaBytes,
-      });
-    });
-  });
-}
-
-/**
- * Mục 5.3: Sao lưu Database không dùng ổ cứng tạm trên VPS (SSH Pipe Streaming + kiểm tra PIPESTATUS)
- */
-function runSshStreamDatabaseDump(params: {
-  jobId: number;
-  server: ServerRecord;
-  creds: MysqlAdminCredentials;
-  dbName: string;
-  destDatabasesDir: string;
-  onLog: (msg: string) => void;
-}): Promise<{ fileName: string; sizeBytes: number }> {
-  const { jobId, server, creds, dbName, destDatabasesDir, onLog } = params;
-  fs.mkdirSync(destDatabasesDir, { recursive: true });
-
-  return new Promise((resolve, reject) => {
-    const authFlags = buildMysqlAuthFlags(creds);
-    const envPrelude = buildRemoteMysqlEnvPrelude(creds);
-
-    // Ưu tiên nén zstd -3 -T1 theo đặc tả; tự động fallback sang gzip -c nếu VPS chưa cài zstd
-    const checkZstdArgs = [
-      ...buildSshBaseArgs(server),
-      '--',
-      `${server.ssh_user || 'root'}@${server.ip_address}`,
-      'command -v zstd >/dev/null 2>&1 && echo ZSTD || echo GZIP',
-    ];
-
-    const probe = spawn('ssh', checkZstdArgs, {
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    let probeOut = '';
-    let probeSettled = false;
-    const probeTimer = setTimeout(() => {
-      if (!probeSettled) {
-        probeSettled = true;
-        terminateChildGracefully(probe);
-        reject(
-          new RetryableNetworkError(
-            `Quá thời gian kết nối SSH khi chuẩn bị stream DB ${dbName}`,
-            255
-          )
-        );
-      }
-    }, 20000);
-
-    probe.stdout.on('data', (d: Buffer) => {
-      probeOut += d.toString('utf8');
-    });
-    probe.on('error', (err) => {
-      clearTimeout(probeTimer);
-      if (!probeSettled) {
-        probeSettled = true;
-        reject(err);
-      }
-    });
-    probe.on('close', (pCode) => {
-      clearTimeout(probeTimer);
-      if (probeSettled) return;
-      probeSettled = true;
-
-      if (isJobCancelled(jobId)) {
-        reject(new Error('Job đã bị hủy bởi quản trị viên.'));
-        return;
-      }
-
-      if (pCode === 255) {
-        reject(
-          new RetryableNetworkError(
-            `Mất kết nối SSH khi chuẩn bị stream DB ${dbName}`,
-            255
-          )
-        );
-        return;
-      }
-
-      const useZstd = probeOut.trim() === 'ZSTD';
-      const ext = useZstd ? 'sql.zst' : 'sql.gz';
-      const compCmd = useZstd ? 'zstd -3 -T1 -c' : 'gzip -c';
-      const fileName = `${dbName}.${ext}`;
-      const outPath = path.join(destDatabasesDir, fileName);
-      const tmpOutPath = `${outPath}.part`;
-
-      // Sử dụng bash pipefail trên VPS để đảm bảo cả mysqldump lẫn luồng nén đều trả về đúng mã 0.
-      // Mật khẩu MySQL được nạp nội bộ qua envPrelude (MYSQL_PWD), tuyệt đối không xuất hiện trên `ps aux`.
-      const quotedDb = shellSingleQuote(dbName);
-      const innerDumpScript = `${envPrelude}if command -v ionice >/dev/null 2>&1 && ionice -c2 -n7 true 2>/dev/null; then IONICE_CMD="ionice -c2 -n7"; else IONICE_CMD=""; fi\n$IONICE_CMD nice -n19 mysqldump ${authFlags} --single-transaction --quick --lock-tables=false --routines --triggers --events ${quotedDb} | ${compCmd}`;
-      const remoteDumpScript = `bash -o pipefail -c ${shellSingleQuote(innerDumpScript)}`;
-
-      const sshArgs = [
-        ...buildSshBaseArgs(server),
-        '--',
-        `${server.ssh_user || 'root'}@${server.ip_address}`,
-        remoteDumpScript,
-      ];
-
-      const outStream = fs.createWriteStream(tmpOutPath);
-      const child = spawn('ssh', sshArgs, {
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
-
-      let stderr = '';
-      let writeFailed = false;
-      let idleTimedOut = false;
-      let lastActivityAt = Date.now();
-
-      const dumpWatcher = setInterval(() => {
-        if (isJobCancelled(jobId)) {
-          terminateChildGracefully(child);
-          return;
-        }
-        if (Date.now() - lastActivityAt > STREAM_IDLE_TIMEOUT_MS) {
-          idleTimedOut = true;
-          terminateChildGracefully(child);
-        }
-      }, 3000);
-
-      child.stdout.on('data', () => {
-        lastActivityAt = Date.now();
-      });
-      child.stdout.pipe(outStream);
-      child.stderr.on('data', (d: Buffer) => {
-        lastActivityAt = Date.now();
-        stderr += d.toString('utf8');
-        if (stderr.length > 65536) {
-          stderr = stderr.slice(-32768);
-        }
-      });
-
-      // Thiếu listener 'error' thì ENOSPC (Volume NAS đầy) thành uncaught exception
-      // và làm sập toàn bộ tiến trình Node cùng mọi Job đang chạy.
-      outStream.on('error', (err) => {
-        writeFailed = true;
-        clearInterval(dumpWatcher);
-        terminateChildGracefully(child);
-        fs.rmSync(tmpOutPath, { force: true });
-        reject(new Error(`Ghi file dump DB ${dbName} thất bại: ${err.message}`));
-      });
-
-      child.on('error', (err) => {
-        clearInterval(dumpWatcher);
-        outStream.destroy();
-        fs.rmSync(tmpOutPath, { force: true });
-        reject(err);
-      });
-
-      child.on('close', (code) => {
-        clearInterval(dumpWatcher);
-        if (writeFailed) return;
-        outStream.end(() => {
-          try {
-            finalizeDump(code);
-          } catch (err) {
-            fs.rmSync(tmpOutPath, { force: true });
-            reject(err);
-          }
-        });
-      });
-
-      const finalizeDump = (code: number | null) => {
-        if (isJobCancelled(jobId)) {
-          fs.rmSync(tmpOutPath, { force: true });
-          reject(new Error('Job đã bị hủy bởi quản trị viên.'));
-          return;
-        }
-
-        if (idleTimedOut) {
-          fs.rmSync(tmpOutPath, { force: true });
-          reject(
-            new RetryableNetworkError(
-              `Luồng stream DB ${dbName} không phản hồi dữ liệu quá 30 phút (Idle Timeout).`,
-              30
-            )
-          );
-          return;
-        }
-
-        if (code === 255) {
-          fs.rmSync(tmpOutPath, { force: true });
-          reject(
-            new RetryableNetworkError(
-              `Đứt kết nối SSH giữa chừng khi stream DB ${dbName}: ${stderr.trim()}`,
-              255
-            )
-          );
-          return;
-        }
-
-        if (code !== 0) {
-          fs.rmSync(tmpOutPath, { force: true });
-          reject(
-            new Error(
-              `mysqldump stream cho DB "${dbName}" thất bại (PIPESTATUS code ${code}): ${stderr.trim()}`
-            )
-          );
-          return;
-        }
-
-        const tmpStat = fs.statSync(tmpOutPath, { throwIfNoEntry: false });
-        const sizeBytes = tmpStat ? tmpStat.size : 0;
-        if (sizeBytes < (useZstd ? 8 : 20)) {
-          fs.rmSync(tmpOutPath, { force: true });
-          reject(
-            new Error(
-              `Tệp nén SQL cho DB "${dbName}" bị rỗng hoặc cắt cụt bất thường (${sizeBytes} bytes).`
-            )
-          );
-          return;
-        }
-
-        // Xác minh magic bytes luồng nén (gzip 0x1f8b / zstd 0x28b52ffd) trước khi commit tên file chính thức
-        const fd = fs.openSync(tmpOutPath, 'r');
-        const header = Buffer.alloc(4);
-        fs.readSync(fd, header, 0, 4, 0);
-        fs.closeSync(fd);
-        const validMagic = useZstd
-          ? header[0] === 0x28 &&
-            header[1] === 0xb5 &&
-            header[2] === 0x2f &&
-            header[3] === 0xfd
-          : header[0] === 0x1f && header[1] === 0x8b;
-
-        if (!validMagic) {
-          fs.rmSync(tmpOutPath, { force: true });
-          reject(
-            new Error(
-              `Tệp dump DB "${dbName}" không có định dạng nén ${
-                useZstd ? 'Zstandard' : 'Gzip'
-              } hợp lệ.`
-            )
-          );
-          return;
-        }
-
-        fs.renameSync(tmpOutPath, outPath);
-        onLog(
-          `[DB Stream] Đã stream trực tiếp ${dbName} ➔ ${fileName} (${(
-            sizeBytes / 1024
-          ).toFixed(1)} KB, không tốn ổ cứng tạm VPS).`
-        );
-        resolve({ fileName, sizeBytes });
-      };
-    });
-  });
-}
-
-/**
- * Mô phỏng sao lưu thực tế trên ổ cứng Local cho các máy chủ Demo (is_mock = 1),
- * sử dụng Hard Link thật (fs.linkSync) để test Incremental, Explorer, Diff Viewer & Sandbox Verify trên Windows!
- */
-async function simulateMockDomainSync(params: {
-  jobId: number;
-  server: ServerRecord;
-  domainInfo: DiscoveredDomain;
-  snapshotName: string;
-  destPublicHtmlDir: string;
-  destDatabasesDir: string;
-  linkDestPublicHtmlDir: string | null;
-  onProgress: (pct: number, speedBps: number, etaSec: number) => void;
-  onLog: (msg: string) => void;
-}): Promise<{
-  filesTotal: number;
-  filesChanged: number;
-  totalBytes: number;
-  deltaBytes: number;
-  dbResults: DatabaseBackupInfo[];
-}> {
-  const {
-    jobId,
-    server,
-    domainInfo,
-    snapshotName,
-    destPublicHtmlDir,
-    destDatabasesDir,
-    linkDestPublicHtmlDir,
-    onProgress,
-    onLog,
-  } = params;
-
-  fs.mkdirSync(destPublicHtmlDir, { recursive: true });
-  fs.mkdirSync(path.join(destPublicHtmlDir, 'assets'), { recursive: true });
-  fs.mkdirSync(path.join(destPublicHtmlDir, 'includes'), { recursive: true });
-  fs.mkdirSync(destDatabasesDir, { recursive: true });
-
-  const staticFiles: Record<string, string> = {
-    '.htaccess': `# BEGIN NAS-Sync Optimized Rewrite\nRewriteEngine On\nRewriteBase /\nRewriteCond %{REQUEST_FILENAME} !-f\nRewriteCond %{REQUEST_FILENAME} !-d\nRewriteRule . /index.php [L]\n# END Rewrite\n`,
-    'assets/style.css': `/* Theme stylesheet for ${domainInfo.domain} */\nbody { font-family: system-ui, sans-serif; margin: 0; background: #f8fafc; color: #0f172a; }\n.container { max-width: 1200px; margin: 0 auto; padding: 2rem; }\n`,
-    'includes/bootstrap.php': `<?php\n// Core bootstrapper for ${domainInfo.domain}\ndefine('APP_ENV', 'production');\ndefine('PANEL_ORIGIN', '${server.panel_type}');\ndefine('SYS_USER', '${domainInfo.systemUser}');\n`,
-    'robots.txt': `User-agent: *\nAllow: /\nSitemap: https://${domainInfo.domain}/sitemap.xml\n`,
-  };
-
-  // File thay đổi mỗi bản snapshot để test Incremental & Diff Viewer!
-  const dynamicFiles: Record<string, string> = {
-    'index.php': `<?php\n/**\n * Website: ${domainInfo.domain}\n * Hosted on: ${server.hostname} (${server.panel_type})\n * Snapshot Version: ${snapshotName}\n */\nrequire_once __DIR__ . '/includes/bootstrap.php';\nrequire_once __DIR__ . '/wp-config.php';\n\n$buildVersion = '${snapshotName}';\n$activeVisitors = ${Math.floor(
-      120 + Math.random() * 500
-    )};\necho "<h1>Welcome to ${domainInfo.domain} — Build " . htmlspecialchars($buildVersion) . "</h1>";\n`,
-    'wp-config.php': `<?php\ndefine('DB_NAME', '${
-      domainInfo.databases[0]?.name || 'app_db'
-    }');\ndefine('DB_USER', '${
-      domainInfo.databases[0]?.user || domainInfo.systemUser
-    }');\ndefine('DB_HOST', 'localhost');\ndefine('WP_CACHE', true);\ndefine('NAS_SYNC_LAST_RUN', '${new Date().toISOString()}');\n`,
-  };
-
-  let filesTotal = 0;
-  let filesChanged = 0;
-  let totalBytes = 0;
-  let deltaBytes = 0;
-
-  const steps = 4;
-  for (let s = 1; s <= steps; s++) {
-    if (isJobCancelled(jobId)) {
-      throw new Error('Job đã bị hủy bởi quản trị viên.');
-    }
-    await new Promise((r) => setTimeout(r, 260));
-    onProgress(
-      Math.round((s / steps) * 100),
-      18 * 1024 * 1024 + Math.floor(Math.random() * 8 * 1024 * 1024),
-      Math.max(1, steps - s)
-    );
-  }
-
-  // Ghi file tĩnh bằng Hard Link từ bản latest nếu không đổi (mô phỏng chính xác rsync --link-dest)
-  for (const [relPath, content] of Object.entries(staticFiles)) {
-    filesTotal++;
-    const destFile = path.join(destPublicHtmlDir, relPath);
-    const prevFile = linkDestPublicHtmlDir
-      ? path.join(linkDestPublicHtmlDir, relPath)
-      : null;
-
-    if (prevFile && fs.existsSync(prevFile)) {
-      try {
-        if (fs.existsSync(destFile)) fs.unlinkSync(destFile);
-        fs.linkSync(prevFile, destFile);
-        const sz = fs.statSync(destFile).size;
-        totalBytes += sz;
-        continue;
-      } catch {
-        // Fallback ghi thường nếu khác ổ đĩa
-      }
-    }
-    fs.writeFileSync(destFile, content, 'utf8');
-    const sz = Buffer.byteLength(content, 'utf8');
-    totalBytes += sz;
-    deltaBytes += sz;
-    filesChanged++;
-  }
-
-  // Ghi file có cập nhật mới (tốn dung lượng thực Delta)
-  for (const [relPath, content] of Object.entries(dynamicFiles)) {
-    filesTotal++;
-    filesChanged++;
-    const destFile = path.join(destPublicHtmlDir, relPath);
-    fs.writeFileSync(destFile, content, 'utf8');
-    const sz = Buffer.byteLength(content, 'utf8');
-    totalBytes += sz;
-    deltaBytes += sz;
-  }
-
-  onLog(
-    `[Incremental Sync] ${domainInfo.domain}: Tổng ${filesTotal} files, thay đổi ${filesChanged} files (Hard-linked ${
-      filesTotal - filesChanged
-    } files từ bản latest).`
-  );
-
-  // Tạo file dump SQL nén chuẩn .sql.gz hợp lệ
-  const dbResults: DatabaseBackupInfo[] = [];
-  for (const dbItem of domainInfo.databases) {
-    const sqlContent = `-- NAS-Sync SQL Stream Dump
--- Host: ${server.hostname}    Database: ${dbItem.name}
--- Panel: ${server.panel_type}    Snapshot: ${snapshotName}
-SET NAMES utf8mb4;
-SET FOREIGN_KEY_CHECKS = 0;
-
-CREATE TABLE IF NOT EXISTS \`wp_options\` (
-  \`option_id\` bigint(20) unsigned NOT NULL AUTO_INCREMENT,
-  \`option_name\` varchar(191) NOT NULL DEFAULT '',
-  \`option_value\` longtext NOT NULL,
-  PRIMARY KEY (\`option_id\`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-
-INSERT INTO \`wp_options\` (\`option_name\`, \`option_value\`) VALUES
-('siteurl', 'https://${domainInfo.domain}'),
-('blogname', '${domainInfo.domain} Enterprise Portal'),
-('snapshot_tag', '${snapshotName}');
-
-CREATE TABLE IF NOT EXISTS \`wp_posts\` (
-  \`ID\` bigint(20) unsigned NOT NULL AUTO_INCREMENT,
-  \`post_title\` text NOT NULL,
-  \`post_status\` varchar(20) NOT NULL DEFAULT 'publish',
-  PRIMARY KEY (\`ID\`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-
-INSERT INTO \`wp_posts\` (\`post_title\`, \`post_status\`) VALUES
-('Chào mừng tới hệ thống ${domainInfo.domain}', 'publish'),
-('Bản ghi đồng bộ lúc ${new Date().toISOString()}', 'publish');
-
-SET FOREIGN_KEY_CHECKS = 1;
--- Dump completed on ${new Date().toISOString()}
-`;
-    const compressed = zlib.gzipSync(Buffer.from(sqlContent, 'utf8'));
-    const fileName = `${dbItem.name}.sql.gz`;
-    const dumpPath = path.join(destDatabasesDir, fileName);
-    fs.writeFileSync(dumpPath, compressed);
-
-    totalBytes += compressed.length;
-    deltaBytes += compressed.length;
-
-    onLog(
-      `[DB Stream] Đã stream trực tiếp ${dbItem.name} ➔ ${fileName} (${(
-        compressed.length / 1024
-      ).toFixed(2)} KB).`
-    );
-
-    dbResults.push({
-      name: dbItem.name,
-      db_user: dbItem.user,
-      file: fileName,
-      size_bytes: compressed.length,
-    });
-  }
-
-  return {
-    filesTotal,
-    filesChanged,
-    totalBytes,
-    deltaBytes,
-    dbResults,
-  };
-}
-
-/**
- * Thực thi toàn bộ luồng Sao lưu Cốt lõi cho 1 Job (Mục 5, 6, 7, 9.2, 9.3)
+ * Thực thi toàn bộ luồng Sao lưu Cốt lõi cho 1 Job (Mục 5, 6, 7, 9.2, 9.3 + v1.4.0 SSH TOFU Pinning)
  */
 export async function executeBackupJob(
   jobId: number,
@@ -832,7 +61,7 @@ export async function executeBackupJob(
     throw new Error(`Không tìm thấy Backup Job #${jobId}`);
   }
 
-  const server = db
+  let server = db
     .prepare('SELECT * FROM servers WHERE id = ?')
     .get(job.server_id) as unknown as ServerRecord | undefined;
 
@@ -842,86 +71,18 @@ export async function executeBackupJob(
 
   clearCancelledJob(jobId);
 
-  const logLines: string[] = job.live_log
-    ? job.live_log.split('\n').filter(Boolean)
-    : [];
+  const appendLog = createJobLogger({
+    jobId,
+    serverId: server.id,
+    hostname: server.hostname,
+    initialLog: job.live_log,
+  });
 
-  const appendLog = (msg: string) => {
-    const ts = new Date().toLocaleTimeString('vi-VN', { hour12: false });
-    const formatted = `[${ts}] ${msg}`;
-    logLines.push(formatted);
-    if (logLines.length > 250) {
-      logLines.splice(0, logLines.length - 250);
-    }
-    db.prepare('UPDATE backup_jobs SET live_log = ? WHERE id = ?').run(
-      logLines.join('\n'),
-      jobId
-    );
-    emitJobLog({
-      jobId,
-      serverId: server.id,
-      hostname: server.hostname,
-      line: formatted,
-      timestamp: ts,
-    });
-  };
-
-  const updateProgress = (patch: {
-    status?: BackupJob['status'];
-    progressPercent?: number;
-    currentPhase?: string;
-    currentDomain?: string;
-    speedBps?: number;
-    etaSeconds?: number;
-    totalSizeBytes?: number;
-    deltaSizeBytes?: number;
-  }) => {
-    const curr = db
-      .prepare('SELECT * FROM backup_jobs WHERE id = ?')
-      .get(jobId) as unknown as BackupJob;
-    if (!curr) return;
-
-    const nextStatus = patch.status ?? curr.status;
-    const nextPct = patch.progressPercent ?? curr.progress_percent;
-    const nextPhase = patch.currentPhase ?? curr.current_phase;
-    const nextDom = patch.currentDomain ?? curr.current_domain;
-    const nextSpeed = patch.speedBps ?? curr.speed_bps;
-    const nextEta = patch.etaSeconds ?? curr.eta_seconds;
-    const nextTotal = patch.totalSizeBytes ?? curr.total_size_bytes;
-    const nextDelta = patch.deltaSizeBytes ?? curr.delta_size_bytes;
-
-    db.prepare(
-      `UPDATE backup_jobs
-       SET status = ?, progress_percent = ?, current_phase = ?, current_domain = ?,
-           speed_bps = ?, eta_seconds = ?, total_size_bytes = ?, delta_size_bytes = ?
-       WHERE id = ?`
-    ).run(
-      nextStatus,
-      nextPct,
-      nextPhase,
-      nextDom,
-      nextSpeed,
-      nextEta,
-      nextTotal,
-      nextDelta,
-      jobId
-    );
-
-    emitJobProgress({
-      jobId,
-      serverId: server.id,
-      hostname: server.hostname,
-      status: nextStatus,
-      progressPercent: nextPct,
-      currentPhase: nextPhase,
-      currentDomain: nextDom,
-      speedBps: nextSpeed,
-      etaSeconds: nextEta,
-      deltaSizeBytes: nextDelta,
-      totalSizeBytes: nextTotal,
-      retryCount: curr.retry_count,
-    });
-  };
+  const updateProgress = createJobProgressUpdater({
+    jobId,
+    serverId: server.id,
+    hostname: server.hostname,
+  });
 
   const isResuming = job.retry_count > 0 || job.status === 'INTERRUPTED';
 
@@ -957,6 +118,21 @@ export async function executeBackupJob(
     );
 
     assertSafe(isSafeSnapshotName, job.snapshot_name, 'Snapshot Name');
+
+    // 1b. Xác thực khóa định danh SSH Host Key (TOFU Pinning & Chống MITM) trước mọi kết nối SSH/Rsync
+    updateProgress({
+      status: 'RUNNING',
+      progressPercent: 5,
+      currentPhase: 'Đang xác thực khóa định danh SSH Host Key (TOFU)...',
+    });
+    const hostKeyCheck = await ensureServerHostKeyPinned(server.id);
+    server =
+      (db
+        .prepare('SELECT * FROM servers WHERE id = ?')
+        .get(server.id) as unknown as ServerRecord | undefined) || server;
+    appendLog(
+      `[SSH TOFU] Xác thực khóa định danh máy chủ thành công (${hostKeyCheck.status}: ${hostKeyCheck.fingerprint}).`
+    );
 
     const hostDir = path.join(activeVolume.mount_path, server.hostname);
     const inProgressDir = path.join(
@@ -1033,9 +209,7 @@ export async function executeBackupJob(
 
     // 3. Lặp qua từng Domain: Đồng bộ mã nguồn + Stream DB + Lưu metadata.json
     for (let idx = 0; idx < domains.length; idx++) {
-      if (isJobCancelled(jobId)) {
-        throw new Error('Job đã bị hủy bởi quản trị viên.');
-      }
+      throwIfCancelled(jobId);
 
       const dom = domains[idx];
       const basePct = 10 + Math.round((idx / Math.max(1, domains.length)) * 72);
@@ -1069,7 +243,10 @@ export async function executeBackupJob(
       let webrootBackedUp = 1;
       let securityJailViolationReason: string | null = null;
 
-      if (domState.filesSynced && Object.keys(domState.completedDbs).length >= dom.databases.length) {
+      if (
+        domState.filesSynced &&
+        Object.keys(domState.completedDbs).length >= dom.databases.length
+      ) {
         appendLog(
           `[Auto-Resume] ⏭️ Bỏ qua ${dom.domain} (Đã hoàn thành 100% trước khi ngắt mạng).`
         );
@@ -1089,7 +266,7 @@ export async function executeBackupJob(
         }
 
         if (server.is_mock) {
-          const mockRes = await simulateMockDomainSync({
+          const mockRes = await executeMockServerBackup({
             jobId,
             server,
             domainInfo: dom,
@@ -1150,7 +327,6 @@ export async function executeBackupJob(
                 domState.deltaBytes = 0;
                 saveState(stateFilePath, state);
               } else {
-                // JAIL_VIOLATION: Phát hiện symlink thoát khỏi home của user (VD: trỏ tới /root, /etc hoặc user khác)
                 webrootBackedUp = 0;
                 securityJailViolationReason = safety.reason;
                 appendLog(
@@ -1216,7 +392,7 @@ export async function executeBackupJob(
               currentPhase: `Đang stream Database ${dbEntry.name}`,
               currentDomain: dom.domain,
             });
-            const dumpRes = await runSshStreamDatabaseDump({
+            const dumpRes = await streamRemoteMysqlDumpToZst({
               jobId,
               server,
               creds: mysqlCreds,
@@ -1305,7 +481,6 @@ export async function executeBackupJob(
       etaSeconds: 2,
     });
 
-    // Dọn file trạng thái tạm trước khi khóa thư mục chính thức
     fs.rmSync(stateFilePath, { force: true });
     if (fs.existsSync(finalSnapshotDir)) {
       fs.rmSync(finalSnapshotDir, { recursive: true, force: true });
@@ -1362,7 +537,6 @@ export async function executeBackupJob(
       }
     }
 
-    // Chỉ cập nhật con trỏ symlink `latest` sau khi hoàn tất kiểm tra Ransomware & Sandbox
     if (!anomalyResult.anomalyDetected) {
       await updateLatestSymlink(hostDir, finalSnapshotDir);
       appendLog(
@@ -1386,6 +560,12 @@ export async function executeBackupJob(
     db.prepare(`UPDATE servers SET status = 'ONLINE' WHERE id = ?`).run(
       server.id
     );
+
+    try {
+      captureDailyStorageSnapshot();
+    } catch {
+      // Ignore stats snapshot errors
+    }
 
     appendLog(
       `✅ Sao lưu hoàn tất 100%! Tổng dung lượng bản backup: ${(
@@ -1447,6 +627,12 @@ export async function executeBackupJob(
       server.id
     );
 
+    try {
+      captureDailyStorageSnapshot();
+    } catch {
+      // Ignore stats snapshot errors
+    }
+
     if (finalStatus === 'FAILED') {
       await createSystemAlert({
         severity: 'CRITICAL',
@@ -1464,4 +650,3 @@ export async function executeBackupJob(
     clearCancelledJob(jobId);
   }
 }
-

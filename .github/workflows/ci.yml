@@ -1,4 +1,4 @@
-name: CI — Typecheck & Production Build
+name: CI — Typecheck, Security Tests & Production Build
 
 on:
   push:
@@ -8,7 +8,7 @@ on:
 
 jobs:
   verify:
-    name: Verify TypeScript & Next.js Build (Node 24)
+    name: Verify TypeScript, Unit Tests & Next.js Build (Node 24)
     runs-on: ubuntu-latest
 
     steps:
@@ -27,6 +27,8 @@ jobs:
       - name: Run TypeScript typecheck
         run: npm run typecheck
 
+      - name: Run Automated Security & Engine Unit Tests
+        run: npm test
+
       - name: Build production bundle
         run: npm run build
-

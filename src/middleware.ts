@@ -4,6 +4,26 @@ import { SESSION_COOKIE_NAME, verifySessionToken } from '@/lib/jwt-edge';
 const PUBLIC_PATHS = ['/login', '/api/auth/login', '/api/health'];
 const STATE_CHANGING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
+function isPublicPwaOrStaticPath(pathname: string): boolean {
+  return (
+    pathname.startsWith('/_next') ||
+    pathname.startsWith('/socket.io') ||
+    pathname === '/favicon.ico' ||
+    pathname === '/manifest.webmanifest' ||
+    pathname === '/manifest.json' ||
+    pathname === '/sw.js' ||
+    pathname === '/icons' ||
+    pathname.startsWith('/icons/') ||
+    pathname === '/apple-icon' ||
+    pathname.startsWith('/apple-icon/') ||
+    pathname.startsWith('/apple-icon.') ||
+    pathname === '/apple-touch-icon.png' ||
+    pathname === '/icon' ||
+    pathname.startsWith('/icon/') ||
+    pathname.startsWith('/icon.')
+  );
+}
+
 function matchesExpectedHost(sourceUrl: string, rawExpectedHost: string): boolean {
   if (!rawExpectedHost) return false;
   try {
@@ -56,9 +76,7 @@ export async function middleware(req: NextRequest) {
   }
 
   if (
-    pathname.startsWith('/_next') ||
-    pathname.startsWith('/socket.io') ||
-    pathname === '/favicon.ico' ||
+    isPublicPwaOrStaticPath(pathname) ||
     PUBLIC_PATHS.some((p) => pathname === p || pathname.startsWith(`${p}/`))
   ) {
     return NextResponse.next();
@@ -82,6 +100,7 @@ export async function middleware(req: NextRequest) {
 }
 
 export const config = {
-  matcher: ['/((?!_next/static|_next/image|favicon.ico).*)'],
+  matcher: [
+    '/((?!_next/static|_next/image|favicon.ico|manifest.webmanifest|sw.js|icons/).*)',
+  ],
 };
-

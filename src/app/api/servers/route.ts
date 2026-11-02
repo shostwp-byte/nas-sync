@@ -1,31 +1,46 @@
 import fs from 'node:fs';
 import { NextRequest, NextResponse } from 'next/server';
+import { safeErrorJson, sanitizeErrorMessage } from '@/lib/api-error';
 import { recordAuditLog } from '@/lib/audit';
 import { requireRole } from '@/lib/auth';
 import { getDb } from '@/lib/db';
 import { validateExcludePatternsInput } from '@/lib/engine/exclude-rules';
 import { validateServerConnectionFields } from '@/lib/engine/safe-names';
-import { resolveValidatedSshKeyPath } from '@/lib/ssh';
+import { MOCK_HOST_KEY_FINGERPRINT, resolveValidatedSshKeyPath } from '@/lib/ssh';
 
 export async function GET() {
-  const guard = await requireRole(['ADMIN', 'OPERATOR', 'VIEWER']);
-  if (!guard.ok) return guard.response;
+  try {
+    const guard = await requireRole(['ADMIN', 'OPERATOR', 'VIEWER']);
+    if (!guard.ok) return guard.response;
 
-  const servers = getDb()
-    .prepare(
-      `SELECT
-         s.*,
-         v.name AS assigned_volume_name,
-         v.mount_path AS assigned_volume_path,
-         (SELECT COUNT(*) FROM backup_jobs j WHERE j.server_id = s.id AND j.job_type = 'BACKUP' AND j.status = 'COMPLETED') AS snapshots_count,
-         (SELECT MAX(completed_at) FROM backup_jobs j WHERE j.server_id = s.id AND j.job_type = 'BACKUP' AND j.status = 'COMPLETED') AS last_backup_at
-       FROM servers s
-       LEFT JOIN storage_volumes v ON v.id = s.assigned_volume_id
-       ORDER BY s.id DESC`
-    )
-    .all();
+    const rawServers = getDb()
+      .prepare(
+        `SELECT
+           s.*,
+           v.name AS assigned_volume_name,
+           v.mount_path AS assigned_volume_path,
+           (SELECT COUNT(*) FROM backup_jobs j WHERE j.server_id = s.id AND j.job_type = 'BACKUP' AND j.status = 'COMPLETED') AS snapshots_count,
+           (SELECT MAX(completed_at) FROM backup_jobs j WHERE j.server_id = s.id AND j.job_type = 'BACKUP' AND j.status = 'COMPLETED') AS last_backup_at
+         FROM servers s
+         LEFT JOIN storage_volumes v ON v.id = s.assigned_volume_id
+         ORDER BY s.id DESC`
+      )
+      .all();
 
-  return NextResponse.json({ servers });
+    const servers = rawServers.map((row) => {
+      const copy: Record<string, unknown> = { ...row };
+      delete copy.known_host_entry;
+      delete copy.host_key_pending_entry;
+      if (guard.session.role === 'VIEWER') {
+        copy.ssh_key_path = '';
+      }
+      return copy;
+    });
+
+    return NextResponse.json({ servers });
+  } catch (err) {
+    return safeErrorJson(err, 'Không thể tải danh sách máy chủ VPS.');
+  }
 }
 
 export async function POST(req: NextRequest) {
@@ -79,7 +94,7 @@ export async function POST(req: NextRequest) {
         sshKeyPath = resolveValidatedSshKeyPath(rawSshKeyPath);
       } catch (err) {
         return NextResponse.json(
-          { error: (err as Error).message },
+          { error: sanitizeErrorMessage(err, 'Đường dẫn khóa SSH không hợp lệ.') },
           { status: 400 }
         );
       }
@@ -108,11 +123,14 @@ export async function POST(req: NextRequest) {
       assignedVolId = defVol ? Number(defVol.id) : null;
     }
 
+    const initialHostKeyStatus = isMock ? 'VERIFIED' : 'UNPINNED';
+    const initialHostKeyFp = isMock ? MOCK_HOST_KEY_FINGERPRINT : '';
+
     const res = db
       .prepare(
         `INSERT INTO servers
-         (hostname, ip_address, ssh_port, ssh_user, ssh_key_path, panel_type, assigned_volume_id, bw_limit_kbps, status, is_mock, notes, custom_excludes)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ONLINE', ?, ?, ?)`
+         (hostname, ip_address, ssh_port, ssh_user, ssh_key_path, panel_type, assigned_volume_id, bw_limit_kbps, status, is_mock, notes, custom_excludes, host_key_status, host_key_fingerprint)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ONLINE', ?, ?, ?, ?, ?)`
       )
       .run(
         hostname,
@@ -125,7 +143,9 @@ export async function POST(req: NextRequest) {
         bwLimit,
         isMock,
         notes,
-        excludeCheck.normalized
+        excludeCheck.normalized,
+        initialHostKeyStatus,
+        initialHostKeyFp
       );
 
     const serverId = Number(res.lastInsertRowid);
@@ -144,9 +164,6 @@ export async function POST(req: NextRequest) {
       serverId,
     });
   } catch (err) {
-    return NextResponse.json(
-      { error: (err as Error).message },
-      { status: 500 }
-    );
+    return safeErrorJson(err, 'Không thể thêm máy chủ VPS mới.');
   }
 }

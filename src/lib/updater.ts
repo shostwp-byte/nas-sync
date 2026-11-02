@@ -19,6 +19,7 @@ const PREBUILT_SHA256_NAME = 'nas-sync-prebuilt.tar.gz.sha256';
 
 const SYNC_TARGETS = [
   'src',
+  'public',
   '.next',
   'server.ts',
   'package.json',

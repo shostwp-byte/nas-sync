@@ -28,6 +28,8 @@ services:
 
   app:
     build: .
+    # Có thể chuyển từ `build: .` sang Docker Image dựng sẵn đa kiến trúc (amd64/arm64) trên GHCR nếu muốn khởi chạy tức thì:
+    # image: ghcr.io/shostwp-byte/nas-sync:latest
     container_name: nas_sync_core
     restart: unless-stopped
     security_opt:

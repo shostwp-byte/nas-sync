@@ -1,15 +1,21 @@
 import { spawn } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import type { ServerRecord } from '@/types';
-import { getDb, getSshKeysDir } from './db';
+import type { HostKeyStatus, ServerRecord } from '@/types';
+import { getDataDir, getDb, getSshKeysDir } from './db';
+import { isSafeHostAddress } from './engine/safe-names';
+import { createSystemAlert } from './notifications';
 
 export interface CommandResult {
   code: number;
   stdout: string;
   stderr: string;
 }
+
+export const MOCK_HOST_KEY_FINGERPRINT =
+  'SHA256:MockEd25519HostKeyPinningDemoV140';
 
 /**
  * Bọc câu lệnh trên VPS bằng ionice và nice để đảm bảo Zero-Impact Backup (Mục 5.1)
@@ -26,6 +32,8 @@ export function shellSingleQuote(str: string): string {
 }
 
 const SAFE_SSH_KEY_NAME_RE = /^[A-Za-z0-9._-]{1,64}$/;
+const OPENSSH_KEY_TYPE_RE = /^(?:ssh-|ecdsa-sha2-|sk-)[A-Za-z0-9@._-]+$/;
+const BASE64_BLOB_RE = /^[A-Za-z0-9+/]+={0,2}$/;
 
 const RESERVED_OPENSSH_CONTROL_FILES = new Set([
   'config',
@@ -36,6 +44,388 @@ const RESERVED_OPENSSH_CONTROL_FILES = new Set([
   'rc',
   'environment',
 ]);
+
+export interface ParsedOpenSshKeyLine {
+  hostToken: string;
+  keyType: string;
+  keyBase64: string;
+  rawLine: string;
+}
+
+function parseSingleOpenSshKeyLine(line: string): ParsedOpenSshKeyLine | null {
+  const trimmed = String(line || '').trim();
+  if (!trimmed || trimmed.startsWith('#') || /[\0\r\n]/.test(trimmed)) {
+    return null;
+  }
+
+  const tokens = trimmed.split(/\s+/);
+  let hostToken = '';
+  let keyType = '';
+  let keyBase64 = '';
+
+  if (tokens.length >= 2 && OPENSSH_KEY_TYPE_RE.test(tokens[0])) {
+    keyType = tokens[0];
+    keyBase64 = tokens[1];
+  } else if (tokens.length >= 3 && OPENSSH_KEY_TYPE_RE.test(tokens[1])) {
+    hostToken = tokens[0];
+    keyType = tokens[1];
+    keyBase64 = tokens[2];
+  } else {
+    return null;
+  }
+
+  if (!BASE64_BLOB_RE.test(keyBase64) || keyBase64.length < 24) {
+    return null;
+  }
+
+  const decoded = Buffer.from(keyBase64, 'base64');
+  if (
+    decoded.length < 16 ||
+    decoded.toString('base64').replace(/=+$/, '') !==
+      keyBase64.replace(/=+$/, '')
+  ) {
+    return null;
+  }
+
+  const normalizedLine = hostToken
+    ? `${hostToken} ${keyType} ${keyBase64}`
+    : `${keyType} ${keyBase64}`;
+
+  return {
+    hostToken,
+    keyType,
+    keyBase64,
+    rawLine: normalizedLine,
+  };
+}
+
+/**
+ * Tính dấu vân tay OpenSSH chuẩn RFC 4253 (`SHA256:<unpadded-base64> (<KEYTYPE>)`)
+ * trực tiếp bằng `node:crypto` không phụ thuộc tiến trình ngoài.
+ */
+export function computeOpenSshKeyFingerprint(knownHostLine: string): string {
+  const parsed = parseSingleOpenSshKeyLine(knownHostLine);
+  if (!parsed) {
+    throw new Error('Dòng khóa định danh OpenSSH không hợp lệ.');
+  }
+
+  const rawKeyBytes = Buffer.from(parsed.keyBase64, 'base64');
+  const digest = crypto
+    .createHash('sha256')
+    .update(rawKeyBytes)
+    .digest('base64')
+    .replace(/=+$/, '');
+
+  return `SHA256:${digest} (${parsed.keyType.toUpperCase()})`;
+}
+
+function parseKnownHostsBlock(rawBlock: string): ParsedOpenSshKeyLine[] {
+  if (!rawBlock) return [];
+  const entries: ParsedOpenSshKeyLine[] = [];
+  const seen = new Set<string>();
+
+  for (const line of String(rawBlock).split(/\r?\n/)) {
+    const parsed = parseSingleOpenSshKeyLine(line);
+    if (!parsed || !parsed.hostToken) continue;
+    const dedupKey = `${parsed.hostToken}|${parsed.keyType}|${parsed.keyBase64}`;
+    if (!seen.has(dedupKey)) {
+      seen.add(dedupKey);
+      entries.push(parsed);
+    }
+  }
+  return entries;
+}
+
+function selectPrimaryHostKeyEntry(
+  entries: ParsedOpenSshKeyLine[]
+): ParsedOpenSshKeyLine {
+  return (
+    entries.find((e) => e.keyType === 'ssh-ed25519') ||
+    entries.find((e) => e.keyType === 'ecdsa-sha2-nistp256') ||
+    entries.find((e) => e.keyType.startsWith('ecdsa-sha2-')) ||
+    entries.find((e) => e.keyType === 'ssh-rsa') ||
+    entries[0]
+  );
+}
+
+export function getKnownHostsDir(): string {
+  const dir = path.join(getDataDir(), 'known_hosts');
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  }
+  if (process.platform !== 'win32') {
+    try {
+      fs.chmodSync(dir, 0o700);
+    } catch {
+      // Bỏ qua trên mount chỉ đọc hoặc có Synology RichACL
+    }
+  }
+  return dir;
+}
+
+export function removeServerKnownHostsCache(serverId: number): void {
+  if (!Number.isInteger(serverId) || serverId <= 0) return;
+  const fileName = `server_${serverId}.known_hosts`;
+  const candidates = [
+    path.join(getKnownHostsDir(), fileName),
+    path.join(os.tmpdir(), '.nas_sync_known_hosts', fileName),
+  ];
+  for (const filePath of candidates) {
+    try {
+      fs.rmSync(filePath, { force: true });
+    } catch {
+      // Ignore cleanup errors
+    }
+  }
+}
+
+export function materializeServerKnownHostsFile(
+  server: ServerRecord
+): string | null {
+  if (server.host_key_status === 'MISMATCH') {
+    return null;
+  }
+  const entry = (server.known_host_entry || '').trim();
+  if (!entry) {
+    return null;
+  }
+
+  const validEntries = parseKnownHostsBlock(entry);
+  if (validEntries.length === 0) {
+    return null;
+  }
+
+  const content = `${validEntries.map((e) => e.rawLine).join('\n')}\n`;
+  const fileName = `server_${Number(server.id || 0)}.known_hosts`;
+  const primaryPath = path.join(getKnownHostsDir(), fileName);
+
+  try {
+    const existing = fs.existsSync(primaryPath)
+      ? fs.readFileSync(primaryPath, 'utf8')
+      : null;
+    if (existing !== content) {
+      fs.writeFileSync(primaryPath, content, { encoding: 'utf8', mode: 0o600 });
+    }
+  } catch {
+    // Nếu không ghi được vào DATA_DIR, fallback thẳng sang tmpdir bên dưới
+  }
+
+  if (process.platform === 'win32' && fs.existsSync(primaryPath)) {
+    return primaryPath;
+  }
+
+  if (process.platform !== 'win32' && fs.existsSync(primaryPath)) {
+    try {
+      fs.chmodSync(primaryPath, 0o600);
+    } catch {
+      // Ignore RichACL warning
+    }
+    try {
+      const stat = fs.statSync(primaryPath);
+      const currentUid =
+        typeof process.getuid === 'function' ? process.getuid() : 0;
+      if ((stat.mode & 0o077) === 0 && stat.uid === currentUid) {
+        return primaryPath;
+      }
+    } catch {
+      // Fallback sang tmpfs
+    }
+  }
+
+  // Nếu thư mục bind-mount trên Synology Btrfs dính Windows ACL (0777 hoặc UID khác),
+  // tạo bản sao chuẩn quyền 0600 trong tmpfs nội bộ container
+  const safeTmpDir = path.join(os.tmpdir(), '.nas_sync_known_hosts');
+  fs.mkdirSync(safeTmpDir, { recursive: true, mode: 0o700 });
+  if (process.platform !== 'win32') {
+    try {
+      fs.chmodSync(safeTmpDir, 0o700);
+    } catch {
+      // Ignore
+    }
+  }
+  const stagedPath = path.join(safeTmpDir, fileName);
+  fs.writeFileSync(stagedPath, content, { encoding: 'utf8', mode: 0o600 });
+  if (process.platform !== 'win32') {
+    try {
+      fs.chmodSync(stagedPath, 0o600);
+    } catch {
+      // Ignore
+    }
+  }
+  return stagedPath;
+}
+
+function assertNotHostKeyMismatch(server: ServerRecord): void {
+  if (server.host_key_status === 'MISMATCH') {
+    throw new Error(
+      `[SECURITY] Máy chủ "${server.hostname}" đang bị khóa kết nối do phát hiện thay đổi SSH Host Key bất thường! Quản trị viên (ADMIN) cần kiểm tra và xác nhận trên trang Máy chủ VPS.`
+    );
+  }
+}
+
+/**
+ * Cơ chế TOFU (Trust-On-First-Use) & Khóa chống tấn công MITM cho SSH Host Key:
+ * - Lần kết nối đầu tiên (`UNPINNED`): quét khóa định danh và ghim cố định vào SQLite (`VERIFIED`).
+ * - Các lần sau: đối chiếu toàn bộ dòng khóa OpenSSH; nếu khóa thay đổi bất thường sẽ chuyển sang `MISMATCH`,
+ *   khóa kết nối ngay lập tức và phát cảnh báo an ninh CRITICAL.
+ */
+export async function ensureServerHostKeyPinned(
+  serverId: number,
+  injectedScanStdout?: string
+): Promise<{ status: HostKeyStatus; fingerprint: string; changed?: boolean }> {
+  const db = getDb();
+  const server = db
+    .prepare('SELECT * FROM servers WHERE id = ?')
+    .get(serverId) as unknown as ServerRecord | undefined;
+
+  if (!server) {
+    throw new Error(`Không tìm thấy máy chủ ID=${serverId}`);
+  }
+
+  if (server.is_mock) {
+    const fp = server.host_key_fingerprint || MOCK_HOST_KEY_FINGERPRINT;
+    if (server.host_key_status !== 'VERIFIED' || !server.host_key_fingerprint) {
+      db.prepare(
+        `UPDATE servers
+         SET host_key_status = 'VERIFIED',
+             host_key_fingerprint = ?,
+             host_key_pending_fingerprint = '',
+             host_key_pending_entry = ''
+         WHERE id = ?`
+      ).run(fp, server.id);
+    }
+    return { status: 'VERIFIED', fingerprint: fp, changed: false };
+  }
+
+  const ipAddr = (server.ip_address || '').trim();
+  const port = Number(server.ssh_port || 22);
+  if (!isSafeHostAddress(ipAddr)) {
+    throw new Error('Địa chỉ IP / Hostname của máy chủ không hợp lệ.');
+  }
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error(`Cổng SSH không hợp lệ: ${server.ssh_port}`);
+  }
+
+  let scanStdout = '';
+  let scanStderr = '';
+  if (injectedScanStdout !== undefined) {
+    scanStdout = injectedScanStdout;
+  } else {
+    const scanRes = await execLocalCommand(
+      'ssh-keyscan',
+      ['-T', '10', '-p', String(port), ipAddr],
+      15000
+    );
+    scanStdout = scanRes.stdout;
+    scanStderr = scanRes.stderr;
+  }
+
+  const scannedEntries = parseKnownHostsBlock(scanStdout);
+  if (scannedEntries.length === 0) {
+    assertNotHostKeyMismatch(server);
+    const detail = scanStderr
+      .split(/\r?\n/)
+      .filter((l) => l.trim() && !l.trim().startsWith('#'))
+      .join(' ')
+      .trim();
+    throw new Error(
+      `Không thể thu thập SSH Host Key từ ${ipAddr}:${port}${
+        detail ? ` (${detail})` : ' — Vui lòng kiểm tra kết nối mạng hoặc cổng SSH'
+      }.`
+    );
+  }
+
+  const primaryScanned = selectPrimaryHostKeyEntry(scannedEntries);
+  const scannedFingerprint = computeOpenSshKeyFingerprint(
+    primaryScanned.rawLine
+  );
+  const normalizedScannedBlock = scannedEntries.map((e) => e.rawLine).join('\n');
+
+  const storedRaw = (server.known_host_entry || '').trim();
+  if (!storedRaw || server.host_key_status === 'UNPINNED') {
+    db.prepare(
+      `UPDATE servers
+       SET known_host_entry = ?,
+           host_key_fingerprint = ?,
+           host_key_status = 'VERIFIED',
+           host_key_pending_fingerprint = '',
+           host_key_pending_entry = ''
+       WHERE id = ?`
+    ).run(normalizedScannedBlock, scannedFingerprint, server.id);
+    removeServerKnownHostsCache(server.id);
+    return {
+      status: 'VERIFIED',
+      fingerprint: scannedFingerprint,
+      changed: false,
+    };
+  }
+
+  const storedEntries = parseKnownHostsBlock(storedRaw);
+  const storedKeyIdentities = new Set(
+    storedEntries.map((e) => `${e.keyType} ${e.keyBase64}`)
+  );
+  const anyKeyMatched =
+    storedEntries.length > 0 &&
+    scannedEntries.some((s) =>
+      storedKeyIdentities.has(`${s.keyType} ${s.keyBase64}`)
+    );
+
+  if (anyKeyMatched) {
+    const effectiveFp = server.host_key_fingerprint || scannedFingerprint;
+    if (
+      server.host_key_status !== 'VERIFIED' ||
+      server.known_host_entry !== normalizedScannedBlock ||
+      server.host_key_fingerprint !== effectiveFp ||
+      server.host_key_pending_entry ||
+      server.host_key_pending_fingerprint
+    ) {
+      db.prepare(
+        `UPDATE servers
+         SET known_host_entry = ?,
+             host_key_fingerprint = ?,
+             host_key_status = 'VERIFIED',
+             host_key_pending_fingerprint = '',
+             host_key_pending_entry = ''
+         WHERE id = ?`
+      ).run(normalizedScannedBlock, effectiveFp, server.id);
+      removeServerKnownHostsCache(server.id);
+    }
+    return {
+      status: 'VERIFIED',
+      fingerprint: effectiveFp,
+      changed: false,
+    };
+  }
+
+  // PHÁT HIỆN THAY ĐỔI HOST KEY BẤT THƯỜNG (NGUY CƠ MITM HOẶC CÀI LẠI OS VPS)!
+  const alreadyAlertedSameKey =
+    server.host_key_status === 'MISMATCH' &&
+    server.host_key_pending_fingerprint === scannedFingerprint;
+
+  db.prepare(
+    `UPDATE servers
+     SET host_key_status = 'MISMATCH',
+         host_key_pending_fingerprint = ?,
+         host_key_pending_entry = ?,
+         status = 'ERROR'
+     WHERE id = ?`
+  ).run(scannedFingerprint, normalizedScannedBlock, server.id);
+  removeServerKnownHostsCache(server.id);
+
+  if (!alreadyAlertedSameKey) {
+    await createSystemAlert({
+      severity: 'CRITICAL',
+      category: 'SYSTEM',
+      serverId: server.id,
+      title: `CẢNH BÁO AN NINH: Thay đổi SSH Host Key trên ${server.hostname}`,
+      message: `Phát hiện khóa định danh SSH của VPS ${server.hostname} (${server.ip_address}:${server.ssh_port}) đã thay đổi từ [${server.host_key_fingerprint}] sang [${scannedFingerprint}]! Hệ thống đã tự động khóa mọi kết nối Sao lưu/Khôi phục để phòng chống tấn công MITM.`,
+    });
+  }
+
+  throw new Error(
+    `[SECURITY] Phát hiện SSH Host Key của máy chủ "${server.hostname}" (${ipAddr}:${port}) đã thay đổi từ [${server.host_key_fingerprint}] sang [${scannedFingerprint}]! Hệ thống đã tự động khóa kết nối để chống tấn công MITM — Quản trị viên (ADMIN) cần kiểm tra và xác nhận trên trang Máy chủ VPS.`
+  );
+}
 
 export function validateSafeSshKeyName(rawName: string): string {
   const trimmed = String(rawName || '').trim();
@@ -170,10 +560,14 @@ function resolveServerKeyPath(server: ServerRecord): string | null {
 }
 
 export function buildSshBaseArgs(server: ServerRecord): string[] {
+  assertNotHostKeyMismatch(server);
+
   const port = Number(server.ssh_port || 22);
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     throw new Error(`Cổng SSH không hợp lệ: ${server.ssh_port}`);
   }
+
+  const knownHostsFile = materializeServerKnownHostsFile(server);
 
   const args: string[] = [
     '-F',
@@ -182,8 +576,25 @@ export function buildSshBaseArgs(server: ServerRecord): string[] {
     String(port),
     '-o',
     'BatchMode=yes',
-    '-o',
-    'StrictHostKeyChecking=accept-new',
+  ];
+
+  if (knownHostsFile) {
+    args.push(
+      '-o',
+      'StrictHostKeyChecking=yes',
+      '-o',
+      `UserKnownHostsFile=${knownHostsFile}`
+    );
+  } else {
+    args.push(
+      '-o',
+      'StrictHostKeyChecking=accept-new',
+      '-o',
+      'UserKnownHostsFile=/dev/null'
+    );
+  }
+
+  args.push(
     '-o',
     'IgnoreUnknown=WarnWeakCrypto,PubkeyAcceptedAlgorithms,HostKeyAlgorithms',
     '-o',
@@ -197,8 +608,8 @@ export function buildSshBaseArgs(server: ServerRecord): string[] {
     '-o',
     'ServerAliveInterval=15',
     '-o',
-    'ServerAliveCountMax=3',
-  ];
+    'ServerAliveCountMax=3'
+  );
 
   const resolvedKey = resolveServerKeyPath(server);
   if (resolvedKey) {
@@ -209,20 +620,35 @@ export function buildSshBaseArgs(server: ServerRecord): string[] {
 }
 
 export function buildRsyncSshTransport(server: ServerRecord): string {
+  assertNotHostKeyMismatch(server);
+
   const port = Number(server.ssh_port || 22);
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     throw new Error(`Cổng SSH không hợp lệ: ${server.ssh_port}`);
   }
 
   const resolvedKey = resolveServerKeyPath(server);
+  const knownHostsFile = materializeServerKnownHostsFile(server);
+
   const parts: string[] = ['ssh', '-F /dev/null'];
   if (resolvedKey) {
     parts.push(`-i ${shellSingleQuote(resolvedKey)}`);
   }
+  parts.push(`-p ${port}`, '-o BatchMode=yes');
+
+  if (knownHostsFile) {
+    parts.push(
+      '-o StrictHostKeyChecking=yes',
+      `-o UserKnownHostsFile=${shellSingleQuote(knownHostsFile)}`
+    );
+  } else {
+    parts.push(
+      '-o StrictHostKeyChecking=accept-new',
+      '-o UserKnownHostsFile=/dev/null'
+    );
+  }
+
   parts.push(
-    `-p ${port}`,
-    '-o BatchMode=yes',
-    '-o StrictHostKeyChecking=accept-new',
     '-o IgnoreUnknown=WarnWeakCrypto,PubkeyAcceptedAlgorithms,HostKeyAlgorithms',
     '-o WarnWeakCrypto=no',
     '-o PubkeyAcceptedAlgorithms=+ssh-rsa',
@@ -324,22 +750,33 @@ export async function testSshConnection(server: ServerRecord): Promise<{
   osInfo?: string;
   uptime?: string;
   latencyMs: number;
+  hostKeyStatus?: HostKeyStatus;
+  hostKeyFingerprint?: string;
   error?: string;
 }> {
   const start = Date.now();
   if (server.is_mock) {
+    const pinned = await ensureServerHostKeyPinned(server.id);
     await new Promise((r) => setTimeout(r, 250));
     return {
       ok: true,
       osInfo: 'AlmaLinux 9.4 (Mock Simulation Mode)',
       uptime: 'up 84 days, 12:40',
       latencyMs: Date.now() - start,
+      hostKeyStatus: pinned.status,
+      hostKeyFingerprint: pinned.fingerprint,
     };
   }
 
   try {
+    const pinned = await ensureServerHostKeyPinned(server.id);
+    const freshServer =
+      (getDb()
+        .prepare('SELECT * FROM servers WHERE id = ?')
+        .get(server.id) as unknown as ServerRecord | undefined) || server;
+
     const res = await execRemoteSSH(
-      server,
+      freshServer,
       'uname -sr && (uptime -p 2>/dev/null || uptime)',
       { timeoutMs: 15000 }
     );
@@ -349,16 +786,19 @@ export async function testSshConnection(server: ServerRecord): Promise<{
         .filter((line) => !line.trim().startsWith('** '))
         .join('\n')
         .trim();
-      let errorMsg = cleanedStderr || res.stderr.trim() || `SSH exited with code ${res.code}`;
+      let errorMsg =
+        cleanedStderr || res.stderr.trim() || `SSH exited with code ${res.code}`;
       if (errorMsg.includes('Permission denied')) {
-        const keyUsed = resolveServerKeyPath(server);
+        const keyUsed = resolveServerKeyPath(freshServer);
         errorMsg += keyUsed
-          ? ` — Đã thử khóa "${server.ssh_key_path || keyUsed}". Hãy đảm bảo bạn đã dán Public Key của khóa này vào ~/.ssh/authorized_keys trên VPS.`
+          ? ` — Đã thử khóa "${freshServer.ssh_key_path || keyUsed}". Hãy đảm bảo bạn đã dán Public Key của khóa này vào ~/.ssh/authorized_keys trên VPS.`
           : ' — Máy chủ này chưa được gán SSH Key! Hãy bấm "Quản lý SSH Keys" -> "+ Sinh Khóa SSH Mới" và dán lệnh cài Public Key lên VPS.';
       }
       return {
         ok: false,
         latencyMs: Date.now() - start,
+        hostKeyStatus: pinned.status,
+        hostKeyFingerprint: pinned.fingerprint,
         error: errorMsg,
       };
     }
@@ -368,6 +808,8 @@ export async function testSshConnection(server: ServerRecord): Promise<{
       osInfo: lines[0] || 'Linux',
       uptime: lines[1] || '',
       latencyMs: Date.now() - start,
+      hostKeyStatus: pinned.status,
+      hostKeyFingerprint: pinned.fingerprint,
     };
   } catch (err) {
     return {
@@ -420,4 +862,3 @@ export async function generateSshKeyPair(
     fingerprint,
   };
 }
-

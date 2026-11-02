@@ -17,6 +17,7 @@ const TEXT_EXTENSIONS = new Set([
   '.cjs',
   '.json',
   '.css',
+  '.svg',
   '.md',
   '.yml',
   '.yaml',
@@ -144,11 +145,17 @@ copyFileNormalizedLf(
   path.join(stageDir, '.env')
 );
 
-// Sao chép toàn bộ thư mục mã nguồn src/
+// Sao chép toàn bộ thư mục mã nguồn src/ và tài nguyên PWA public/
 copyDirectoryRecursive(
   path.join(projectRoot, 'src'),
   path.join(stageDir, 'src')
 );
+if (fs.existsSync(path.join(projectRoot, 'public'))) {
+  copyDirectoryRecursive(
+    path.join(projectRoot, 'public'),
+    path.join(stageDir, 'public')
+  );
+}
 
 // Tạo sẵn thư mục bind-mount để Synology Container Manager không báo lỗi "Bind mount folder does not exist"
 for (const emptyDir of ['app_data', 'ssh_keys']) {

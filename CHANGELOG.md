@@ -2,6 +2,23 @@
 
 Mọi thay đổi đáng chú ý của dự án **NAS-Sync** (<https://github.com/shostwp-byte/nas-sync>) đều được ghi nhận tại tài liệu này theo chuẩn [Keep a Changelog](https://keepachangelog.com/vi/1.1.0/) và [Semantic Versioning](https://semver.org/).
 
+## [1.4.0] - 2026-11-02
+
+### Added & Improved (Giai đoạn 2 — An ninh Chiều sâu, Báo cáo NOC Thông minh, PWA & Tối ưu Docker/CI)
+- **Ghim Vân tay Máy chủ SSH (`SSH Host Key TOFU Pinning`) & Bộ lọc Lỗi API (`src/lib/ssh.ts`, `src/lib/api-error.ts`, `api/servers/[id]/host-key/route.ts`, `servers/page.tsx`)**:
+  - Tự động quét và ghim vân tay định danh OpenSSH (`SHA256:...` chuẩn RFC 4253) của từng VPS ngay lần kết nối đầu tiên vào kho `known_hosts` biệt lập (`chmod 600`) kèm chế độ kiểm tra nghiêm ngặt `StrictHostKeyChecking=yes` trên mọi lệnh `ssh` và `rsync`.
+  - Phát hiện tức thì hành vi đổi Host Key bất thường (tấn công MITM hoặc cài lại OS), tự động khóa mọi kết nối Sao lưu/Khôi phục trên VPS đó, phát cảnh báo khẩn cấp `CRITICAL` và cung cấp quy trình xác nhận Host Key mới dành riêng cho `ADMIN` (lưu vết đầy đủ vào `audit_logs`).
+  - Bổ sung bộ lọc `sanitizeErrorMessage` / `safeErrorJson` che giấu đường dẫn nội bộ máy chủ và stack trace thô khỏi phản hồi API lỗi `500`.
+- **Báo cáo Tổng hợp Sáng sớm (`Daily Morning Digest`) & Phân tích Dung lượng 30 Ngày (`src/lib/engine/morning-digest.ts`, `api/settings/digest/route.ts`, `page.tsx`, `settings/page.tsx`)**:
+  - Lập lịch tự động gửi báo cáo tổng hợp hàng sáng (mặc định `07:00`, hỗ trợ bấm gửi thử 1-Click ngay trong Cài đặt) qua **Telegram & SMTP Email**: thống kê 24h qua (số Job thành công/thất bại, dung lượng tăng ròng, tỷ lệ tiết kiệm Hard-Link, số CSDL đạt `Verified ✅`, cảnh báo SSH TOFU & dung lượng trống từng Volume).
+  - Bổ sung bảng `storage_daily_stats` (tự động tổng hợp ngược lịch sử từ `backup_jobs`) cùng **Biểu đồ Tăng trưởng Dung lượng 30 Ngày** tương tác và bảng **Top 10 Website / Domain Dung lượng Lớn nhất** ngay trên Dashboard NOC.
+- **Ứng dụng Di động Độc lập (`PWA — Progressive Web App`) (`src/app/manifest.ts`, `public/icons/*`, `public/sw.js`, `PwaRegistrar.tsx`, `layout.tsx`)**:
+  - Hỗ trợ cài đặt **NAS-Sync** trực tiếp ra màn hình chính iOS (`apple-mobile-web-app-capable`) và Android/Desktop Chrome ở chế độ toàn màn hình `standalone` với bộ biểu tượng Dark NOC chuyên biệt và Service Worker an toàn (không bao giờ lưu đệm `/api/*` hay `/socket.io/*`).
+- **Kiến trúc Worker Mô-đun hóa, Bộ Kiểm thử Tự động `node:test` & Docker Image Đa Kiến trúc `GHCR` (`worker-state.ts`, `rsync-runner.ts`, `mysql-streamer.ts`, `mock-runner.ts`, `tests/security-and-engine.test.ts`, `Dockerfile`, `ci.yml`, `release.yml`)**:
+  - Tách nhỏ `backup-worker.ts` thành 5 module chuyên biệt rõ ràng, dễ bảo trì và mở rộng.
+  - Bổ sung 14 bài kiểm thử tự động toàn diện chạy trên `node:test` tích hợp sẵn của Node.js 24 (**không phát sinh thêm bất kỳ gói phụ thuộc npm nào**, giữ nguyên 100% tốc độ cập nhật Prebuilt ~5 giây trên NAS) vào quy trình kiểm định `CI`.
+  - Tối ưu `Dockerfile` (`npm ci`) và bổ sung GitHub Actions xuất bản tự động Docker Image đa kiến trúc (`linux/amd64`, `linux/arm64`) lên `ghcr.io/shostwp-byte/nas-sync`.
+
 ## [1.3.1] - 2026-11-02
 
 ### Fixed

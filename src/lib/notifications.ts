@@ -336,6 +336,108 @@ export async function dispatchExternalNotifications(alert: {
   };
 }
 
+export async function sendDigestNotification(
+  subject: string,
+  telegramText: string,
+  htmlBody: string
+): Promise<NotificationDispatchResult> {
+  const errors: string[] = [];
+  let telegramSent = false;
+  let emailSent = false;
+
+  const botToken = getSetting('telegram_bot_token').trim().replace(/^bot/i, '');
+  const chatId = getSetting('telegram_chat_id').trim();
+  const telegramConfigured = Boolean(botToken && chatId);
+
+  if (telegramConfigured) {
+    const botSelfId = botToken.split(':')[0]?.trim();
+    if (botSelfId && chatId === botSelfId) {
+      errors.push(
+        `Telegram lỗi: Bạn đang nhập nhầm ID của chính con Bot (${chatId}) vào ô "Telegram Chat ID"!`
+      );
+    } else {
+      try {
+        const resp = await fetch(
+          `https://api.telegram.org/bot${botToken}/sendMessage`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chat_id: chatId,
+              text: telegramText,
+              parse_mode: 'HTML',
+              disable_web_page_preview: true,
+            }),
+            signal: AbortSignal.timeout(12000),
+          }
+        );
+        if (resp.ok) {
+          telegramSent = true;
+        } else {
+          const errBody = await resp.text();
+          errors.push(formatFriendlyTelegramError(resp.status, errBody, chatId));
+        }
+      } catch (err) {
+        errors.push(`Telegram lỗi kết nối: ${(err as Error).message}`);
+      }
+    }
+  } else if (botToken && !chatId) {
+    errors.push('Telegram: Đã nhập Bot Token nhưng còn thiếu Telegram Chat ID.');
+  } else if (!botToken && chatId) {
+    errors.push('Telegram: Đã nhập Chat ID nhưng còn thiếu Telegram Bot Token.');
+  }
+
+  const smtpHost = getSetting('smtp_host').trim();
+  const smtpPort = Number(getSetting('smtp_port', '587'));
+  const smtpUser = getSetting('smtp_user').trim();
+  const smtpPass = getSetting('smtp_pass');
+  const smtpFrom = getSetting('smtp_from', smtpUser || 'noreply@nas-sync.local')
+    .replace(/[\r\n]+/g, ' ')
+    .trim();
+  const alertEmailTo = (
+    getSetting('alert_email_to') || getSetting('notify_email_to')
+  )
+    .replace(/[\r\n]+/g, ' ')
+    .trim();
+  const emailConfigured = Boolean(smtpHost && alertEmailTo);
+
+  if (emailConfigured) {
+    try {
+      const transporter = nodemailer.createTransport({
+        host: smtpHost,
+        port: smtpPort,
+        secure: smtpPort === 465,
+        auth: smtpUser ? { user: smtpUser, pass: smtpPass } : undefined,
+        connectionTimeout: 10000,
+        greetingTimeout: 10000,
+        socketTimeout: 15000,
+      });
+
+      const safeSubject = String(subject || '')
+        .replace(/[\r\n]+/g, ' ')
+        .trim();
+
+      await transporter.sendMail({
+        from: `"NAS-Sync Backup" <${smtpFrom}>`,
+        to: alertEmailTo,
+        subject: safeSubject,
+        html: htmlBody,
+      });
+      emailSent = true;
+    } catch (err) {
+      errors.push(`SMTP Email lỗi: ${(err as Error).message}`);
+    }
+  }
+
+  return {
+    telegramConfigured,
+    telegramSent,
+    emailConfigured,
+    emailSent,
+    errors,
+  };
+}
+
 function escapeHtml(str: string): string {
   return String(str)
     .replace(/&/g, '&amp;')

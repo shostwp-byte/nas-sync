@@ -210,6 +210,18 @@ async function bootstrap() {
       const skipAuthAndRbacCheck =
         pathname.startsWith('/_next') ||
         pathname === '/favicon.ico' ||
+        pathname === '/manifest.webmanifest' ||
+        pathname === '/manifest.json' ||
+        pathname === '/sw.js' ||
+        pathname === '/icons' ||
+        pathname.startsWith('/icons/') ||
+        pathname === '/apple-icon' ||
+        pathname.startsWith('/apple-icon/') ||
+        pathname.startsWith('/apple-icon.') ||
+        pathname === '/apple-touch-icon.png' ||
+        pathname === '/icon' ||
+        pathname.startsWith('/icon/') ||
+        pathname.startsWith('/icon.') ||
         pathname === '/api/health' ||
         pathname === '/api/auth/login' ||
         pathname === '/api/auth/logout';

@@ -1,11 +1,14 @@
+import cron from 'node-cron';
 import { NextRequest, NextResponse } from 'next/server';
+import { safeErrorJson } from '@/lib/api-error';
 import { recordAuditLog } from '@/lib/audit';
-import { requireRole } from '@/lib/auth';
+import { requireRole, type SessionPayload } from '@/lib/auth';
 import { getAllSettings, getDb, getSetting, setSettings } from '@/lib/db';
 import {
   DEFAULT_WORDPRESS_HOSTING_EXCLUDES,
   validateExcludePatternsInput,
 } from '@/lib/engine/exclude-rules';
+import { sendDailyMorningDigest } from '@/lib/engine/morning-digest';
 import { reloadCronSchedules } from '@/lib/engine/queue';
 import {
   detectTelegramChatId,
@@ -47,29 +50,103 @@ const ALLOWED_SETTING_KEYS = new Set([
   'dsm_worm_lock_days',
   'github_token',
   'global_exclude_patterns',
+  'digest_enabled',
+  'digest_cron_time',
 ]);
 
-export async function GET() {
-  const guard = await requireRole(['ADMIN']);
-  if (!guard.ok) return guard.response;
+const CRON_TRIGGER_KEYS = new Set([
+  'digest_enabled',
+  'digest_cron_time',
+  'btrfs_auto_enabled',
+  'btrfs_cron_time',
+]);
 
-  const rawSettings = getAllSettings();
-  const settings: Record<string, string> = { ...rawSettings };
-  for (const key of SECRET_SETTING_KEYS) {
-    if (settings[key]) {
-      settings[key] = SECRET_MASK;
+function applySettingsDictionary(
+  rawDict: Record<string, unknown>,
+  session: SessionPayload,
+  req: NextRequest
+): NextResponse | null {
+  const sanitized: Record<string, string> = {};
+
+  for (const [k, v] of Object.entries(rawDict)) {
+    if (!ALLOWED_SETTING_KEYS.has(k)) {
+      continue;
+    }
+    const strVal = String(v ?? '');
+    if (SECRET_SETTING_KEYS.has(k) && strVal === SECRET_MASK) {
+      continue;
+    }
+    if (k === 'global_exclude_patterns') {
+      const check = validateExcludePatternsInput(strVal);
+      if (!check.ok) {
+        return NextResponse.json(
+          { error: check.error || 'Quy tắc loại trừ không hợp lệ.' },
+          { status: 400 }
+        );
+      }
+      sanitized[k] = check.normalized;
+      continue;
+    }
+    if ((k === 'digest_cron_time' || k === 'btrfs_cron_time') && strVal.trim()) {
+      if (!cron.validate(strVal.trim())) {
+        return NextResponse.json(
+          {
+            error: `Biểu thức lịch Cron (${k}) không hợp lệ: "${strVal.trim()}".`,
+          },
+          { status: 400 }
+        );
+      }
+      sanitized[k] = strVal.trim();
+      continue;
+    }
+    sanitized[k] = strVal;
+  }
+
+  const updatedKeys = Object.keys(sanitized);
+  if (updatedKeys.length > 0) {
+    setSettings(sanitized);
+    recordAuditLog({
+      session,
+      action: 'SETTINGS_UPDATE',
+      resourceType: 'SETTINGS',
+      detail: `Cập nhật cấu hình hệ thống (${updatedKeys.join(', ')})`,
+      req,
+    });
+    if (updatedKeys.some((k) => CRON_TRIGGER_KEYS.has(k))) {
+      reloadCronSchedules();
+    } else {
+      reloadCronSchedules();
     }
   }
 
-  const alerts = getDb()
-    .prepare('SELECT * FROM system_alerts ORDER BY id DESC LIMIT 50')
-    .all();
+  return null;
+}
 
-  return NextResponse.json({
-    settings,
-    alerts,
-    defaultExcludePreset: DEFAULT_WORDPRESS_HOSTING_EXCLUDES,
-  });
+export async function GET() {
+  try {
+    const guard = await requireRole(['ADMIN']);
+    if (!guard.ok) return guard.response;
+
+    const rawSettings = getAllSettings();
+    const settings: Record<string, string> = { ...rawSettings };
+    for (const key of SECRET_SETTING_KEYS) {
+      if (settings[key]) {
+        settings[key] = SECRET_MASK;
+      }
+    }
+
+    const alerts = getDb()
+      .prepare('SELECT * FROM system_alerts ORDER BY id DESC LIMIT 50')
+      .all();
+
+    return NextResponse.json({
+      settings,
+      alerts,
+      defaultExcludePreset: DEFAULT_WORDPRESS_HOSTING_EXCLUDES,
+    });
+  } catch (err) {
+    return safeErrorJson(err, 'Không thể tải cấu hình hệ thống.');
+  }
 }
 
 export async function PUT(req: NextRequest) {
@@ -79,48 +156,16 @@ export async function PUT(req: NextRequest) {
 
     const body = await req.json();
     if (body.settings && typeof body.settings === 'object') {
-      const sanitized: Record<string, string> = {};
-      for (const [k, v] of Object.entries(body.settings)) {
-        if (!ALLOWED_SETTING_KEYS.has(k)) {
-          continue;
-        }
-        const strVal = String(v ?? '');
-        if (SECRET_SETTING_KEYS.has(k) && strVal === SECRET_MASK) {
-          continue;
-        }
-        if (k === 'global_exclude_patterns') {
-          const check = validateExcludePatternsInput(strVal);
-          if (!check.ok) {
-            return NextResponse.json(
-              { error: check.error || 'Quy tắc loại trừ không hợp lệ.' },
-              { status: 400 }
-            );
-          }
-          sanitized[k] = check.normalized;
-          continue;
-        }
-        sanitized[k] = strVal;
-      }
-
-      const updatedKeys = Object.keys(sanitized);
-      if (updatedKeys.length > 0) {
-        setSettings(sanitized);
-        recordAuditLog({
-          session: guard.session,
-          action: 'SETTINGS_UPDATE',
-          resourceType: 'SETTINGS',
-          detail: `Cập nhật cấu hình hệ thống (${updatedKeys.join(', ')})`,
-          req,
-        });
-      }
-      reloadCronSchedules();
+      const errResp = applySettingsDictionary(
+        body.settings as Record<string, unknown>,
+        guard.session,
+        req
+      );
+      if (errResp) return errResp;
     }
     return NextResponse.json({ ok: true });
   } catch (err) {
-    return NextResponse.json(
-      { error: (err as Error).message },
-      { status: 500 }
-    );
+    return safeErrorJson(err, 'Không thể lưu cấu hình hệ thống.');
   }
 }
 
@@ -130,10 +175,26 @@ export async function POST(req: NextRequest) {
     if (!guard.ok) return guard.response;
 
     const body = await req.json();
-    const action = String(body.action || '');
+    const action = String(body.action || '').trim();
+
+    if (
+      (!action || action === 'save_settings') &&
+      ((body.settings && typeof body.settings === 'object') ||
+        Object.keys(body).some((k) => ALLOWED_SETTING_KEYS.has(k)))
+    ) {
+      const dict =
+        body.settings && typeof body.settings === 'object'
+          ? (body.settings as Record<string, unknown>)
+          : (body as Record<string, unknown>);
+      const errResp = applySettingsDictionary(dict, guard.session, req);
+      if (errResp) return errResp;
+      return NextResponse.json({ ok: true });
+    }
 
     if (action === 'mark_all_read') {
-      getDb().prepare('UPDATE system_alerts SET is_read = 1 WHERE is_read = 0').run();
+      getDb()
+        .prepare('UPDATE system_alerts SET is_read = 1 WHERE is_read = 0')
+        .run();
       return NextResponse.json({ ok: true });
     }
 
@@ -171,14 +232,25 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: true, ...res });
     }
 
+    if (action === 'send_digest_now') {
+      const { summary, dispatch } = await sendDailyMorningDigest({
+        manual: true,
+      });
+      recordAuditLog({
+        session: guard.session,
+        action: 'SEND_MORNING_DIGEST',
+        resourceType: 'SETTINGS',
+        detail: `Gửi thủ công Báo cáo NOC Buổi sáng (${summary.jobsSucceeded24h} OK / ${summary.jobsFailed24h} lỗi)`,
+        req,
+      });
+      return NextResponse.json({ ok: true, summary, dispatch });
+    }
+
     return NextResponse.json(
       { error: 'Hành động không hợp lệ.' },
       { status: 400 }
     );
   } catch (err) {
-    return NextResponse.json(
-      { error: (err as Error).message },
-      { status: 500 }
-    );
+    return safeErrorJson(err, 'Không thể thực hiện thao tác cấu hình.');
   }
 }

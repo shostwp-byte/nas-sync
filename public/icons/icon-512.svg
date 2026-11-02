@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" fill="none">
+  <defs>
+    <radialGradient id="bgGlow512" cx="50%" cy="45%" r="60%">
+      <stop offset="0%" stop-color="#0f172a" />
+      <stop offset="100%" stop-color="#020617" />
+    </radialGradient>
+    <linearGradient id="shield512" x1="140" y1="96" x2="372" y2="416" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#22d3ee" />
+      <stop offset="50%" stop-color="#10b981" />
+      <stop offset="100%" stop-color="#059669" />
+    </linearGradient>
+    <linearGradient id="innerShield512" x1="160" y1="112" x2="352" y2="404" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#0f172a" />
+      <stop offset="100%" stop-color="#020617" />
+    </linearGradient>
+  </defs>
+
+  <!-- Full-bleed Maskable Background (Safe zone inside inner 80%: 64..448) -->
+  <rect width="512" height="512" fill="url(#bgGlow512)" />
+  <circle cx="256" cy="256" r="176" fill="#22d3ee" fill-opacity="0.05" />
+  <circle cx="256" cy="256" r="136" stroke="#1e293b" stroke-width="2" stroke-dasharray="8 8" />
+
+  <!-- Shield Emblem inside Maskable Safe Zone -->
+  <path
+    d="M256 98L378 145V248C378 329.5 326.2 394.2 256 420C185.8 394.2 134 329.5 134 248V145L256 98Z"
+    fill="url(#innerShield512)"
+    stroke="url(#shield512)"
+    stroke-width="14"
+    stroke-linejoin="round"
+  />
+
+  <!-- NAS Rack Unit 1 -->
+  <rect x="180" y="178" width="152" height="52" rx="13" fill="#0f172a" stroke="#38bdf8" stroke-width="6" />
+  <circle cx="205" cy="204" r="7.5" fill="#10b981" />
+  <circle cx="229" cy="204" r="7.5" fill="#22d3ee" />
+  <rect x="256" y="199" width="54" height="10" rx="5" fill="#334155" />
+
+  <!-- NAS Rack Unit 2 -->
+  <rect x="180" y="244" width="152" height="52" rx="13" fill="#0f172a" stroke="#10b981" stroke-width="6" />
+  <circle cx="205" cy="270" r="7.5" fill="#10b981" />
+  <circle cx="229" cy="270" r="7.5" fill="#10b981" />
+  <rect x="256" y="265" width="54" height="10" rx="5" fill="#334155" />
+
+  <!-- Sync & Verified Core -->
+  <circle cx="256" cy="346" r="34" fill="#064e3b" stroke="#10b981" stroke-width="6.5" />
+  <path
+    d="M240 346.5L251 357.5L273.5 335"
+    stroke="#34d399"
+    stroke-width="8"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+</svg>

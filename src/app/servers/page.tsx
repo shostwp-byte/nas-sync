@@ -13,6 +13,8 @@ import {
   RefreshCw,
   SearchCode,
   Server,
+  ShieldAlert,
+  ShieldCheck,
   Trash2,
   X,
 } from 'lucide-react';
@@ -30,6 +32,18 @@ import type {
 interface ExtendedServer extends ServerRecord {
   snapshots_count?: number;
   last_backup_at?: string | null;
+}
+
+function formatTofuShort(fingerprint?: string): string {
+  const raw = (fingerprint || '').trim();
+  if (!raw) return 'SHA256:(Đã ghim)';
+  const parenMatch = raw.match(/(\([^)]+\))$/);
+  const algoSuffix = parenMatch ? ` ${parenMatch[1]}` : '';
+  const hashPart = parenMatch ? raw.slice(0, parenMatch.index).trim() : raw;
+  if (hashPart.length <= 24) {
+    return `${hashPart}${algoSuffix}`;
+  }
+  return `${hashPart.slice(0, 19)}…${hashPart.slice(-4)}${algoSuffix}`;
 }
 
 export default function ServersPage() {
@@ -73,6 +87,13 @@ export default function ServersPage() {
     error?: string;
     ssh?: { osInfo?: string; uptime?: string; latencyMs: number };
     domains?: DiscoveredDomain[];
+  } | null>(null);
+
+  // SSH Host Key TOFU Pinning State
+  const [hostKeyBusyId, setHostKeyBusyId] = useState<number | null>(null);
+  const [tofuFeedback, setTofuFeedback] = useState<{
+    ok: boolean;
+    text: string;
   } | null>(null);
 
   const loadData = useCallback(async () => {
@@ -253,6 +274,183 @@ export default function ServersPage() {
     setTimeout(() => setCopiedId(null), 2000);
   };
 
+  const handleHostKeyAction = async (
+    srv: ExtendedServer,
+    action: 'approve_new' | 'reset_tofu'
+  ) => {
+    const promptText =
+      action === 'approve_new'
+        ? [
+            `🚨 CẢNH BÁO BẢO MẬT SSH TOFU — ${srv.hostname} (${srv.ip_address})`,
+            '',
+            `• Khóa cũ đang ghim: ${srv.host_key_fingerprint || '(Chưa rõ)'}`,
+            `• Khóa mới phát hiện: ${
+              srv.host_key_pending_fingerprint ||
+              '(Sẽ quét trực tiếp từ máy chủ VPS)'
+            }`,
+            '',
+            '⚠️ CHỈ XÁC NHẬN nếu bạn vừa chủ động cài đặt lại hệ điều hành (Reinstall OS), di chuyển VPS hoặc làm mới SSH Host Key trên máy chủ này. Nếu không, kết nối có thể đang bị tấn công giả mạo Man-in-the-Middle (MITM)!',
+            '',
+            'Bạn có chắc chắn muốn phê duyệt và ghim Host Key mới này không?',
+          ].join('\n')
+        : `Quét lại & đặt lại khóa định danh SSH TOFU cho máy chủ "${srv.hostname}" (${srv.ip_address})?\nHệ thống sẽ thu thập lại dấu vân tay SSH hiện tại của VPS để ghim bảo vệ.`;
+
+    if (!confirm(promptText)) {
+      return;
+    }
+
+    setHostKeyBusyId(srv.id);
+    setTofuFeedback(null);
+    try {
+      const resp = await fetch(`/api/servers/${srv.id}/host-key`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action }),
+      });
+      const json = await resp.json().catch(() => ({}));
+      if (!resp.ok || !json.ok) {
+        setTofuFeedback({
+          ok: false,
+          text:
+            json.error ||
+            `❌ Không thể cập nhật SSH Host Key cho máy chủ ${srv.hostname}.`,
+        });
+        return;
+      }
+
+      setTofuFeedback({
+        ok: true,
+        text:
+          action === 'approve_new'
+            ? `✅ Đã xác nhận & ghim SSH Host Key mới cho "${srv.hostname}" (${
+                json.host_key_fingerprint || 'VERIFIED'
+              }).`
+            : `✅ Đã làm mới trạng thái khóa định danh SSH TOFU cho "${srv.hostname}".`,
+      });
+      await loadData();
+    } catch (err) {
+      setTofuFeedback({
+        ok: false,
+        text: `❌ ${(err as Error).message || 'Lỗi kết nối khi xử lý SSH Host Key.'}`,
+      });
+    } finally {
+      setHostKeyBusyId(null);
+    }
+  };
+
+  const renderHostKeyPinning = (
+    srv: ExtendedServer,
+    variant: 'mobile' | 'desktop'
+  ) => {
+    const status = srv.host_key_status || 'UNPINNED';
+    const isBusy = hostKeyBusyId === srv.id;
+
+    if (status === 'MISMATCH') {
+      return (
+        <div className="mt-2 space-y-2">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-rose-500/20 border border-rose-500/50 text-[11px] font-bold text-rose-200 animate-pulse">
+              🚨 ĐỔI HOST KEY BẤT THƯỜNG!
+            </span>
+          </div>
+          <div className="p-2.5 rounded-xl bg-rose-950/60 border border-rose-500/40 text-[11px] space-y-1.5 max-w-md">
+            <div>
+              <span className="text-slate-400">Khóa cũ đã ghim: </span>
+              <span className="font-mono text-slate-200 break-all">
+                {srv.host_key_fingerprint || '—'}
+              </span>
+            </div>
+            <div>
+              <span className="text-rose-300 font-medium">
+                Khóa mới phát hiện:{' '}
+              </span>
+              <span className="font-mono text-amber-300 break-all">
+                {srv.host_key_pending_fingerprint ||
+                  'Không khớp với dấu vân tay đã ghim'}
+              </span>
+            </div>
+
+            {userRole === 'ADMIN' ? (
+              <div className="pt-1 flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  disabled={isBusy}
+                  onClick={() => void handleHostKeyAction(srv, 'approve_new')}
+                  className="min-h-[36px] px-3 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-500 disabled:opacity-50 text-white font-semibold inline-flex items-center gap-1.5 shadow-sm transition-colors"
+                >
+                  <ShieldCheck className="w-3.5 h-3.5 shrink-0" />
+                  <span>
+                    {isBusy
+                      ? 'Đang xác nhận khóa...'
+                      : 'Xác nhận Host Key mới'}
+                  </span>
+                </button>
+              </div>
+            ) : (
+              <div className="text-rose-300/90 italic pt-0.5">
+                Cần quyền Quản trị viên (ADMIN) để xác minh &amp; phê duyệt Host
+                Key mới.
+              </div>
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    if (status === 'VERIFIED') {
+      return (
+        <div className="mt-1.5 flex flex-wrap items-center gap-1.5 min-w-0">
+          <span
+            title={`Đã ghim & xác thực khóa SSH TOFU: ${
+              srv.host_key_fingerprint || ''
+            }`}
+            className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-emerald-500/10 border border-emerald-500/30 text-[11px] font-mono text-emerald-300 max-w-full"
+          >
+            <span className="shrink-0">🔒 TOFU:</span>
+            <span className="truncate">
+              {formatTofuShort(srv.host_key_fingerprint)}
+            </span>
+          </span>
+          {userRole === 'ADMIN' && (
+            <button
+              type="button"
+              disabled={isBusy}
+              onClick={() => void handleHostKeyAction(srv, 'reset_tofu')}
+              title="Quét lại & đặt lại khóa SSH TOFU (Reset TOFU)"
+              aria-label={`Quét lại khóa SSH TOFU cho ${srv.hostname}`}
+              className={`${
+                variant === 'mobile'
+                  ? 'min-h-[36px] min-w-[36px] p-2'
+                  : 'min-h-[28px] min-w-[28px] p-1.5'
+              } inline-flex items-center justify-center rounded-md bg-slate-800/80 hover:bg-slate-700 text-slate-400 hover:text-cyan-300 border border-slate-700/80 disabled:opacity-50 transition-colors shrink-0`}
+            >
+              <RefreshCw
+                className={`w-3 h-3 ${
+                  isBusy ? 'animate-spin text-cyan-300' : ''
+                }`}
+              />
+            </button>
+          )}
+        </div>
+      );
+    }
+
+    return (
+      <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+        <span
+          title="Dấu vân tay SSH Host Key sẽ được tự động lưu ghim (Trust On First Use) ngay ở lần kết nối SSH đầu tiên"
+          className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-amber-500/10 border border-amber-500/25 text-[11px] text-amber-200/90"
+        >
+          ⏳ TOFU: Tự ghim ở lần kết nối đầu
+        </span>
+      </div>
+    );
+  };
+
+  const mismatchServers = servers.filter(
+    (s) => s.host_key_status === 'MISMATCH'
+  );
+
   return (
     <div className="space-y-6">
       <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
@@ -298,6 +496,51 @@ export default function ServersPage() {
         </div>
       </div>
 
+      {tofuFeedback && (
+        <div
+          className={`p-3.5 rounded-xl border text-xs flex items-start justify-between gap-3 ${
+            tofuFeedback.ok
+              ? 'bg-emerald-500/15 border-emerald-500/35 text-emerald-200'
+              : 'bg-rose-500/15 border-rose-500/35 text-rose-200'
+          }`}
+        >
+          <span className="break-words">{tofuFeedback.text}</span>
+          <button
+            type="button"
+            onClick={() => setTofuFeedback(null)}
+            aria-label="Đóng thông báo"
+            className="text-slate-400 hover:text-white shrink-0"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
+
+      {/* Top Security Alert Banner when any server has SSH Host Key MISMATCH */}
+      {mismatchServers.length > 0 && (
+        <div className="p-4 sm:p-5 rounded-2xl bg-gradient-to-r from-rose-950/80 via-rose-950/50 to-slate-900 border border-rose-500/50 space-y-2.5 text-xs">
+          <div className="flex flex-wrap items-center gap-2 text-rose-200 font-bold text-sm">
+            <ShieldAlert className="w-5 h-5 text-rose-400 animate-pulse shrink-0" />
+            <span>
+              🚨 Cảnh báo Bảo mật SSH TOFU: Phát hiện {mismatchServers.length}{' '}
+              máy chủ VPS đổi Host Key bất thường!
+            </span>
+          </div>
+          <p className="text-rose-100/90 leading-relaxed">
+            Hệ thống đã tự động khóa tạm thời phiên kết nối SSH tới:{' '}
+            <strong className="font-mono text-white">
+              {mismatchServers
+                .map((m) => `${m.hostname} (${m.ip_address})`)
+                .join(', ')}
+            </strong>{' '}
+            để chống nguy cơ tấn công xen giữa Man-in-the-Middle (MITM). Chỉ bấm{' '}
+            <strong>&quot;Xác nhận Host Key mới&quot;</strong> nếu bạn vừa chủ
+            động cài đặt lại hệ điều hành (Reinstall OS) hoặc di chuyển IP máy
+            chủ.
+          </p>
+        </div>
+      )}
+
       {/* Mobile & Tablet Server Cards (< lg) */}
       <div className="lg:hidden">
         {loading ? (
@@ -313,7 +556,11 @@ export default function ServersPage() {
             {servers.map((srv) => (
               <div
                 key={srv.id}
-                className="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3.5 flex flex-col justify-between"
+                className={`bg-slate-900 border rounded-2xl p-4 space-y-3.5 flex flex-col justify-between ${
+                  srv.host_key_status === 'MISMATCH'
+                    ? 'border-rose-500/50'
+                    : 'border-slate-800'
+                }`}
               >
                 <div className="space-y-3">
                   <div className="flex items-start justify-between gap-2">
@@ -407,6 +654,13 @@ export default function ServersPage() {
                         {formatDateTime(srv.last_backup_at)}
                       </div>
                     </div>
+
+                    <div className="sm:col-span-2 pt-2 border-t border-slate-800/80 min-w-0">
+                      <div className="text-[10px] text-slate-500 uppercase tracking-wide">
+                        Định danh Khóa SSH Host Key (TOFU Pinning)
+                      </div>
+                      {renderHostKeyPinning(srv, 'mobile')}
+                    </div>
                   </div>
                 </div>
 
@@ -427,8 +681,14 @@ export default function ServersPage() {
                       </button>
                       <button
                         type="button"
+                        disabled={srv.host_key_status === 'MISMATCH'}
                         onClick={() => void handleStartBackup(srv)}
-                        className="min-h-[40px] inline-flex items-center gap-1.5 px-3 py-2 rounded-lg bg-emerald-600/20 hover:bg-emerald-600 text-emerald-300 hover:text-white border border-emerald-500/30 font-medium transition-colors"
+                        title={
+                          srv.host_key_status === 'MISMATCH'
+                            ? 'Đã chặn sao lưu do lệch khóa SSH TOFU — Vui lòng xác nhận Host Key mới trước'
+                            : undefined
+                        }
+                        className="min-h-[40px] inline-flex items-center gap-1.5 px-3 py-2 rounded-lg bg-emerald-600/20 hover:bg-emerald-600 text-emerald-300 hover:text-white border border-emerald-500/30 font-medium disabled:opacity-45 disabled:cursor-not-allowed transition-colors"
                       >
                         <Play className="w-3.5 h-3.5 fill-current shrink-0" />
                         Sao lưu ngay
@@ -491,8 +751,15 @@ export default function ServersPage() {
                 </tr>
               ) : (
                 servers.map((srv) => (
-                  <tr key={srv.id} className="hover:bg-slate-800/30">
-                    <td className="p-4">
+                  <tr
+                    key={srv.id}
+                    className={
+                      srv.host_key_status === 'MISMATCH'
+                        ? 'bg-rose-950/15 hover:bg-rose-950/25'
+                        : 'hover:bg-slate-800/30'
+                    }
+                  >
+                    <td className="p-4 align-top">
                       <div className="font-semibold text-sm text-white flex items-center gap-2">
                         <span
                           className={`w-2 h-2 rounded-full shrink-0 ${
@@ -513,6 +780,7 @@ export default function ServersPage() {
                       <div className="text-slate-400 font-mono mt-0.5">
                         {srv.ssh_user}@{srv.ip_address}:{srv.ssh_port}
                       </div>
+                      {renderHostKeyPinning(srv, 'desktop')}
                     </td>
 
                     <td className="p-4">
@@ -568,8 +836,14 @@ export default function ServersPage() {
                             </button>
                             <button
                               type="button"
+                              disabled={srv.host_key_status === 'MISMATCH'}
                               onClick={() => void handleStartBackup(srv)}
-                              className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-emerald-600/20 hover:bg-emerald-600 text-emerald-300 hover:text-white border border-emerald-500/30 font-medium transition-colors"
+                              title={
+                                srv.host_key_status === 'MISMATCH'
+                                  ? 'Đã chặn sao lưu do lệch khóa SSH TOFU — Vui lòng xác nhận Host Key mới trước'
+                                  : undefined
+                              }
+                              className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-emerald-600/20 hover:bg-emerald-600 text-emerald-300 hover:text-white border border-emerald-500/30 font-medium disabled:opacity-45 disabled:cursor-not-allowed transition-colors"
                             >
                               <Play className="w-3.5 h-3.5 fill-current" />
                               Backup ngay

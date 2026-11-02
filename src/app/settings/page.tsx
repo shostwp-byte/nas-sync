@@ -4,6 +4,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   ArrowUpCircle,
   BellRing,
+  CalendarClock,
   Check,
   CheckCheck,
   CheckCircle2,
@@ -31,9 +32,10 @@ import {
   X,
 } from 'lucide-react';
 import { useRealtime } from '@/components/SocketProvider';
-import { formatDateTime } from '@/lib/format';
+import { formatBytes, formatDateTime } from '@/lib/format';
 import type {
   AuditLogRecord,
+  MorningDigestSummary,
   SystemAlert,
   SystemUpdateInfo,
   UserRecord,
@@ -41,6 +43,14 @@ import type {
 } from '@/types';
 
 type SettingsTab = 'config' | 'account' | 'rbac' | 'audit';
+
+const DIGEST_CRON_PRESETS = [
+  { label: '06:00', cron: '0 6 * * *' },
+  { label: '06:30', cron: '30 6 * * *' },
+  { label: '07:00', cron: '0 7 * * *' },
+  { label: '07:30', cron: '30 7 * * *' },
+  { label: '08:00', cron: '0 8 * * *' },
+];
 
 const STANDARD_WP_EXCLUDES = [
   'wp-content/cache/',
@@ -146,6 +156,17 @@ export default function SettingsPage() {
   const [showTelegramToken, setShowTelegramToken] = useState(false);
   const [showSmtpPass, setShowSmtpPass] = useState(false);
   const [showDsmPass, setShowDsmPass] = useState(false);
+
+  // Daily Morning Digest State (Tab 1)
+  const [testingDigest, setTestingDigest] = useState(false);
+  const [digestResult, setDigestResult] = useState<{
+    ok: boolean;
+    message: string;
+    telegramSent?: boolean;
+    emailSent?: boolean;
+    errors?: string[];
+    summary?: MorningDigestSummary;
+  } | null>(null);
 
   // GitHub Updater State (Tab 1)
   const [updateInfo, setUpdateInfo] = useState<SystemUpdateInfo | null>(null);
@@ -515,6 +536,98 @@ export default function SettingsPage() {
       });
     } finally {
       setTestingNotify(false);
+    }
+  };
+
+  const handleToggleDigestEnabled = () => {
+    setSettings((prev) => {
+      const nextEnabled = prev.digest_enabled === 'true' ? 'false' : 'true';
+      const nextCron = (prev.digest_cron_time || '').trim() || '0 7 * * *';
+      return {
+        ...prev,
+        digest_enabled: nextEnabled,
+        digest_cron_time: nextCron,
+      };
+    });
+  };
+
+  const handleTestMorningDigest = async () => {
+    setTestingDigest(true);
+    setDigestResult(null);
+    setFeedback('');
+    try {
+      const payloadSettings: Record<string, string> = {
+        ...settings,
+        digest_enabled: settings.digest_enabled === 'true' ? 'true' : 'false',
+        digest_cron_time:
+          (settings.digest_cron_time || '').trim() || '0 7 * * *',
+      };
+      setSettings(payloadSettings);
+
+      const saveResp = await fetch('/api/settings', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ settings: payloadSettings }),
+      });
+      if (!saveResp.ok) {
+        const saveErr = await saveResp.json().catch(() => ({}));
+        setDigestResult({
+          ok: false,
+          message:
+            saveErr.error ||
+            'Không thể lưu cấu hình Báo cáo Sáng sớm (kiểm tra lại biểu thức Cron).',
+        });
+        return;
+      }
+
+      const resp = await fetch('/api/settings/digest', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      const json = await resp.json().catch(() => ({}));
+      const dispatch = json.dispatch || {};
+      const tgSent = Boolean(dispatch.telegramSent ?? json.telegramSent);
+      const mailSent = Boolean(dispatch.emailSent ?? json.emailSent);
+      const errs: string[] = Array.isArray(dispatch.errors)
+        ? (dispatch.errors as string[])
+        : Array.isArray(json.errors)
+        ? (json.errors as string[])
+        : [];
+
+      if (!resp.ok || json.ok === false) {
+        setDigestResult({
+          ok: false,
+          message:
+            json.error ||
+            'Không thể tổng hợp hoặc gửi Báo cáo Sáng sớm lúc này.',
+          telegramSent: tgSent,
+          emailSent: mailSent,
+          errors: errs,
+        });
+        return;
+      }
+
+      const anyDelivered = tgSent || mailSent;
+      setDigestResult({
+        ok: anyDelivered && errs.length === 0,
+        message: anyDelivered
+          ? 'Đã tổng hợp & gửi Báo cáo Sáng sớm 24h thành công!'
+          : 'Đã tổng hợp Báo cáo 24h nhưng chưa gửi ra kênh ngoài (hãy kiểm tra Telegram Bot Token / Chat ID hoặc SMTP Email phía trên).',
+        telegramSent: tgSent,
+        emailSent: mailSent,
+        errors: errs,
+        summary: json.summary as MorningDigestSummary | undefined,
+      });
+    } catch (err) {
+      setDigestResult({
+        ok: false,
+        message:
+          (err as Error).message ||
+          'Lỗi kết nối khi kích hoạt gửi thử Báo cáo Sáng sớm.',
+      });
+    } finally {
+      setTestingDigest(false);
     }
   };
 
@@ -1383,6 +1496,215 @@ export default function SettingsPage() {
                       className="w-full min-h-[42px] bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white"
                     />
                   </div>
+                </div>
+
+                {/* Daily Morning Digest Card */}
+                <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-6 space-y-4">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div className="min-w-0 space-y-1 flex-1">
+                      <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                        <CalendarClock className="w-4 h-4 text-emerald-400 shrink-0" />
+                        <span>
+                          Báo cáo Tổng hợp Sáng sớm (Daily Morning Digest)
+                        </span>
+                      </h3>
+                      <p className="text-[11px] text-slate-400 leading-relaxed">
+                        Tự động gửi bản tin tổng kết 24 giờ qua (Job thành công/lỗi,
+                        dung lượng Delta thực tốn, SQL Verified, sức khỏe Volume
+                        NAS &amp; khóa SSH TOFU) qua Telegram &amp; Email mỗi sáng.
+                      </p>
+                    </div>
+
+                    {/* Accessible Switch for digest_enabled */}
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={settings.digest_enabled === 'true'}
+                      onClick={handleToggleDigestEnabled}
+                      className={`min-h-[38px] px-3 py-1.5 rounded-xl border inline-flex items-center gap-2 font-semibold transition-all shrink-0 ${
+                        settings.digest_enabled === 'true'
+                          ? 'bg-emerald-500/20 border-emerald-500/40 text-emerald-300'
+                          : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
+                      }`}
+                    >
+                      <span
+                        className={`w-8 h-4 rounded-full relative transition-colors inline-block ${
+                          settings.digest_enabled === 'true'
+                            ? 'bg-emerald-500'
+                            : 'bg-slate-700'
+                        }`}
+                      >
+                        <span
+                          className={`w-3 h-3 rounded-full bg-white absolute top-0.5 transition-all ${
+                            settings.digest_enabled === 'true'
+                              ? 'left-4'
+                              : 'left-0.5'
+                          }`}
+                        />
+                      </span>
+                      <span>
+                        {settings.digest_enabled === 'true'
+                          ? 'Đang bật'
+                          : 'Đang tắt'}
+                      </span>
+                    </button>
+                  </div>
+
+                  <div className="space-y-2.5">
+                    <label className="block text-slate-400">
+                      Khung giờ gửi tự động hàng ngày (Chọn nhanh hoặc nhập biểu thức Cron)
+                    </label>
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      {DIGEST_CRON_PRESETS.map((preset) => {
+                        const activeCron =
+                          (settings.digest_cron_time || '0 7 * * *').trim() ===
+                          preset.cron;
+                        return (
+                          <button
+                            key={preset.cron}
+                            type="button"
+                            onClick={() =>
+                              updateField('digest_cron_time', preset.cron)
+                            }
+                            className={`min-h-[38px] px-3 py-1.5 rounded-lg border font-mono text-xs font-medium transition-colors ${
+                              activeCron
+                                ? 'bg-cyan-500/20 border-cyan-500/40 text-cyan-300'
+                                : 'bg-slate-950 border-slate-800 text-slate-300 hover:bg-slate-800'
+                            }`}
+                          >
+                            ⏰ {preset.label}
+                          </button>
+                        );
+                      })}
+                    </div>
+
+                    <div className="flex flex-col sm:flex-row sm:items-center gap-2.5 pt-1">
+                      <input
+                        value={settings.digest_cron_time ?? '0 7 * * *'}
+                        onChange={(e) =>
+                          updateField('digest_cron_time', e.target.value)
+                        }
+                        placeholder="0 7 * * *"
+                        aria-label="Biểu thức Cron cho Báo cáo Sáng sớm"
+                        className="flex-1 min-w-0 min-h-[42px] bg-slate-950 border border-slate-800 focus:border-cyan-500 rounded-lg px-3 py-2 text-white font-mono outline-none"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => void handleTestMorningDigest()}
+                        disabled={testingDigest}
+                        className="w-full sm:w-auto justify-center min-h-[42px] whitespace-nowrap inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-emerald-600/20 hover:bg-emerald-600 text-emerald-300 hover:text-white border border-emerald-500/35 font-semibold disabled:opacity-50 transition-all"
+                      >
+                        <span>
+                          {testingDigest
+                            ? '⏳ Đang tổng hợp & gửi...'
+                            : '📨 Gửi thử Báo cáo Sáng ngay'}
+                        </span>
+                      </button>
+                    </div>
+                    <p className="text-[11px] text-slate-500">
+                      Mặc định: <code>0 7 * * *</code> (07:00 sáng hàng ngày). Nhấn{' '}
+                      <strong className="text-slate-300">
+                        Lưu Toàn bộ Cấu hình
+                      </strong>{' '}
+                      ở cuối trang để lưu lịch tự động.
+                    </p>
+                  </div>
+
+                  {digestResult && (
+                    <div
+                      className={`p-3.5 rounded-xl border text-xs space-y-2.5 break-words ${
+                        digestResult.ok
+                          ? 'bg-emerald-500/10 border-emerald-500/35 text-emerald-100'
+                          : 'bg-amber-500/10 border-amber-500/35 text-amber-100'
+                      }`}
+                    >
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <span className="font-semibold">
+                          {digestResult.message}
+                        </span>
+                        <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
+                          <span
+                            className={`px-2 py-0.5 rounded border font-medium ${
+                              digestResult.telegramSent
+                                ? 'bg-emerald-500/20 border-emerald-500/40 text-emerald-200'
+                                : 'bg-slate-900/80 border-slate-700 text-slate-300'
+                            }`}
+                          >
+                            Telegram {digestResult.telegramSent ? '✅' : '—'}
+                          </span>
+                          <span
+                            className={`px-2 py-0.5 rounded border font-medium ${
+                              digestResult.emailSent
+                                ? 'bg-emerald-500/20 border-emerald-500/40 text-emerald-200'
+                                : 'bg-slate-900/80 border-slate-700 text-slate-300'
+                            }`}
+                          >
+                            Email {digestResult.emailSent ? '✅' : '—'}
+                          </span>
+                        </div>
+                      </div>
+
+                      {digestResult.summary && (
+                        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-2 border-t border-slate-800/70 text-[11px]">
+                          <div className="p-2 rounded-lg bg-slate-950/80 border border-slate-800/80">
+                            <div className="text-slate-400">VPS Online</div>
+                            <div className="font-mono font-bold text-white mt-0.5">
+                              {digestResult.summary.onlineServers}/
+                              {digestResult.summary.totalServers}
+                            </div>
+                            {digestResult.summary.hostKeyMismatchCount > 0 && (
+                              <div className="text-[10px] text-rose-300 mt-0.5">
+                                🚨 {digestResult.summary.hostKeyMismatchCount}{' '}
+                                lệch TOFU
+                              </div>
+                            )}
+                          </div>
+
+                          <div className="p-2 rounded-lg bg-slate-950/80 border border-slate-800/80">
+                            <div className="text-slate-400">Phiên 24h qua</div>
+                            <div className="font-mono font-bold text-emerald-300 mt-0.5">
+                              {digestResult.summary.jobsSucceeded24h} hoàn tất
+                            </div>
+                            <div className="text-[10px] text-slate-400">
+                              {digestResult.summary.jobsFailed24h} thất bại
+                            </div>
+                          </div>
+
+                          <div className="p-2 rounded-lg bg-slate-950/80 border border-slate-800/80">
+                            <div className="text-slate-400">Delta 24h</div>
+                            <div className="font-mono font-bold text-cyan-300 mt-0.5">
+                              +{formatBytes(digestResult.summary.netDeltaBytes24h)}
+                            </div>
+                            <div className="text-[10px] text-slate-400">
+                              Tiết kiệm{' '}
+                              {Number(
+                                digestResult.summary.savingsPercent || 0
+                              ).toFixed(1)}
+                              %
+                            </div>
+                          </div>
+
+                          <div className="p-2 rounded-lg bg-slate-950/80 border border-slate-800/80">
+                            <div className="text-slate-400">Kiểm định SQL</div>
+                            <div className="font-mono font-bold text-emerald-300 mt-0.5">
+                              {digestResult.summary.verifiedDbs24h} DB ✅
+                            </div>
+                            <div className="text-[10px] text-slate-400">
+                              {digestResult.summary.anomalies24h} bất thường
+                            </div>
+                          </div>
+                        </div>
+                      )}
+
+                      {digestResult.errors && digestResult.errors.length > 0 && (
+                        <ul className="list-disc pl-4 space-y-1 text-[11px] text-rose-200 pt-1">
+                          {digestResult.errors.map((err, idx) => (
+                            <li key={idx}>{err}</li>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
+                  )}
                 </div>
 
                 {/* Global Exclude Rules Card */}
