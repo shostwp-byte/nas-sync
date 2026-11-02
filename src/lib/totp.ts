@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
-import QRCode from 'qrcode';
 import { ensureJwtSecret } from './jwt-secret';
+import { renderQrSvg } from './qr-svg';
 
 const BASE32_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
 const RECOVERY_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ'; // 32 ký tự rõ ràng, không gây nhầm lẫn 0/O/1/I
@@ -187,8 +187,7 @@ export function buildOtpAuthUrl(
 }
 
 export async function generateTotpQrSvg(otpauthUrl: string): Promise<string> {
-  return await QRCode.toString(otpauthUrl, {
-    type: 'svg',
+  return renderQrSvg(otpauthUrl, {
     margin: 1,
     width: 200,
     color: {

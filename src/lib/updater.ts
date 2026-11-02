@@ -571,6 +571,201 @@ async function computeFileSha256Hex(filePath: string): Promise<string> {
   });
 }
 
+function readPackageIdentity(pkgDir: string): string | null {
+  try {
+    const raw = fs.readFileSync(path.join(pkgDir, 'package.json'), 'utf8');
+    const parsed = JSON.parse(raw) as { name?: string; version?: string };
+    if (parsed.name && parsed.version) {
+      return `${parsed.name}@${parsed.version}`;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function isBusyFileError(err: unknown): boolean {
+  const code = (err as NodeJS.ErrnoException | undefined)?.code;
+  return code === 'ETXTBSY' || code === 'EBUSY';
+}
+
+function copyTreePosixSafe(
+  srcPath: string,
+  dstPath: string,
+  state: { deferredToRestart: boolean }
+) {
+  let srcStat: fs.Stats;
+  try {
+    srcStat = fs.lstatSync(srcPath);
+  } catch {
+    return;
+  }
+
+  if (srcStat.isSymbolicLink()) {
+    try {
+      const target = fs.readlinkSync(srcPath);
+      try {
+        fs.unlinkSync(dstPath);
+      } catch {
+        // Destination does not exist
+      }
+      fs.symlinkSync(target, dstPath);
+    } catch (err) {
+      if (isBusyFileError(err)) {
+        state.deferredToRestart = true;
+        return;
+      }
+      throw err;
+    }
+    return;
+  }
+
+  if (srcStat.isDirectory()) {
+    try {
+      const dstStat = fs.lstatSync(dstPath);
+      if (!dstStat.isDirectory()) {
+        fs.unlinkSync(dstPath);
+      }
+    } catch {
+      // Destination does not exist yet
+    }
+    fs.mkdirSync(dstPath, { recursive: true });
+    for (const entry of fs.readdirSync(srcPath)) {
+      copyTreePosixSafe(
+        path.join(srcPath, entry),
+        path.join(dstPath, entry),
+        state
+      );
+    }
+    return;
+  }
+
+  if (srcStat.isFile()) {
+    try {
+      try {
+        const dstStat = fs.lstatSync(dstPath);
+        if (dstStat.isDirectory()) {
+          fs.rmSync(dstPath, { recursive: true, force: true });
+        } else {
+          // POSIX: unlink() tách dentry khỏi inode đang chạy (tránh lỗi ETXTBSY như esbuild/swc)
+          fs.unlinkSync(dstPath);
+        }
+      } catch {
+        // Destination does not exist yet
+      }
+      fs.copyFileSync(srcPath, dstPath);
+      try {
+        fs.chmodSync(dstPath, srcStat.mode);
+      } catch {
+        // Ignore chmod differences on Windows/bind mounts
+      }
+    } catch (err) {
+      if (isBusyFileError(err)) {
+        state.deferredToRestart = true;
+        return;
+      }
+      throw err;
+    }
+  }
+}
+
+/**
+ * Đồng bộ node_modules sang /app/node_modules an toàn trên Linux/Docker (không bao giờ lỗi ETXTBSY):
+ * 1. Bỏ qua tức thì các gói có cùng `name@version` (không chạm vào binary đang thực thi như @esbuild/linux-x64).
+ * 2. Luôn `unlink()` file đích trước khi `copyFileSync()` để tạo inode mới thay vì ghi đè O_TRUNC.
+ * 3. Nếu kernel/OverlayFS vẫn khóa file thực thi khi nâng cấp chính binary đó, đánh dấu `.needs_npm_sync`
+ *    để `docker-entrypoint.sh` hoàn tất đồng bộ sạch trước khi khởi chạy `tsx` ở lần restart kế tiếp.
+ */
+export function syncNodeModulesSafe(
+  srcNodeModules: string,
+  dstNodeModules: string
+): { deferredToRestart: boolean } {
+  const state = { deferredToRestart: false };
+  fs.mkdirSync(dstNodeModules, { recursive: true });
+
+  const srcTopEntries = fs.readdirSync(srcNodeModules, { withFileTypes: true });
+  const srcTopNames = new Set(srcTopEntries.map((e) => e.name));
+
+  for (const entry of srcTopEntries) {
+    const srcEntryPath = path.join(srcNodeModules, entry.name);
+    const dstEntryPath = path.join(dstNodeModules, entry.name);
+
+    if (entry.isDirectory() && entry.name.startsWith('@')) {
+      fs.mkdirSync(dstEntryPath, { recursive: true });
+      const scopedEntries = fs.readdirSync(srcEntryPath, {
+        withFileTypes: true,
+      });
+      const scopedNames = new Set(scopedEntries.map((e) => e.name));
+
+      for (const scoped of scopedEntries) {
+        const srcPkg = path.join(srcEntryPath, scoped.name);
+        const dstPkg = path.join(dstEntryPath, scoped.name);
+        if (scoped.isDirectory()) {
+          const srcId = readPackageIdentity(srcPkg);
+          const dstId = readPackageIdentity(dstPkg);
+          if (srcId && srcId === dstId) {
+            continue;
+          }
+          try {
+            fs.rmSync(dstPkg, { recursive: true, force: true });
+          } catch (err) {
+            if (!isBusyFileError(err)) throw err;
+          }
+        }
+        copyTreePosixSafe(srcPkg, dstPkg, state);
+      }
+
+      for (const existingScoped of fs.readdirSync(dstEntryPath)) {
+        if (!scopedNames.has(existingScoped)) {
+          try {
+            fs.rmSync(path.join(dstEntryPath, existingScoped), {
+              recursive: true,
+              force: true,
+            });
+          } catch (err) {
+            if (isBusyFileError(err)) state.deferredToRestart = true;
+          }
+        }
+      }
+      continue;
+    }
+
+    if (entry.isDirectory() && entry.name !== '.bin') {
+      const srcId = readPackageIdentity(srcEntryPath);
+      const dstId = readPackageIdentity(dstEntryPath);
+      if (srcId && srcId === dstId) {
+        continue;
+      }
+      try {
+        fs.rmSync(dstEntryPath, { recursive: true, force: true });
+      } catch (err) {
+        if (!isBusyFileError(err)) throw err;
+      }
+    }
+
+    copyTreePosixSafe(srcEntryPath, dstEntryPath, state);
+  }
+
+  for (const existingTop of fs.readdirSync(dstNodeModules)) {
+    if (
+      !srcTopNames.has(existingTop) &&
+      existingTop !== '.bin' &&
+      existingTop !== '.cache'
+    ) {
+      try {
+        fs.rmSync(path.join(dstNodeModules, existingTop), {
+          recursive: true,
+          force: true,
+        });
+      } catch (err) {
+        if (isBusyFileError(err)) state.deferredToRestart = true;
+      }
+    }
+  }
+
+  return state;
+}
+
 function syncReleaseDirToAppRoot(sourcePersistDir: string, appRoot: string) {
   for (const item of SYNC_TARGETS) {
     const srcItem = path.join(sourcePersistDir, item);
@@ -581,6 +776,7 @@ function syncReleaseDirToAppRoot(sourcePersistDir: string, appRoot: string) {
       fs.rmSync(dstItem, { recursive: true, force: true });
       fs.cpSync(srcItem, dstItem, { recursive: true, force: true });
     } else {
+      fs.rmSync(dstItem, { force: true });
       fs.copyFileSync(srcItem, dstItem);
     }
   }
@@ -918,10 +1114,17 @@ export async function performGitHubUpdate(
             );
           }
           if (shouldSyncAppRoot && fs.existsSync(stagingNodeModules)) {
-            fs.cpSync(stagingNodeModules, path.join(appRoot, 'node_modules'), {
-              recursive: true,
-              force: true,
-            });
+            const syncRes = syncNodeModulesSafe(
+              stagingNodeModules,
+              path.join(appRoot, 'node_modules')
+            );
+            if (syncRes.deferredToRestart) {
+              fs.writeFileSync(
+                path.join(stagingDir, '.needs_npm_sync'),
+                new Date().toISOString(),
+                'utf8'
+              );
+            }
           }
           fs.rmSync(stagingNodeModules, { recursive: true, force: true });
         } else {
@@ -1094,10 +1297,17 @@ export async function performGitHubUpdate(
 
       if (depsChanged) {
         if (shouldSyncAppRoot && fs.existsSync(stagingNodeModules)) {
-          fs.cpSync(stagingNodeModules, path.join(appRoot, 'node_modules'), {
-            recursive: true,
-            force: true,
-          });
+          const syncRes = syncNodeModulesSafe(
+            stagingNodeModules,
+            path.join(appRoot, 'node_modules')
+          );
+          if (syncRes.deferredToRestart) {
+            fs.writeFileSync(
+              path.join(stagingDir, '.needs_npm_sync'),
+              new Date().toISOString(),
+              'utf8'
+            );
+          }
         }
         fs.rmSync(stagingNodeModules, { recursive: true, force: true });
       } else {
@@ -1307,10 +1517,17 @@ export async function performRollbackRelease(): Promise<{
         );
       }
       if (shouldSyncAppRoot && fs.existsSync(prevNodeModules)) {
-        fs.cpSync(prevNodeModules, path.join(appRoot, 'node_modules'), {
-          recursive: true,
-          force: true,
-        });
+        const syncRes = syncNodeModulesSafe(
+          prevNodeModules,
+          path.join(appRoot, 'node_modules')
+        );
+        if (syncRes.deferredToRestart) {
+          fs.writeFileSync(
+            path.join(previousPersistDir, '.needs_npm_sync'),
+            new Date().toISOString(),
+            'utf8'
+          );
+        }
       }
       fs.rmSync(prevNodeModules, { recursive: true, force: true });
     }

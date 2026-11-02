@@ -2,6 +2,13 @@
 
 Mọi thay đổi đáng chú ý của dự án **NAS-Sync** (<https://github.com/shostwp-byte/nas-sync>) đều được ghi nhận tại tài liệu này theo chuẩn [Keep a Changelog](https://keepachangelog.com/vi/1.1.0/) và [Semantic Versioning](https://semver.org/).
 
+## [1.3.1] - 2026-11-02
+
+### Fixed
+- **Khắc phục triệt để lỗi `ETXTBSY: Text file busy '/app/node_modules/@esbuild/linux-x64/bin'` khi Tự động Cập nhật 1-Click trên Linux/Synology Docker (`src/lib/qr-svg.ts`, `src/lib/totp.ts`, `src/lib/updater.ts`, `docker-entrypoint.sh`)**:
+  - Thay thế hoàn toàn gói `qrcode` bên ngoài bằng bộ mã hóa QR Code SVG chuẩn **ISO/IEC 18004 thuần TypeScript (`src/lib/qr-svg.ts`)** không phụ thuộc thư viện ngoài — giữ nguyên 100% danh sách `dependencies` tương thích ngược với `v1.1.x` / `v1.2.0` để các thiết bị NAS đang chạy phiên bản cũ có thể nâng cấp thẳng lên `v1.3.1` bằng 1-Click ngay trên Web UI mà không cần can thiệp SSH.
+  - Bổ sung cơ chế đồng bộ thư viện POSIX an toàn `syncNodeModulesSafe()` trong `updater.ts`: tự động bỏ qua các gói không đổi phiên bản (`name@version`), thực hiện `unlink()` tách inode trước khi sao chép file mới thay vì ghi đè `O_TRUNC` lên binary đang thực thi (`esbuild` / `swc`), kết hợp cờ `.needs_npm_sync` trong `docker-entrypoint.sh` cho mọi bản cập nhật tương lai.
+
 ## [1.3.0] - 2026-11-02
 
 ### Added & Improved (Giai đoạn 1 — 5 Nâng cấp Lõi Ưu tiên Cao)

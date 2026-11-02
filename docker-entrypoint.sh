@@ -22,6 +22,8 @@ if [ -f "$PERSIST_DIR/package.json" ] && [ -d "$PERSIST_DIR/.next" ]; then
     try {
       const imgPkg = JSON.parse(fs.readFileSync("/app/package.json", "utf8"));
       const livePkg = JSON.parse(fs.readFileSync(process.argv[1] + "/package.json", "utf8"));
+      const forceSync = fs.existsSync(process.argv[1] + "/.needs_npm_sync");
+      if (forceSync) { console.log("APPLY_WITH_DEPS"); process.exit(0); }
       const c = cmp(livePkg.version, imgPkg.version);
       if (c < 0) { console.log("CLEAN_OLD"); process.exit(0); }
       let shouldApply = c > 0;
@@ -51,6 +53,8 @@ if [ -f "$PERSIST_DIR/package.json" ] && [ -d "$PERSIST_DIR/.next" ]; then
       if ! (cd /app && npm install --include=dev --no-audit --no-fund --ignore-scripts); then
         echo "[NAS-Sync Entrypoint] CẢNH BÁO: npm install thất bại, giữ nguyên bản gốc trong Docker Image."
         APPLY_OK=0
+      else
+        rm -f "$PERSIST_DIR/.needs_npm_sync"
       fi
     fi
 
