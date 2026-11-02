@@ -2,6 +2,13 @@
 
 Mọi thay đổi đáng chú ý của dự án **NAS-Sync** (<https://github.com/shostwp-byte/nas-sync>) đều được ghi nhận tại tài liệu này theo chuẩn [Keep a Changelog](https://keepachangelog.com/vi/1.1.0/) và [Semantic Versioning](https://semver.org/).
 
+## [1.5.1] - 2026-11-02
+
+### Fixed
+- **Khắc phục lỗi quyền ghi `/mnt/vol1` (`EACCES`) khi chạy kiểm thử `npm test` trên GitHub Actions Ubuntu Linux & khôi phục xuất bản gói Release tự động (`tests/security-and-engine.test.ts`, `offsite-cloud.ts`, `explorer/archive/route.ts`)**:
+  - Cô lập hoàn toàn biến môi trường `STORAGE_VOLUMES` (kèm ngưỡng `VOLUME_MIN_FREE_GB=0`, `VOLUME_MAX_USAGE_PERCENT=99`) vào thư mục tạm `os.tmpdir()` trong bộ kiểm thử tự động — xử lý triệt để lỗi non-root runner trên Ubuntu Linux ghi vào đường dẫn mặc định `/mnt/vol1` của container khiến tiến trình CI và đóng gói GitHub Release (`nas-sync-prebuilt.tar.gz` + `.sha256` + `nas-sync-synology.zip/.tar.gz`) bị dừng ở bước test.
+  - Chuẩn hóa thứ tự cờ lệnh `tar -czf - --exclude=... -C <dir> <entry>` tương thích đồng nhất trên cả GNU `tar`, BSD `libarchive` `tar` và BusyBox `tar`.
+
 ## [1.5.0] - 2026-11-02
 
 ### Added & Improved (Giai đoạn 3 — Mở rộng Nghiệp vụ Hosting, Đám mây Offsite `3-2-1` Google Drive/S3 & 7 Control Panels + PostgreSQL)

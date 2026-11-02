@@ -79,6 +79,12 @@ before(() => {
   tempRootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nas-sync-v140-tests-'));
   process.env.DATA_DIR = path.join(tempRootDir, 'data');
   process.env.SSH_KEYS_DIR = path.join(tempRootDir, 'ssh_keys');
+  process.env.STORAGE_VOLUMES = [
+    path.join(tempRootDir, 'volumes', 'vol1'),
+    path.join(tempRootDir, 'volumes', 'vol2'),
+  ].join(',');
+  process.env.VOLUME_MIN_FREE_GB = '0';
+  process.env.VOLUME_MAX_USAGE_PERCENT = '99';
   process.env.SEED_DEMO = 'false';
   process.env.JWT_SECRET =
     'test-jwt-secret-key-for-nas-sync-v140-automated-suite-256bit';
@@ -345,6 +351,10 @@ describe('5. anomaly-detector & retention-gfs GFS bucket retention', () => {
     const vol = db
       .prepare('SELECT id, mount_path FROM storage_volumes ORDER BY id ASC LIMIT 1')
       .get() as { id: number; mount_path: string };
+    assert.ok(
+      vol.mount_path.startsWith(tempRootDir),
+      'Test storage volume must be isolated inside tempRootDir on both Linux and Windows'
+    );
 
     const srvRes = db
       .prepare(
@@ -409,6 +419,10 @@ describe('5. anomaly-detector & retention-gfs GFS bucket retention', () => {
     const vol = db
       .prepare('SELECT id, mount_path FROM storage_volumes ORDER BY id ASC LIMIT 1')
       .get() as { id: number; mount_path: string };
+    assert.ok(
+      vol.mount_path.startsWith(tempRootDir),
+      'Test storage volume must be isolated inside tempRootDir on both Linux and Windows'
+    );
 
     const srvRes = db
       .prepare(
@@ -933,6 +947,10 @@ describe('7. v1.5.0 Offsite AES-256-GCM Crypto, Cloud SigV4/GDrive JWT, New Pane
     const vol = db
       .prepare('SELECT id, mount_path FROM storage_volumes ORDER BY id ASC LIMIT 1')
       .get() as { id: number; mount_path: string };
+    assert.ok(
+      vol.mount_path.startsWith(tempRootDir),
+      'Test storage volume must be isolated inside tempRootDir on both Linux and Windows'
+    );
 
     const srvIns = db
       .prepare(

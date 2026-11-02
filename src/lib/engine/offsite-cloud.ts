@@ -1260,10 +1260,10 @@ export function startSnapshotOffsitePush(
       : snapshotName;
     const tarBin = process.platform === 'win32' ? 'tar.exe' : 'tar';
     const tarArgs = [
-      '--exclude=.rsync-partial',
-      '--exclude=.state.json',
       '-czf',
       '-',
+      '--exclude=.rsync-partial',
+      '--exclude=.state.json',
       '-C',
       hostDir,
       entryName,

@@ -79,10 +79,10 @@ export async function GET(req: NextRequest) {
 
     const tarBin = process.platform === 'win32' ? 'tar.exe' : 'tar';
     const tarArgs = [
-      '--exclude=.rsync-partial',
-      '--exclude=.state.json',
       '-czf',
       '-',
+      '--exclude=.rsync-partial',
+      '--exclude=.state.json',
       '-C',
       parentDir,
       entryName,
