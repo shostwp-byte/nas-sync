@@ -2,6 +2,19 @@
 
 Mọi thay đổi đáng chú ý của dự án **NAS-Sync** (<https://github.com/shostwp-byte/nas-sync>) đều được ghi nhận tại tài liệu này theo chuẩn [Keep a Changelog](https://keepachangelog.com/vi/1.1.0/) và [Semantic Versioning](https://semver.org/).
 
+## [1.5.0] - 2026-11-02
+
+### Added & Improved (Giai đoạn 3 — Mở rộng Nghiệp vụ Hosting, Đám mây Offsite `3-2-1` Google Drive/S3 & 7 Control Panels + PostgreSQL)
+- **Sao lưu Đám mây Offsite Chuẩn `3-2-1` Mã hóa Đầu-Cuối `AES-256-GCM` hỗ trợ `Google Drive` & `S3 / Cloudflare R2 / Backblaze B2` (`src/lib/engine/offsite-crypto.ts`, `src/lib/engine/offsite-cloud.ts`, `api/offsite/**`, `scripts/decrypt-offsite-backup.mjs`, `settings/page.tsx`, `jobs/page.tsx`)**:
+  - Thiết kế định dạng mã hóa luồng xác thực `NASSYNC1` (`PBKDF2-HMAC-SHA256` 210.000 vòng + các khung `AES-256-GCM` kèm khung kết thúc chống cắt cụt `NASSYNC1-EOF`) nối trực tiếp từ `tar -czf -` lên đám mây mà **không tốn dung lượng tạm trên ổ cứng NAS**.
+  - Tích hợp **Google Drive REST API v3 (`Resumable Upload`)**: hỗ trợ cả **OAuth2 1-Click** (dành cho Gmail cá nhân, Google One & Google Workspace với luồng tự động lấy `Refresh Token` tại `/api/offsite/gdrive-oauth`) lẫn **Service Account JSON (`RS256` JWT)** và tự động nhận diện link thư mục Drive / Shared Drive.
+  - Tích hợp **AWS Signature v4 thuần `node:crypto` (`Multipart Upload`)** tương thích **Cloudflare R2**, **Backblaze B2**, **AWS S3**, **MinIO**, hỗ trợ tự động đẩy sau mỗi lần Backup / Chủ nhật hàng tuần, đẩy thủ công 1-Click trên trang Lịch sử Job, tự động dọn bản cũ theo `offsite_keep_count` và đi kèm công cụ giải mã khẩn cấp độc lập `node scripts/decrypt-offsite-backup.mjs`.
+- **Sao lưu Mở rộng Hệ thống Hosting: Hộp thư Email, Crontab & Cấu hình Webserver/SSL (`src/lib/engine/extended-hosting-backup.ts`, `servers/page.tsx`)**:
+  - Bổ sung 3 tùy chọn độc lập cho từng máy chủ VPS: **Hộp thư Email (`Maildir / IMAP`)** sử dụng `rsync --link-dest` tiết kiệm dung lượng kèm kiểm tra chống thoát vùng symlink, **Lịch Crontab của từng User** và **Cấu hình Vhost/SSL** lưu trữ gọn trong `system_extras/` của mỗi Snapshot (duyệt & tải trực tiếp được trên File Explorer).
+- **Mở rộng lên 7 Control Panel (`CyberPanel`, `HestiaCP`, `CloudPanel`) & Hỗ trợ Cơ sở dữ liệu `PostgreSQL` (`cyberpanel.ts`, `hestiacp.ts`, `cloudpanel.ts`, `postgres-streamer.ts`, `sandbox-verifier.ts`, `restore/page.tsx`)**:
+  - Bổ sung đầy đủ Adapter khám phá tự động, kiểm tra an toàn Webroot Jail và khôi phục chéo cho **CyberPanel (OpenLiteSpeed)**, **HestiaCP** và **CloudPanel** bên cạnh DirectAdmin, cPanel, Plesk, aaPanel.
+  - Hỗ trợ sao lưu stream không tốn đĩa tạm (`pg_dump | zstd -3`), kiểm định toàn vẹn luồng Zstd + cấu trúc dump PostgreSQL và khôi phục tự động (`psql`) cho cơ sở dữ liệu **PostgreSQL** song song với MySQL/MariaDB.
+
 ## [1.4.0] - 2026-11-02
 
 ### Added & Improved (Giai đoạn 2 — An ninh Chiều sâu, Báo cáo NOC Thông minh, PWA & Tối ưu Docker/CI)

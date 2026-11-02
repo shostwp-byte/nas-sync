@@ -1,5 +1,6 @@
 import { execRemoteSSH, shellSingleQuote } from '@/lib/ssh';
 import type {
+  DatabaseEngine,
   DiscoveredDomain,
   MysqlAdminCredentials,
   ServerRecord,
@@ -48,9 +49,9 @@ export class PleskAdapter implements PanelAdapter {
           CASE WHEN IFNULL(d.parentDomainId, 0) > 0 OR d.htype = 'subdomain' THEN 1 ELSE 0 END AS is_sub,
           IFNULL(parent.name, '') AS parent_name,
           IFNULL((
-            SELECT GROUP_CONCAT(db.name SEPARATOR ',')
+            SELECT GROUP_CONCAT(CONCAT(db.name, ':', db.type) SEPARATOR ',')
             FROM data_bases db
-            WHERE db.dom_id = d.id AND db.type = 'mysql'
+            WHERE db.dom_id = d.id AND db.type IN ('mysql', 'postgresql')
           ), '')
         FROM domains d
         JOIN hosting h ON d.id = h.dom_id
@@ -92,7 +93,15 @@ export class PleskAdapter implements PanelAdapter {
         .split(',')
         .map((s) => s.trim())
         .filter(Boolean)
-        .map((name) => ({ name, user: systemUser }));
+        .map((token) => {
+          const colonIdx = token.lastIndexOf(':');
+          const name = colonIdx > 0 ? token.slice(0, colonIdx) : token;
+          const rawType =
+            colonIdx > 0 ? token.slice(colonIdx + 1).toLowerCase() : 'mysql';
+          const engine: DatabaseEngine =
+            rawType === 'postgresql' ? 'POSTGRESQL' : 'MYSQL';
+          return { name, user: systemUser, engine };
+        });
       out.push({
         domain,
         systemUser,

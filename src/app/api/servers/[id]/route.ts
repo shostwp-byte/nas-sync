@@ -12,6 +12,11 @@ import {
   resolveValidatedSshKeyPath,
 } from '@/lib/ssh';
 
+function toBitFlag(val: unknown, fallback = 0): number {
+  if (val === undefined || val === null) return fallback ? 1 : 0;
+  return val === true || val === 1 || val === '1' || val === 'true' ? 1 : 0;
+}
+
 export async function PATCH(
   req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
@@ -43,6 +48,18 @@ export async function PATCH(
     const nextBwLimit = Number(body.bw_limit_kbps ?? curr.bw_limit_kbps);
     const nextIsMock =
       body.is_mock !== undefined ? (body.is_mock ? 1 : 0) : Number(curr.is_mock || 0);
+    const nextBackupMailboxes = toBitFlag(
+      body.backup_mailboxes,
+      Number(curr.backup_mailboxes || 0)
+    );
+    const nextBackupCronjobs = toBitFlag(
+      body.backup_cronjobs,
+      Number(curr.backup_cronjobs || 0)
+    );
+    const nextBackupVhostConfigs = toBitFlag(
+      body.backup_vhost_configs,
+      Number(curr.backup_vhost_configs || 0)
+    );
     const rawSshKeyPath = String(
       body.ssh_key_path !== undefined ? body.ssh_key_path : curr.ssh_key_path || ''
     ).trim();
@@ -108,6 +125,7 @@ export async function PATCH(
          SET hostname = ?, ip_address = ?, ssh_port = ?, ssh_user = ?, ssh_key_path = ?,
              panel_type = ?, assigned_volume_id = ?, bw_limit_kbps = ?, is_mock = ?, notes = ?,
              custom_excludes = ?,
+             backup_mailboxes = ?, backup_cronjobs = ?, backup_vhost_configs = ?,
              host_key_status = ?, host_key_fingerprint = ?, known_host_entry = '',
              host_key_pending_fingerprint = '', host_key_pending_entry = ''
          WHERE id = ?`
@@ -125,6 +143,9 @@ export async function PATCH(
         nextIsMock,
         body.notes !== undefined ? String(body.notes) : curr.notes,
         nextCustomExcludes,
+        nextBackupMailboxes,
+        nextBackupCronjobs,
+        nextBackupVhostConfigs,
         resetStatus,
         resetFp,
         serverId
@@ -134,7 +155,8 @@ export async function PATCH(
         `UPDATE servers
          SET hostname = ?, ip_address = ?, ssh_port = ?, ssh_user = ?, ssh_key_path = ?,
              panel_type = ?, assigned_volume_id = ?, bw_limit_kbps = ?, is_mock = ?, notes = ?,
-             custom_excludes = ?
+             custom_excludes = ?,
+             backup_mailboxes = ?, backup_cronjobs = ?, backup_vhost_configs = ?
          WHERE id = ?`
       ).run(
         nextHostname,
@@ -150,6 +172,9 @@ export async function PATCH(
         nextIsMock,
         body.notes !== undefined ? String(body.notes) : curr.notes,
         nextCustomExcludes,
+        nextBackupMailboxes,
+        nextBackupCronjobs,
+        nextBackupVhostConfigs,
         serverId
       );
     }

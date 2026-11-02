@@ -43,6 +43,11 @@ export async function GET() {
   }
 }
 
+function toBitFlag(val: unknown, fallback = 0): number {
+  if (val === undefined || val === null) return fallback ? 1 : 0;
+  return val === true || val === 1 || val === '1' || val === 'true' ? 1 : 0;
+}
+
 export async function POST(req: NextRequest) {
   try {
     const guard = await requireRole(['ADMIN']);
@@ -60,6 +65,9 @@ export async function POST(req: NextRequest) {
     const notes = String(body.notes || '');
     const rawCustomExcludes =
       body.custom_excludes !== undefined ? String(body.custom_excludes) : '';
+    const backupMailboxes = toBitFlag(body.backup_mailboxes, 0);
+    const backupCronjobs = toBitFlag(body.backup_cronjobs, 0);
+    const backupVhostConfigs = toBitFlag(body.backup_vhost_configs, 0);
 
     if (!hostname || !ipAddress) {
       return NextResponse.json(
@@ -129,8 +137,8 @@ export async function POST(req: NextRequest) {
     const res = db
       .prepare(
         `INSERT INTO servers
-         (hostname, ip_address, ssh_port, ssh_user, ssh_key_path, panel_type, assigned_volume_id, bw_limit_kbps, status, is_mock, notes, custom_excludes, host_key_status, host_key_fingerprint)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ONLINE', ?, ?, ?, ?, ?)`
+         (hostname, ip_address, ssh_port, ssh_user, ssh_key_path, panel_type, assigned_volume_id, bw_limit_kbps, status, is_mock, notes, custom_excludes, backup_mailboxes, backup_cronjobs, backup_vhost_configs, host_key_status, host_key_fingerprint)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ONLINE', ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         hostname,
@@ -144,6 +152,9 @@ export async function POST(req: NextRequest) {
         isMock,
         notes,
         excludeCheck.normalized,
+        backupMailboxes,
+        backupCronjobs,
+        backupVhostConfigs,
         initialHostKeyStatus,
         initialHostKeyFp
       );

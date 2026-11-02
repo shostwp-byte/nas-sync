@@ -124,7 +124,77 @@ export async function executeMockServerBackup(params: {
   );
 
   const dbResults: DatabaseBackupInfo[] = [];
+  const zlibWithZstd = zlib as typeof zlib & {
+    zstdCompressSync?: (buf: Buffer) => Buffer;
+  };
+
   for (const dbItem of domainInfo.databases) {
+    if (dbItem.engine === 'POSTGRESQL') {
+      const pgSqlContent = `--
+-- PostgreSQL database dump
+--
+-- Dumped from database version 16.4
+-- Dumped by pg_dump version 16.4
+-- Host: ${server.hostname}    Database: ${dbItem.name}
+-- Panel: ${server.panel_type}    Snapshot: ${snapshotName}
+
+SET statement_timeout = 0;
+SET client_encoding = 'UTF8';
+SET standard_conforming_strings = on;
+
+CREATE TABLE IF NOT EXISTS public.app_settings (
+    id bigint PRIMARY KEY,
+    setting_key character varying(191) NOT NULL,
+    setting_value text NOT NULL
+);
+
+INSERT INTO public.app_settings (id, setting_key, setting_value) VALUES
+(1, 'site_domain', 'https://${domainInfo.domain}'),
+(2, 'snapshot_tag', '${snapshotName}');
+
+CREATE TABLE IF NOT EXISTS public.audit_events (
+    id bigint PRIMARY KEY,
+    event_name character varying(120) NOT NULL,
+    created_at timestamp with time zone DEFAULT now()
+);
+
+INSERT INTO public.audit_events (id, event_name) VALUES
+(1, 'nas_sync_pg_stream_${snapshotName}');
+
+--
+-- PostgreSQL database dump complete
+--
+`;
+      const rawBuf = Buffer.from(pgSqlContent, 'utf8');
+      const useZstd = typeof zlibWithZstd.zstdCompressSync === 'function';
+      const compressed = useZstd
+        ? zlibWithZstd.zstdCompressSync!(rawBuf)
+        : zlib.gzipSync(rawBuf);
+      const fileName = useZstd
+        ? `pg_${dbItem.name}.sql.zst`
+        : `pg_${dbItem.name}.sql.gz`;
+      const dumpPath = path.join(destDatabasesDir, fileName);
+      fs.writeFileSync(dumpPath, compressed);
+
+      totalBytes += compressed.length;
+      deltaBytes += compressed.length;
+
+      onLog(
+        `[PG Stream] Đã stream trực tiếp PostgreSQL ${dbItem.name} ➔ ${fileName} (${(
+          compressed.length / 1024
+        ).toFixed(2)} KB).`
+      );
+
+      dbResults.push({
+        name: dbItem.name,
+        db_user: dbItem.user,
+        engine: 'POSTGRESQL',
+        file: fileName,
+        size_bytes: compressed.length,
+      });
+      continue;
+    }
+
     const sqlContent = `-- NAS-Sync SQL Stream Dump
 -- Host: ${server.hostname}    Database: ${dbItem.name}
 -- Panel: ${server.panel_type}    Snapshot: ${snapshotName}
@@ -174,6 +244,7 @@ SET FOREIGN_KEY_CHECKS = 1;
     dbResults.push({
       name: dbItem.name,
       db_user: dbItem.user,
+      engine: 'MYSQL',
       file: fileName,
       size_bytes: compressed.length,
     });

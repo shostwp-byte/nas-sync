@@ -8,6 +8,7 @@ import {
   Check,
   CheckCheck,
   CheckCircle2,
+  Cloud,
   Copy,
   ExternalLink,
   Eye,
@@ -32,10 +33,13 @@ import {
   X,
 } from 'lucide-react';
 import { useRealtime } from '@/components/SocketProvider';
-import { formatBytes, formatDateTime } from '@/lib/format';
+import { formatBytes, formatDateTime, formatEta } from '@/lib/format';
 import type {
   AuditLogRecord,
   MorningDigestSummary,
+  OffsiteProviderType,
+  OffsiteSyncJob,
+  OffsiteSyncStatus,
   SystemAlert,
   SystemUpdateInfo,
   UserRecord,
@@ -43,6 +47,9 @@ import type {
 } from '@/types';
 
 type SettingsTab = 'config' | 'account' | 'rbac' | 'audit';
+
+const EMERGENCY_DECRYPT_CMD =
+  'node scripts/decrypt-offsite-backup.mjs <file.tar.gz.enc> <out.tar.gz> "<passphrase>"';
 
 const DIGEST_CRON_PRESETS = [
   { label: '06:00', cron: '0 6 * * *' },
@@ -129,8 +136,42 @@ function getAuditActionBadgeClass(action: string): string {
   return 'bg-blue-500/15 text-blue-300 border-blue-500/30';
 }
 
+function getOffsiteStatusMeta(status: OffsiteSyncStatus | string): {
+  label: string;
+  className: string;
+} {
+  switch (status) {
+    case 'COMPLETED':
+      return {
+        label: 'Hoàn tất',
+        className: 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40',
+      };
+    case 'UPLOADING':
+      return {
+        label: 'Đang tải lên',
+        className: 'bg-cyan-500/20 text-cyan-300 border-cyan-500/40',
+      };
+    case 'QUEUED':
+      return {
+        label: 'Đang chờ',
+        className: 'bg-slate-500/20 text-slate-300 border-slate-500/30',
+      };
+    case 'FAILED':
+      return {
+        label: 'Thất bại',
+        className: 'bg-rose-500/20 text-rose-300 border-rose-500/40',
+      };
+    default:
+      return {
+        label: status,
+        className: 'bg-slate-700 text-slate-300 border-slate-600',
+      };
+  }
+}
+
 export default function SettingsPage() {
-  const { updateProgress, updateLogs, clearUpdateLogs } = useRealtime();
+  const { updateProgress, updateLogs, clearUpdateLogs, lastUpdateCounter } =
+    useRealtime();
 
   // Current User & Active Tab
   const [currentUser, setCurrentUser] = useState<{
@@ -172,6 +213,29 @@ export default function SettingsPage() {
   const [updateInfo, setUpdateInfo] = useState<SystemUpdateInfo | null>(null);
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [triggeringUpdate, setTriggeringUpdate] = useState(false);
+
+  // Offsite Cloud Backup 3-2-1 State (Tab 1)
+  const [offsiteJobs, setOffsiteJobs] = useState<OffsiteSyncJob[]>([]);
+  const [offsiteJobsLoading, setOffsiteJobsLoading] = useState(false);
+  const [testingOffsite, setTestingOffsite] = useState(false);
+  const [offsiteTestResult, setOffsiteTestResult] = useState<{
+    ok: boolean;
+    providerLabel?: string;
+    detail?: string;
+    error?: string;
+  } | null>(null);
+  const [connectingGdriveOAuth, setConnectingGdriveOAuth] = useState(false);
+  const [gdriveOAuthBanner, setGdriveOAuthBanner] = useState<{
+    ok: boolean;
+    text: string;
+  } | null>(null);
+  const [appOrigin, setAppOrigin] = useState('');
+  const [copiedRedirectUri, setCopiedRedirectUri] = useState(false);
+  const [copiedDecryptCmd, setCopiedDecryptCmd] = useState(false);
+  const [showOffsitePassphrase, setShowOffsitePassphrase] = useState(false);
+  const [showS3SecretKey, setShowS3SecretKey] = useState(false);
+  const [showGdriveClientSecret, setShowGdriveClientSecret] = useState(false);
+  const [showGdriveRefreshToken, setShowGdriveRefreshToken] = useState(false);
 
   // Personal Account Password / Username State (Tab 2)
   const [adminUsername, setAdminUsername] = useState('admin');
@@ -266,6 +330,21 @@ export default function SettingsPage() {
     }
   }, []);
 
+  const loadOffsiteJobs = useCallback(async () => {
+    setOffsiteJobsLoading(true);
+    try {
+      const resp = await fetch('/api/offsite', { cache: 'no-store' });
+      if (resp.ok) {
+        const json = await resp.json();
+        setOffsiteJobs(json.jobs || []);
+      }
+    } catch {
+      // Ignore transient network hiccup
+    } finally {
+      setOffsiteJobsLoading(false);
+    }
+  }, []);
+
   const handleCheckUpdate = useCallback(async () => {
     setCheckingUpdate(true);
     try {
@@ -337,7 +416,11 @@ export default function SettingsPage() {
         if (role !== 'ADMIN') {
           setActiveTab('account');
         } else {
-          await Promise.all([loadAdminSettings(), handleCheckUpdate()]);
+          await Promise.all([
+            loadAdminSettings(),
+            loadOffsiteJobs(),
+            handleCheckUpdate(),
+          ]);
         }
       } catch {
         // Ignore transient init errors
@@ -347,7 +430,49 @@ export default function SettingsPage() {
     return () => {
       active = false;
     };
-  }, [loadTwoFaStatus, loadAdminSettings, handleCheckUpdate]);
+  }, [loadTwoFaStatus, loadAdminSettings, loadOffsiteJobs, handleCheckUpdate]);
+
+  // Detect Google Drive OAuth2 callback query params (?gdrive=connected or ?gdrive_error=...)
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    setAppOrigin(window.location.origin);
+    const params = new URLSearchParams(window.location.search);
+    const gdrive = params.get('gdrive');
+    const gdriveError = params.get('gdrive_error');
+    if (gdrive === 'connected') {
+      setGdriveOAuthBanner({
+        ok: true,
+        text: '✅ Đã liên kết tài khoản Google Drive thành công!',
+      });
+      setActiveTab('config');
+      window.history.replaceState({}, '', window.location.pathname);
+    } else if (gdriveError) {
+      setGdriveOAuthBanner({
+        ok: false,
+        text: `❌ Liên kết tài khoản Google Drive thất bại: ${gdriveError}`,
+      });
+      setActiveTab('config');
+      window.history.replaceState({}, '', window.location.pathname);
+    }
+  }, []);
+
+  // Auto-refresh Offsite sync transfers when realtime events arrive or while an upload is active
+  useEffect(() => {
+    if (!isAdmin || activeTab !== 'config' || lastUpdateCounter === 0) return;
+    void loadOffsiteJobs();
+  }, [isAdmin, activeTab, lastUpdateCounter, loadOffsiteJobs]);
+
+  useEffect(() => {
+    if (!isAdmin || activeTab !== 'config') return;
+    const hasActiveUpload = offsiteJobs.some(
+      (j) => j.status === 'QUEUED' || j.status === 'UPLOADING'
+    );
+    if (!hasActiveUpload) return;
+    const timer = setInterval(() => {
+      void loadOffsiteJobs();
+    }, 4000);
+    return () => clearInterval(timer);
+  }, [isAdmin, activeTab, offsiteJobs, loadOffsiteJobs]);
 
   useEffect(() => {
     if (!currentUser || currentUser.role !== 'ADMIN') return;
@@ -428,8 +553,21 @@ export default function SettingsPage() {
 
   const handleSaveSettings = async (e: React.FormEvent) => {
     e.preventDefault();
-    setSaving(true);
     setFeedback('');
+
+    const activeOffsiteProvider = (settings.offsite_provider ||
+      'NONE') as OffsiteProviderType;
+    if (activeOffsiteProvider !== 'NONE') {
+      const pass = (settings.offsite_encryption_passphrase || '').trim();
+      if (pass.length < 8) {
+        setFeedback(
+          '❌ Mật khẩu Mã hóa Đầu-Cuối AES-256-GCM cho Đám mây Offsite phải có tối thiểu 8 ký tự.'
+        );
+        return;
+      }
+    }
+
+    setSaving(true);
     try {
       const resp = await fetch('/api/settings', {
         method: 'PUT',
@@ -438,12 +576,123 @@ export default function SettingsPage() {
       });
       if (resp.ok) {
         setFeedback('✅ Đã lưu toàn bộ cấu hình hệ thống thành công!');
+        await loadAdminSettings();
       } else {
         const json = await resp.json().catch(() => ({}));
         setFeedback(`❌ ${json.error || 'Không thể lưu cấu hình hệ thống.'}`);
       }
     } finally {
       setSaving(false);
+    }
+  };
+
+  const getOffsiteOverrides = (): Record<string, string> => ({
+    offsite_provider: settings.offsite_provider || 'NONE',
+    offsite_auto_push: settings.offsite_auto_push || 'NONE',
+    offsite_keep_count: settings.offsite_keep_count || '12',
+    offsite_encryption_passphrase: settings.offsite_encryption_passphrase || '',
+    offsite_s3_preset: settings.offsite_s3_preset || 'R2',
+    offsite_s3_endpoint: settings.offsite_s3_endpoint || '',
+    offsite_s3_region: settings.offsite_s3_region || '',
+    offsite_s3_bucket: settings.offsite_s3_bucket || '',
+    offsite_s3_prefix: settings.offsite_s3_prefix || '',
+    offsite_s3_access_key: settings.offsite_s3_access_key || '',
+    offsite_s3_secret_key: settings.offsite_s3_secret_key || '',
+    offsite_gdrive_auth_mode: settings.offsite_gdrive_auth_mode || 'OAUTH2',
+    offsite_gdrive_folder_id: settings.offsite_gdrive_folder_id || '',
+    offsite_gdrive_client_id: settings.offsite_gdrive_client_id || '',
+    offsite_gdrive_client_secret: settings.offsite_gdrive_client_secret || '',
+    offsite_gdrive_refresh_token: settings.offsite_gdrive_refresh_token || '',
+    offsite_gdrive_service_account_json:
+      settings.offsite_gdrive_service_account_json || '',
+  });
+
+  const handleTestOffsiteConnection = async () => {
+    setTestingOffsite(true);
+    setOffsiteTestResult(null);
+    try {
+      const resp = await fetch('/api/offsite', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'test_connection',
+          overrides: getOffsiteOverrides(),
+        }),
+      });
+      const json = await resp.json().catch(() => ({}));
+      if (!resp.ok || !json.ok) {
+        setOffsiteTestResult({
+          ok: false,
+          error:
+            json.error ||
+            'Không thể kết nối tới dịch vụ Đám mây Offsite. Vui lòng kiểm tra lại thông tin xác thực.',
+        });
+        return;
+      }
+      setOffsiteTestResult({
+        ok: true,
+        providerLabel: json.providerLabel,
+        detail:
+          json.detail || 'Kết nối kho lưu trữ Đám mây Offsite thành công!',
+      });
+    } catch (err) {
+      setOffsiteTestResult({
+        ok: false,
+        error:
+          (err as Error).message ||
+          'Lỗi kết nối khi kiểm tra Đám mây Offsite.',
+      });
+    } finally {
+      setTestingOffsite(false);
+    }
+  };
+
+  const handleStartGdriveOAuth = async () => {
+    const clientId = (settings.offsite_gdrive_client_id || '').trim();
+    const clientSecret = (settings.offsite_gdrive_client_secret || '').trim();
+    if (!clientId || !clientSecret) {
+      setOffsiteTestResult({
+        ok: false,
+        error:
+          'Vui lòng nhập đầy đủ Google Client ID và Google Client Secret trước khi đăng nhập lấy Refresh Token.',
+      });
+      return;
+    }
+
+    setConnectingGdriveOAuth(true);
+    setOffsiteTestResult(null);
+    try {
+      // Lưu tạm các thông tin phụ trợ trên biểu mẫu trước khi chuyển hướng trình duyệt sang Google
+      await fetch('/api/settings', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ settings }),
+      }).catch(() => {});
+
+      const resp = await fetch('/api/offsite/gdrive-oauth', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ clientId, clientSecret }),
+      });
+      const json = await resp.json().catch(() => ({}));
+      if (!resp.ok || !json.ok || !json.authUrl) {
+        setOffsiteTestResult({
+          ok: false,
+          error:
+            json.error ||
+            'Không thể khởi tạo phiên đăng nhập Google OAuth2. Hãy kiểm tra lại Client ID / Client Secret.',
+        });
+        return;
+      }
+      window.location.href = String(json.authUrl);
+    } catch (err) {
+      setOffsiteTestResult({
+        ok: false,
+        error:
+          (err as Error).message || 'Lỗi kết nối khi khởi tạo Google OAuth2.',
+      });
+    } finally {
+      setConnectingGdriveOAuth(false);
     }
   };
 
@@ -1006,7 +1255,7 @@ export default function SettingsPage() {
         </h2>
         <p className="text-xs text-slate-400 mt-0.5">
           {isAdmin
-            ? 'Quản lý cập nhật Prebuilt 1-Click từ GitHub (shostwp-byte/nas-sync), Bộ lọc file toàn cục, Bảo mật 2FA, Phân quyền RBAC và Nhật ký kiểm toán.'
+            ? 'Quản lý cập nhật Prebuilt 1-Click từ GitHub (shostwp-byte/nas-sync), Sao lưu Đám mây Offsite chuẩn 3-2-1 (AES-256-GCM), Bộ lọc file toàn cục, Bảo mật 2FA, Phân quyền RBAC và Nhật ký kiểm toán.'
             : 'Quản lý mật khẩu đăng nhập và thiết lập xác thực 2 lớp (Google Authenticator / Authy) cho tài khoản của bạn.'}
         </p>
       </div>
@@ -1078,8 +1327,34 @@ export default function SettingsPage() {
          ===================================================================== */}
       {isAdmin && activeTab === 'config' && (
         <div className="space-y-6">
+          {gdriveOAuthBanner && (
+            <div
+              className={`p-4 rounded-2xl border text-xs sm:text-sm font-semibold flex items-start justify-between gap-3 shadow-lg ${
+                gdriveOAuthBanner.ok
+                  ? 'bg-emerald-500/15 border-emerald-500/40 text-emerald-200 shadow-emerald-950/30'
+                  : 'bg-rose-500/15 border-rose-500/40 text-rose-200 shadow-rose-950/30'
+              }`}
+            >
+              <span className="break-words">{gdriveOAuthBanner.text}</span>
+              <button
+                type="button"
+                onClick={() => setGdriveOAuthBanner(null)}
+                aria-label="Đóng thông báo Google Drive"
+                className="text-slate-300 hover:text-white shrink-0"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          )}
+
           {feedback && (
-            <div className="p-3.5 rounded-xl bg-blue-500/15 border border-blue-500/30 text-xs text-blue-200 break-words">
+            <div
+              className={`p-3.5 rounded-xl border text-xs break-words ${
+                feedback.startsWith('❌')
+                  ? 'bg-rose-500/15 border-rose-500/35 text-rose-200'
+                  : 'bg-emerald-500/15 border-emerald-500/35 text-emerald-200'
+              }`}
+            >
               {feedback}
             </div>
           )}
@@ -1289,6 +1564,966 @@ export default function SettingsPage() {
           </div>
 
           <form onSubmit={handleSaveSettings} className="space-y-6 text-xs">
+            {/* ===============================================================
+                OFFSITE CLOUD BACKUP 3-2-1 (GOOGLE DRIVE + S3/R2/B2 + AES-256-GCM)
+               =============================================================== */}
+            {(() => {
+              const offsiteProvider = (settings.offsite_provider ||
+                'NONE') as OffsiteProviderType;
+              const gdriveAuthMode = (settings.offsite_gdrive_auth_mode ||
+                'OAUTH2') as 'OAUTH2' | 'SERVICE_ACCOUNT';
+              const s3Preset = (settings.offsite_s3_preset || 'R2') as
+                | 'R2'
+                | 'B2'
+                | 'AWS'
+                | 'CUSTOM';
+              const gdriveRedirectUri = `${
+                appOrigin || 'http://localhost:3000'
+              }/api/offsite/gdrive-oauth`;
+
+              const s3EndpointPlaceholder =
+                s3Preset === 'R2'
+                  ? 'https://<accountid>.r2.cloudflarestorage.com'
+                  : s3Preset === 'B2'
+                  ? 'https://s3.us-west-004.backblazeb2.com'
+                  : s3Preset === 'AWS'
+                  ? 'https://s3.ap-southeast-1.amazonaws.com (để trống nếu dùng chuẩn AWS)'
+                  : 'https://minio.example.com:9000';
+
+              const s3RegionPlaceholder =
+                s3Preset === 'R2'
+                  ? 'auto'
+                  : s3Preset === 'B2'
+                  ? 'us-west-004'
+                  : s3Preset === 'AWS'
+                  ? 'ap-southeast-1'
+                  : 'us-east-1';
+
+              return (
+                <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-6 space-y-5 min-w-0">
+                  <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3">
+                    <div className="min-w-0 space-y-1">
+                      <h3 className="text-sm font-bold text-white flex items-center gap-2 flex-wrap">
+                        <Cloud className="w-4 h-4 text-cyan-400 shrink-0" />
+                        <span>
+                          ☁️ Sao lưu Đám mây Offsite chuẩn 3-2-1 (Mã hóa Đầu-Cuối
+                          AES-256-GCM)
+                        </span>
+                      </h3>
+                      <p className="text-[11px] text-slate-400 leading-relaxed">
+                        Đóng gói nén Snapshot trên NAS, mã hóa đầu-cuối Zero-Knowledge{' '}
+                        <code className="font-mono text-emerald-300">
+                          AES-256-GCM
+                        </code>{' '}
+                        ngay tại chỗ trước khi tải lên Google Drive hoặc kho S3 /
+                        Cloudflare R2 / Backblaze B2 tách biệt vật lý.
+                      </p>
+                    </div>
+
+                    <span
+                      className={`px-2.5 py-1 rounded-full border text-[11px] font-semibold shrink-0 self-start ${
+                        offsiteProvider === 'GOOGLE_DRIVE'
+                          ? 'bg-emerald-500/15 border-emerald-500/35 text-emerald-300'
+                          : offsiteProvider === 'S3_COMPATIBLE'
+                          ? 'bg-amber-500/15 border-amber-500/35 text-amber-300'
+                          : 'bg-slate-950 border-slate-800 text-slate-400'
+                      }`}
+                    >
+                      {offsiteProvider === 'GOOGLE_DRIVE'
+                        ? '🟢 Đang bật: Google Drive'
+                        : offsiteProvider === 'S3_COMPATIBLE'
+                        ? '🟠 Đang bật: S3 / R2 / B2'
+                        : '🚫 Chỉ lưu tại NAS'}
+                    </span>
+                  </div>
+
+                  {/* 1. Provider Selector Cards/Pills */}
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                    {[
+                      {
+                        value: 'NONE' as OffsiteProviderType,
+                        title: '🚫 Tắt (Chỉ lưu tại NAS)',
+                        desc: 'Không đẩy bản sao lưu ra đám mây ngoài NAS.',
+                        activeClass:
+                          'bg-slate-800/80 border-slate-600 text-white',
+                      },
+                      {
+                        value: 'GOOGLE_DRIVE' as OffsiteProviderType,
+                        title:
+                          '🟢 Google Drive (Gmail Cá nhân / Google One / Workspace)',
+                        desc: 'Tận dụng dung lượng Google One / Workspace sẵn có với OAuth2 hoặc Service Account.',
+                        activeClass:
+                          'bg-emerald-500/15 border-emerald-500 text-white shadow-lg shadow-emerald-950/30',
+                      },
+                      {
+                        value: 'S3_COMPATIBLE' as OffsiteProviderType,
+                        title: '🟠 S3 / Cloudflare R2 / Backblaze B2',
+                        desc: 'Kho Object Storage chuẩn S3 tốc độ cao, miễn phí băng thông tải về (Cloudflare R2).',
+                        activeClass:
+                          'bg-amber-500/15 border-amber-500 text-white shadow-lg shadow-amber-950/30',
+                      },
+                    ].map((card) => {
+                      const active = offsiteProvider === card.value;
+                      return (
+                        <button
+                          key={card.value}
+                          type="button"
+                          onClick={() => {
+                            updateField('offsite_provider', card.value);
+                            setOffsiteTestResult(null);
+                          }}
+                          className={`p-3.5 rounded-xl border text-left space-y-1 transition-all min-w-0 ${
+                            active
+                              ? card.activeClass
+                              : 'bg-slate-950 border-slate-800 text-slate-300 hover:border-slate-700'
+                          }`}
+                        >
+                          <div className="font-semibold text-xs break-words">
+                            {card.title}
+                          </div>
+                          <p className="text-[11px] text-slate-400 leading-relaxed break-words">
+                            {card.desc}
+                          </p>
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  {/* 2. Common Encryption & Retention Row (when provider !== 'NONE') */}
+                  {offsiteProvider !== 'NONE' && (
+                    <div className="space-y-5 pt-2 border-t border-slate-800/80">
+                      <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
+                        <div className="lg:col-span-5 flex flex-col justify-between">
+                          <label className="block text-slate-300 font-medium mb-1">
+                            Mật khẩu Mã hóa Đầu-Cuối AES-256-GCM * (tối thiểu 8 ký
+                            tự)
+                          </label>
+                          <div className="relative">
+                            <input
+                              type={showOffsitePassphrase ? 'text' : 'password'}
+                              minLength={8}
+                              autoComplete="new-password"
+                              value={settings.offsite_encryption_passphrase || ''}
+                              onChange={(e) =>
+                                updateField(
+                                  'offsite_encryption_passphrase',
+                                  e.target.value
+                                )
+                              }
+                              placeholder="Nhập khóa bí mật tối thiểu 8 ký tự..."
+                              className="w-full min-h-[42px] bg-slate-950 border border-slate-700 focus:border-emerald-500 rounded-lg pl-3 pr-10 py-2 text-white font-mono outline-none"
+                            />
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setShowOffsitePassphrase((v) => !v)
+                              }
+                              aria-label={
+                                showOffsitePassphrase
+                                  ? 'Ẩn mật khẩu mã hóa Offsite'
+                                  : 'Hiện mật khẩu mã hóa Offsite'
+                              }
+                              className="h-9 w-9 inline-flex items-center justify-center rounded-md text-slate-400 hover:text-white absolute right-1 top-1/2 -translate-y-1/2"
+                            >
+                              {showOffsitePassphrase ? (
+                                <EyeOff className="w-4 h-4" />
+                              ) : (
+                                <Eye className="w-4 h-4" />
+                              )}
+                            </button>
+                          </div>
+                        </div>
+
+                        <div className="lg:col-span-4 flex flex-col justify-between">
+                          <label className="block text-slate-300 font-medium mb-1">
+                            Chế độ tự động đẩy lên Mây
+                          </label>
+                          <select
+                            value={settings.offsite_auto_push || 'NONE'}
+                            onChange={(e) =>
+                              updateField('offsite_auto_push', e.target.value)
+                            }
+                            className="w-full min-h-[42px] bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white"
+                          >
+                            <option value="NONE">Chỉ đẩy thủ công</option>
+                            <option value="WEEKLY_SUNDAY">
+                              Tự động Chủ Nhật hàng tuần
+                            </option>
+                            <option value="EVERY_BACKUP">
+                              Tự động sau mỗi lần Sao lưu thành công
+                            </option>
+                          </select>
+                        </div>
+
+                        <div className="lg:col-span-3 flex flex-col justify-between">
+                          <label className="block text-slate-300 font-medium mb-1">
+                            Số bản lưu giữ tối đa trên Mây / mỗi VPS
+                          </label>
+                          <input
+                            type="number"
+                            min={1}
+                            max={365}
+                            value={settings.offsite_keep_count || '12'}
+                            onChange={(e) =>
+                              updateField('offsite_keep_count', e.target.value)
+                            }
+                            className="w-full min-h-[42px] bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white font-mono"
+                          />
+                        </div>
+                      </div>
+
+                      {/* Concise Disaster-Recovery Callout */}
+                      <div className="p-3.5 rounded-xl bg-amber-500/10 border border-amber-500/30 space-y-2">
+                        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                          <div className="font-semibold text-amber-200 flex items-center gap-1.5">
+                            <ShieldAlert className="w-4 h-4 text-amber-400 shrink-0" />
+                            <span>
+                              Lệnh Giải mã Khẩn cấp Độc lập (Disaster Recovery —
+                              khi NAS gặp sự cố vật lý):
+                            </span>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              await copyTextSafe(EMERGENCY_DECRYPT_CMD);
+                              setCopiedDecryptCmd(true);
+                              setTimeout(() => setCopiedDecryptCmd(false), 2000);
+                            }}
+                            className="w-full sm:w-auto justify-center min-h-[34px] inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 text-amber-200 border border-amber-500/30 text-[11px] shrink-0"
+                          >
+                            {copiedDecryptCmd ? (
+                              <>
+                                <Check className="w-3.5 h-3.5 text-emerald-400" />
+                                <span>Đã sao chép lệnh!</span>
+                              </>
+                            ) : (
+                              <>
+                                <Copy className="w-3.5 h-3.5" />
+                                <span>Sao chép lệnh giải mã</span>
+                              </>
+                            )}
+                          </button>
+                        </div>
+                        <pre className="p-2.5 rounded-lg bg-slate-950 border border-slate-800 font-mono text-[11px] text-cyan-300 overflow-x-auto whitespace-pre-wrap break-all">
+                          {EMERGENCY_DECRYPT_CMD}
+                        </pre>
+                        <p className="text-[11px] text-amber-100/80">
+                          Hãy lưu giữ Mật khẩu Mã hóa AES-256-GCM ở nơi an toàn:
+                          không ai (kể cả Google/Cloudflare) có thể đọc file{' '}
+                          <code className="font-mono">.tar.gz.enc</code> nếu thiếu
+                          mật khẩu này.
+                        </p>
+                      </div>
+
+                      {/* 3. GOOGLE DRIVE CONFIGURATION */}
+                      {offsiteProvider === 'GOOGLE_DRIVE' && (
+                        <div className="p-4 rounded-xl bg-slate-950 border border-emerald-500/25 space-y-4">
+                          <div className="space-y-2">
+                            <label className="block text-slate-300 font-semibold">
+                              Phương thức Xác thực Google Drive
+                            </label>
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
+                              {[
+                                {
+                                  key: 'OAUTH2' as const,
+                                  label:
+                                    'OAuth2 (Tài khoản Gmail Cá nhân / Google One / Workspace)',
+                                },
+                                {
+                                  key: 'SERVICE_ACCOUNT' as const,
+                                  label:
+                                    'Service Account JSON (Chạy ngầm Workspace / Thư mục chia sẻ)',
+                                },
+                              ].map((m) => {
+                                const active = gdriveAuthMode === m.key;
+                                return (
+                                  <button
+                                    key={m.key}
+                                    type="button"
+                                    onClick={() =>
+                                      updateField(
+                                        'offsite_gdrive_auth_mode',
+                                        m.key
+                                      )
+                                    }
+                                    className={`min-h-[42px] px-3.5 py-2 rounded-xl border text-left font-medium transition-colors break-words ${
+                                      active
+                                        ? 'bg-emerald-500/20 border-emerald-500/50 text-emerald-200'
+                                        : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200'
+                                    }`}
+                                  >
+                                    {m.label}
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          </div>
+
+                          <div>
+                            <label className="block text-slate-300 font-medium mb-1">
+                              Google Drive Folder ID (hoặc dán nguyên link thư mục
+                              Drive) *
+                            </label>
+                            <input
+                              value={settings.offsite_gdrive_folder_id || ''}
+                              onChange={(e) =>
+                                updateField(
+                                  'offsite_gdrive_folder_id',
+                                  e.target.value
+                                )
+                              }
+                              placeholder="VD: 1A2b3C4d5E6f7G8h9I0j... hoặc https://drive.google.com/drive/folders/1A2b3C4d5E..."
+                              className="w-full min-h-[42px] bg-slate-900 border border-slate-700 focus:border-emerald-500 rounded-lg px-3 py-2 text-white font-mono outline-none"
+                            />
+                          </div>
+
+                          {gdriveAuthMode === 'OAUTH2' ? (
+                            <div className="space-y-4 pt-2 border-t border-slate-800/80">
+                              <div className="p-3 rounded-xl bg-slate-900 border border-slate-800 space-y-2">
+                                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                                  <span className="text-[11px] text-slate-300 font-medium">
+                                    Authorized Redirect URI (dán vào Google Cloud
+                                    Console → OAuth 2.0 Client IDs):
+                                  </span>
+                                  <button
+                                    type="button"
+                                    onClick={async () => {
+                                      await copyTextSafe(gdriveRedirectUri);
+                                      setCopiedRedirectUri(true);
+                                      setTimeout(
+                                        () => setCopiedRedirectUri(false),
+                                        2000
+                                      );
+                                    }}
+                                    className="w-full sm:w-auto justify-center min-h-[34px] inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-cyan-500/15 hover:bg-cyan-500/25 text-cyan-300 border border-cyan-500/30 text-[11px] font-medium shrink-0"
+                                  >
+                                    {copiedRedirectUri ? (
+                                      <>
+                                        <Check className="w-3.5 h-3.5 text-emerald-400" />
+                                        <span>Đã sao chép Redirect URI!</span>
+                                      </>
+                                    ) : (
+                                      <>
+                                        <Copy className="w-3.5 h-3.5" />
+                                        <span>Sao chép Redirect URI</span>
+                                      </>
+                                    )}
+                                  </button>
+                                </div>
+                                <code className="block p-2 rounded bg-slate-950 border border-slate-800 font-mono text-[11px] text-cyan-300 break-all select-all">
+                                  {gdriveRedirectUri}
+                                </code>
+                              </div>
+
+                              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                <div className="flex flex-col justify-between">
+                                  <label className="block text-slate-400 mb-1">
+                                    Google Client ID
+                                  </label>
+                                  <input
+                                    value={
+                                      settings.offsite_gdrive_client_id || ''
+                                    }
+                                    onChange={(e) =>
+                                      updateField(
+                                        'offsite_gdrive_client_id',
+                                        e.target.value
+                                      )
+                                    }
+                                    placeholder="1234567890-abc...apps.googleusercontent.com"
+                                    autoComplete="off"
+                                    className="w-full min-h-[42px] bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-white font-mono"
+                                  />
+                                </div>
+
+                                <div className="flex flex-col justify-between">
+                                  <label className="block text-slate-400 mb-1">
+                                    Google Client Secret
+                                  </label>
+                                  <div className="relative">
+                                    <input
+                                      type={
+                                        showGdriveClientSecret
+                                          ? 'text'
+                                          : 'password'
+                                      }
+                                      value={
+                                        settings.offsite_gdrive_client_secret ||
+                                        ''
+                                      }
+                                      onChange={(e) =>
+                                        updateField(
+                                          'offsite_gdrive_client_secret',
+                                          e.target.value
+                                        )
+                                      }
+                                      placeholder="GOCSPX-..."
+                                      autoComplete="new-password"
+                                      className="w-full min-h-[42px] bg-slate-900 border border-slate-700 rounded-lg pl-3 pr-10 py-2 text-white font-mono"
+                                    />
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        setShowGdriveClientSecret((v) => !v)
+                                      }
+                                      aria-label={
+                                        showGdriveClientSecret
+                                          ? 'Ẩn Google Client Secret'
+                                          : 'Hiện Google Client Secret'
+                                      }
+                                      className="h-9 w-9 inline-flex items-center justify-center rounded-md text-slate-400 hover:text-white absolute right-1 top-1/2 -translate-y-1/2"
+                                    >
+                                      {showGdriveClientSecret ? (
+                                        <EyeOff className="w-4 h-4" />
+                                      ) : (
+                                        <Eye className="w-4 h-4" />
+                                      )}
+                                    </button>
+                                  </div>
+                                </div>
+                              </div>
+
+                              <div className="grid grid-cols-1 lg:grid-cols-12 gap-3 items-end">
+                                <div className="lg:col-span-5">
+                                  <button
+                                    type="button"
+                                    disabled={connectingGdriveOAuth}
+                                    onClick={() => void handleStartGdriveOAuth()}
+                                    className="w-full min-h-[42px] px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-semibold inline-flex items-center justify-center gap-2 shadow-lg shadow-emerald-600/20 transition-colors"
+                                  >
+                                    <span>
+                                      {connectingGdriveOAuth
+                                        ? '⏳ Đang chuyển hướng sang Google...'
+                                        : '🔗 Đăng nhập Google & Tự lấy Refresh Token'}
+                                    </span>
+                                  </button>
+                                </div>
+
+                                <div className="lg:col-span-7">
+                                  <label className="block text-slate-400 mb-1">
+                                    Refresh Token (tự động điền sau khi Đăng nhập
+                                    Google hoặc dán thủ công)
+                                  </label>
+                                  <div className="relative">
+                                    <input
+                                      type={
+                                        showGdriveRefreshToken
+                                          ? 'text'
+                                          : 'password'
+                                      }
+                                      value={
+                                        settings.offsite_gdrive_refresh_token ||
+                                        ''
+                                      }
+                                      onChange={(e) =>
+                                        updateField(
+                                          'offsite_gdrive_refresh_token',
+                                          e.target.value
+                                        )
+                                      }
+                                      placeholder="1//0g..."
+                                      autoComplete="new-password"
+                                      className="w-full min-h-[42px] bg-slate-900 border border-slate-700 rounded-lg pl-3 pr-10 py-2 text-white font-mono"
+                                    />
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        setShowGdriveRefreshToken((v) => !v)
+                                      }
+                                      aria-label={
+                                        showGdriveRefreshToken
+                                          ? 'Ẩn Refresh Token'
+                                          : 'Hiện Refresh Token'
+                                      }
+                                      className="h-9 w-9 inline-flex items-center justify-center rounded-md text-slate-400 hover:text-white absolute right-1 top-1/2 -translate-y-1/2"
+                                    >
+                                      {showGdriveRefreshToken ? (
+                                        <EyeOff className="w-4 h-4" />
+                                      ) : (
+                                        <Eye className="w-4 h-4" />
+                                      )}
+                                    </button>
+                                  </div>
+                                </div>
+                              </div>
+                            </div>
+                          ) : (
+                            <div className="space-y-3 pt-2 border-t border-slate-800/80">
+                              <div>
+                                <label className="block text-slate-300 font-medium mb-1">
+                                  Nội dung tệp JSON Service Account
+                                  {settings.offsite_gdrive_service_account_json ===
+                                    '••••••••' && (
+                                    <span className="ml-2 text-[11px] text-emerald-400 font-normal">
+                                      (Đã lưu bảo mật — dán JSON mới nếu muốn thay
+                                      thế)
+                                    </span>
+                                  )}
+                                </label>
+                                <textarea
+                                  rows={5}
+                                  value={
+                                    settings.offsite_gdrive_service_account_json ||
+                                    ''
+                                  }
+                                  onChange={(e) =>
+                                    updateField(
+                                      'offsite_gdrive_service_account_json',
+                                      e.target.value
+                                    )
+                                  }
+                                  placeholder='{"type": "service_account", "project_id": "...", "private_key": "...", "client_email": "backup-bot@project.iam.gserviceaccount.com"}'
+                                  className="w-full bg-slate-900 border border-slate-700 focus:border-emerald-500 rounded-xl px-3 py-2 text-white font-mono text-xs outline-none"
+                                />
+                              </div>
+                              <div className="p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/25 text-[11px] text-emerald-200 leading-relaxed">
+                                💡 <strong>Lưu ý quan trọng:</strong> Hãy mở thư
+                                mục Google Drive đích trên trình duyệt và bấm{' '}
+                                <strong>Chia sẻ (Share — quyền Người chỉnh sửa / Editor)</strong>{' '}
+                                cho địa chỉ{' '}
+                                <code className="font-mono text-white">
+                                  client_email
+                                </code>{' '}
+                                nằm bên trong tệp JSON Service Account.
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      )}
+
+                      {/* 4. S3 / CLOUDFLARE R2 / BACKBLAZE B2 CONFIGURATION */}
+                      {offsiteProvider === 'S3_COMPATIBLE' && (
+                        <div className="p-4 rounded-xl bg-slate-950 border border-amber-500/25 space-y-4">
+                          <div className="space-y-2">
+                            <label className="block text-slate-300 font-semibold">
+                              Chọn nhanh Nhà cung cấp S3-Compatible
+                            </label>
+                            <div className="flex flex-wrap items-center gap-2">
+                              {[
+                                {
+                                  key: 'R2' as const,
+                                  label: 'Cloudflare R2',
+                                },
+                                {
+                                  key: 'B2' as const,
+                                  label: 'Backblaze B2',
+                                },
+                                {
+                                  key: 'AWS' as const,
+                                  label: 'AWS S3',
+                                },
+                                {
+                                  key: 'CUSTOM' as const,
+                                  label: 'MinIO / S3 Tùy chỉnh',
+                                },
+                              ].map((p) => {
+                                const active = s3Preset === p.key;
+                                return (
+                                  <button
+                                    key={p.key}
+                                    type="button"
+                                    onClick={() => {
+                                      setSettings((prev) => ({
+                                        ...prev,
+                                        offsite_s3_preset: p.key,
+                                        offsite_s3_region:
+                                          p.key === 'R2'
+                                            ? 'auto'
+                                            : prev.offsite_s3_region === 'auto'
+                                            ? ''
+                                            : prev.offsite_s3_region || '',
+                                      }));
+                                    }}
+                                    className={`min-h-[38px] px-3.5 py-1.5 rounded-lg border font-medium transition-colors ${
+                                      active
+                                        ? 'bg-amber-500/20 border-amber-500/50 text-amber-200'
+                                        : 'bg-slate-900 border-slate-800 text-slate-300 hover:bg-slate-800'
+                                    }`}
+                                  >
+                                    {p.label}
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          </div>
+
+                          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                            <div className="md:col-span-2 flex flex-col justify-between">
+                              <label className="block text-slate-400 mb-1">
+                                Endpoint URL
+                              </label>
+                              <input
+                                value={settings.offsite_s3_endpoint || ''}
+                                onChange={(e) =>
+                                  updateField(
+                                    'offsite_s3_endpoint',
+                                    e.target.value
+                                  )
+                                }
+                                placeholder={s3EndpointPlaceholder}
+                                autoComplete="off"
+                                className="w-full min-h-[42px] bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-white font-mono"
+                              />
+                            </div>
+
+                            <div className="flex flex-col justify-between">
+                              <label className="block text-slate-400 mb-1">
+                                Region
+                              </label>
+                              <input
+                                value={
+                                  settings.offsite_s3_region ??
+                                  (s3Preset === 'R2' ? 'auto' : '')
+                                }
+                                onChange={(e) =>
+                                  updateField(
+                                    'offsite_s3_region',
+                                    e.target.value
+                                  )
+                                }
+                                placeholder={s3RegionPlaceholder}
+                                autoComplete="off"
+                                className="w-full min-h-[42px] bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-white font-mono"
+                              />
+                            </div>
+                          </div>
+
+                          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                            <div className="flex flex-col justify-between">
+                              <label className="block text-slate-400 mb-1">
+                                Tên Bucket *
+                              </label>
+                              <input
+                                value={settings.offsite_s3_bucket || ''}
+                                onChange={(e) =>
+                                  updateField(
+                                    'offsite_s3_bucket',
+                                    e.target.value
+                                  )
+                                }
+                                placeholder="VD: nas-sync-offsite-vault"
+                                autoComplete="off"
+                                className="w-full min-h-[42px] bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-white font-mono"
+                              />
+                            </div>
+
+                            <div className="flex flex-col justify-between">
+                              <label className="block text-slate-400 mb-1">
+                                Thư mục tiền tố (Prefix)
+                              </label>
+                              <input
+                                value={settings.offsite_s3_prefix || ''}
+                                onChange={(e) =>
+                                  updateField(
+                                    'offsite_s3_prefix',
+                                    e.target.value
+                                  )
+                                }
+                                placeholder="nas-sync-backups"
+                                autoComplete="off"
+                                className="w-full min-h-[42px] bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-white font-mono"
+                              />
+                            </div>
+                          </div>
+
+                          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                            <div className="flex flex-col justify-between">
+                              <label className="block text-slate-400 mb-1">
+                                Access Key ID *
+                              </label>
+                              <input
+                                value={settings.offsite_s3_access_key || ''}
+                                onChange={(e) =>
+                                  updateField(
+                                    'offsite_s3_access_key',
+                                    e.target.value
+                                  )
+                                }
+                                placeholder="AKIA... / R2 Access Key ID"
+                                autoComplete="off"
+                                className="w-full min-h-[42px] bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-white font-mono"
+                              />
+                            </div>
+
+                            <div className="flex flex-col justify-between">
+                              <label className="block text-slate-400 mb-1">
+                                Secret Access Key *
+                              </label>
+                              <div className="relative">
+                                <input
+                                  type={showS3SecretKey ? 'text' : 'password'}
+                                  value={settings.offsite_s3_secret_key || ''}
+                                  onChange={(e) =>
+                                    updateField(
+                                      'offsite_s3_secret_key',
+                                      e.target.value
+                                    )
+                                  }
+                                  placeholder="Secret Access Key..."
+                                  autoComplete="new-password"
+                                  className="w-full min-h-[42px] bg-slate-900 border border-slate-700 rounded-lg pl-3 pr-10 py-2 text-white font-mono"
+                                />
+                                <button
+                                  type="button"
+                                  onClick={() => setShowS3SecretKey((v) => !v)}
+                                  aria-label={
+                                    showS3SecretKey
+                                      ? 'Ẩn Secret Access Key'
+                                      : 'Hiện Secret Access Key'
+                                  }
+                                  className="h-9 w-9 inline-flex items-center justify-center rounded-md text-slate-400 hover:text-white absolute right-1 top-1/2 -translate-y-1/2"
+                                >
+                                  {showS3SecretKey ? (
+                                    <EyeOff className="w-4 h-4" />
+                                  ) : (
+                                    <Eye className="w-4 h-4" />
+                                  )}
+                                </button>
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      )}
+
+                      {/* 5. Test Connection Button & Inline Result */}
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+                        <button
+                          type="button"
+                          disabled={testingOffsite}
+                          onClick={() => void handleTestOffsiteConnection()}
+                          className="w-full sm:w-auto justify-center min-h-[42px] inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-cyan-500/15 hover:bg-cyan-500/25 text-cyan-300 border border-cyan-500/35 font-semibold disabled:opacity-50 transition-colors"
+                        >
+                          {testingOffsite ? (
+                            <>
+                              <RefreshCw className="w-4 h-4 animate-spin shrink-0" />
+                              <span>Đang kiểm tra kết nối Đám mây...</span>
+                            </>
+                          ) : (
+                            <span>🧪 Kiểm tra Kết nối Đám mây</span>
+                          )}
+                        </button>
+
+                        <button
+                          type="submit"
+                          disabled={saving}
+                          className="w-full sm:w-auto justify-center min-h-[42px] inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white font-semibold shadow-lg shadow-blue-600/20 transition-colors"
+                        >
+                          <Save className="w-4 h-4 shrink-0" />
+                          <span>
+                            {saving
+                              ? 'Đang lưu...'
+                              : 'Lưu Cấu hình Offsite 3-2-1'}
+                          </span>
+                        </button>
+                      </div>
+
+                      {offsiteTestResult && (
+                        <div
+                          className={`p-3.5 rounded-xl border text-xs break-words space-y-1 ${
+                            offsiteTestResult.ok
+                              ? 'bg-emerald-500/15 border-emerald-500/40 text-emerald-200'
+                              : 'bg-rose-500/15 border-rose-500/40 text-rose-200'
+                          }`}
+                        >
+                          <div className="font-semibold">
+                            {offsiteTestResult.ok
+                              ? `✅ Kết nối thành công${
+                                  offsiteTestResult.providerLabel
+                                    ? ` (${offsiteTestResult.providerLabel})`
+                                    : ''
+                                }!`
+                              : '❌ Kiểm tra kết nối Đám mây thất bại'}
+                          </div>
+                          <div>
+                            {offsiteTestResult.ok
+                              ? offsiteTestResult.detail
+                              : offsiteTestResult.error}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Recent Offsite Transfers History */}
+                  {(offsiteProvider !== 'NONE' || offsiteJobs.length > 0) && (
+                    <div className="pt-3 border-t border-slate-800 space-y-3">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <h4 className="text-xs font-bold text-slate-200">
+                          Lịch sử Đồng bộ Offsite Gần đây ({offsiteJobs.length})
+                        </h4>
+                        <button
+                          type="button"
+                          onClick={() => void loadOffsiteJobs()}
+                          disabled={offsiteJobsLoading}
+                          className="min-h-[34px] px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 inline-flex items-center gap-1.5 transition-colors"
+                        >
+                          <RefreshCw
+                            className={`w-3.5 h-3.5 shrink-0 ${
+                              offsiteJobsLoading ? 'animate-spin' : ''
+                            }`}
+                          />
+                          <span>Làm mới</span>
+                        </button>
+                      </div>
+
+                      {offsiteJobs.length === 0 ? (
+                        <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 text-center text-slate-500">
+                          Chưa có phiên đẩy dữ liệu Offsite 3-2-1 nào. Bạn có thể
+                          nhấn <strong>☁️ Đẩy Offsite 3-2-1</strong> tại trang{' '}
+                          <strong className="text-slate-300">Tiến trình</strong>{' '}
+                          hoặc bật chế độ tự động đẩy.
+                        </div>
+                      ) : (
+                        <div className="border border-slate-800 rounded-xl overflow-hidden">
+                          {/* Mobile Offsite Transfer Cards (< md) */}
+                          <div className="md:hidden divide-y divide-slate-800 max-h-72 overflow-y-auto">
+                            {offsiteJobs.slice(0, 10).map((oj) => {
+                              const st = getOffsiteStatusMeta(oj.status);
+                              const providerBadge =
+                                oj.provider === 'GOOGLE_DRIVE'
+                                  ? 'Google Drive'
+                                  : 'S3';
+                              return (
+                                <div
+                                  key={oj.id}
+                                  className="p-3.5 bg-slate-950/60 space-y-2"
+                                >
+                                  <div className="flex items-start justify-between gap-2">
+                                    <div className="min-w-0">
+                                      <div className="font-semibold text-white break-all">
+                                        {oj.server_hostname ||
+                                          `VPS #${oj.server_id}`}
+                                      </div>
+                                      <div className="font-mono text-[11px] text-cyan-300 break-all">
+                                        {oj.snapshot_name}
+                                      </div>
+                                    </div>
+                                    <span
+                                      className={`px-2 py-0.5 rounded border text-[10px] font-semibold shrink-0 ${st.className}`}
+                                    >
+                                      {st.label}
+                                    </span>
+                                  </div>
+
+                                  <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-400">
+                                    <span
+                                      className={`px-1.5 py-0.5 rounded border text-[10px] font-medium ${
+                                        oj.provider === 'GOOGLE_DRIVE'
+                                          ? 'bg-emerald-500/15 border-emerald-500/30 text-emerald-300'
+                                          : 'bg-amber-500/15 border-amber-500/30 text-amber-300'
+                                      }`}
+                                    >
+                                      {providerBadge}
+                                    </span>
+                                    <span className="font-mono text-slate-200">
+                                      {oj.encrypted_size_bytes > 0
+                                        ? formatBytes(oj.encrypted_size_bytes)
+                                        : '—'}{' '}
+                                      •{' '}
+                                      {oj.duration_seconds > 0
+                                        ? formatEta(oj.duration_seconds)
+                                        : '—'}
+                                    </span>
+                                  </div>
+
+                                  {oj.error_message && (
+                                    <div className="text-[11px] text-rose-300 break-words">
+                                      ❌ {oj.error_message}
+                                    </div>
+                                  )}
+                                </div>
+                              );
+                            })}
+                          </div>
+
+                          {/* Desktop Offsite Transfer Table (>= md) */}
+                          <div className="hidden md:block overflow-x-auto max-h-72 overflow-y-auto">
+                            <table className="w-full min-w-[680px] text-left text-xs">
+                              <thead className="bg-slate-950 text-slate-400 border-b border-slate-800">
+                                <tr>
+                                  <th className="p-3 font-medium">Máy chủ VPS</th>
+                                  <th className="p-3 font-medium">Snapshot</th>
+                                  <th className="p-3 font-medium">Đám mây</th>
+                                  <th className="p-3 font-medium">
+                                    Dung lượng mã hóa
+                                  </th>
+                                  <th className="p-3 font-medium">Thời lượng</th>
+                                  <th className="p-3 font-medium">Trạng thái</th>
+                                </tr>
+                              </thead>
+                              <tbody className="divide-y divide-slate-800/80 bg-slate-950/40">
+                                {offsiteJobs.slice(0, 10).map((oj) => {
+                                  const st = getOffsiteStatusMeta(oj.status);
+                                  const providerBadge =
+                                    oj.provider === 'GOOGLE_DRIVE'
+                                      ? 'Google Drive'
+                                      : 'S3';
+                                  return (
+                                    <tr
+                                      key={oj.id}
+                                      className="hover:bg-slate-800/30"
+                                    >
+                                      <td className="p-3 font-semibold text-white">
+                                        <div>
+                                          {oj.server_hostname ||
+                                            `VPS #${oj.server_id}`}
+                                        </div>
+                                        <div className="text-[10px] text-slate-500 font-normal">
+                                          {formatDateTime(
+                                            oj.completed_at || oj.created_at
+                                          )}
+                                        </div>
+                                      </td>
+                                      <td className="p-3 font-mono text-cyan-300">
+                                        <div>{oj.snapshot_name}</div>
+                                        {oj.error_message && (
+                                          <div className="text-[11px] font-sans text-rose-300 break-words max-w-xs mt-0.5">
+                                            ❌ {oj.error_message}
+                                          </div>
+                                        )}
+                                      </td>
+                                      <td className="p-3 whitespace-nowrap">
+                                        <span
+                                          className={`px-2 py-0.5 rounded border text-[10px] font-semibold ${
+                                            oj.provider === 'GOOGLE_DRIVE'
+                                              ? 'bg-emerald-500/15 border-emerald-500/30 text-emerald-300'
+                                              : 'bg-amber-500/15 border-amber-500/30 text-amber-300'
+                                          }`}
+                                        >
+                                          {providerBadge}
+                                        </span>
+                                      </td>
+                                      <td className="p-3 font-mono text-slate-200 whitespace-nowrap">
+                                        {oj.encrypted_size_bytes > 0
+                                          ? formatBytes(oj.encrypted_size_bytes)
+                                          : '—'}
+                                      </td>
+                                      <td className="p-3 font-mono text-slate-300 whitespace-nowrap">
+                                        {oj.duration_seconds > 0
+                                          ? formatEta(oj.duration_seconds)
+                                          : '—'}
+                                      </td>
+                                      <td className="p-3 whitespace-nowrap">
+                                        <span
+                                          className={`px-2 py-0.5 rounded border text-[11px] font-medium ${st.className}`}
+                                        >
+                                          {st.label}
+                                        </span>
+                                      </td>
+                                    </tr>
+                                  );
+                                })}
+                              </tbody>
+                            </table>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
+
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
               {/* Left Column: Telegram & SMTP + Global Exclude Rules */}
               <div className="space-y-6">

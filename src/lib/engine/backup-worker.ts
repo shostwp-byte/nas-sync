@@ -4,16 +4,24 @@ import { getDb, getSetting } from '@/lib/db';
 import { emitJobUpdated } from '@/lib/events';
 import { createSystemAlert } from '@/lib/notifications';
 import { ensureServerHostKeyPinned } from '@/lib/ssh';
-import type { BackupJob, DomainMetadataJson, ServerRecord } from '@/types';
+import type {
+  BackupJob,
+  DomainMetadataJson,
+  MysqlAdminCredentials,
+  ServerRecord,
+} from '@/types';
 import { getPanelAdapter } from './adapters';
 import { verifyRemoteWebrootSafety } from './adapters/base';
 import { evaluateBackupAnomaly } from './anomaly-detector';
 import { parseSafeExcludePatterns } from './exclude-rules';
+import { syncExtendedHostingExtras } from './extended-hosting-backup';
 import { executeMockServerBackup } from './mock-runner';
 import { captureDailyStorageSnapshot } from './morning-digest';
 import { streamRemoteMysqlDumpToZst } from './mysql-streamer';
+import { pushSnapshotToOffsiteCloud } from './offsite-cloud';
+import { streamRemotePostgresDumpToZst } from './postgres-streamer';
 import { getDirectorySizeAndCount, runRsyncPullDomain } from './rsync-runner';
-import { assertSafe, isSafeSnapshotName } from './safe-names';
+import { assertSafe, isSafeDbName, isSafeSnapshotName } from './safe-names';
 import { verifyJobDatabasesInSandbox } from './sandbox-verifier';
 import {
   ensureActiveVolumeForBackup,
@@ -169,7 +177,13 @@ export async function executeBackupJob(
 
     const adapter = getPanelAdapter(server);
     const domains = await adapter.discoverDomains(server);
-    const mysqlCreds = await adapter.getMysqlAdminCredentials(server);
+    const hasMysqlDatabases = domains.some((d) =>
+      d.databases.some((dbItem) => dbItem.engine !== 'POSTGRESQL')
+    );
+    let mysqlCreds: MysqlAdminCredentials | null = null;
+    if (server.is_mock || hasMysqlDatabases) {
+      mysqlCreds = await adapter.getMysqlAdminCredentials(server);
+    }
 
     db.prepare(
       `UPDATE servers SET last_connected_at = datetime('now') WHERE id = ?`
@@ -380,7 +394,7 @@ export async function executeBackupJob(
             }
           }
 
-          // Stream từng Database qua SSH Pipe về thẳng NAS (Mục 5.3)
+          // Stream từng Database (MySQL / PostgreSQL) qua SSH Pipe về thẳng NAS (Mục 5.3)
           for (const dbEntry of dom.databases) {
             if (domState.completedDbs[dbEntry.name]) {
               appendLog(
@@ -388,26 +402,61 @@ export async function executeBackupJob(
               );
               continue;
             }
+            const dbEngine =
+              dbEntry.engine === 'POSTGRESQL' ? 'POSTGRESQL' : 'MYSQL';
             updateProgress({
-              currentPhase: `Đang stream Database ${dbEntry.name}`,
+              currentPhase: `Đang stream ${dbEngine} Database ${dbEntry.name}`,
               currentDomain: dom.domain,
             });
-            const dumpRes = await streamRemoteMysqlDumpToZst({
-              jobId,
-              server,
-              creds: mysqlCreds,
-              dbName: dbEntry.name,
-              destDatabasesDir,
-              onLog: appendLog,
-            });
-            domState.completedDbs[dbEntry.name] = {
-              name: dbEntry.name,
-              db_user: dbEntry.user,
-              file: dumpRes.fileName,
-              size_bytes: dumpRes.sizeBytes,
-            };
-            domState.deltaBytes += dumpRes.sizeBytes;
-            saveState(stateFilePath, state);
+
+            if (dbEngine === 'POSTGRESQL') {
+              const safePgDb = assertSafe(
+                isSafeDbName,
+                dbEntry.name,
+                'PostgreSQL DB Name'
+              );
+              const destZstFile = path.join(
+                destDatabasesDir,
+                `pg_${safePgDb}.sql.zst`
+              );
+              const pgRes = await streamRemotePostgresDumpToZst({
+                jobId,
+                server,
+                dbName: safePgDb,
+                destZstFile,
+                onLog: appendLog,
+              });
+              domState.completedDbs[dbEntry.name] = {
+                name: dbEntry.name,
+                db_user: dbEntry.user,
+                engine: 'POSTGRESQL',
+                file: pgRes.fileName,
+                size_bytes: pgRes.sizeBytes,
+              };
+              domState.deltaBytes += pgRes.sizeBytes;
+              saveState(stateFilePath, state);
+            } else {
+              if (!mysqlCreds) {
+                mysqlCreds = await adapter.getMysqlAdminCredentials(server);
+              }
+              const dumpRes = await streamRemoteMysqlDumpToZst({
+                jobId,
+                server,
+                creds: mysqlCreds,
+                dbName: dbEntry.name,
+                destDatabasesDir,
+                onLog: appendLog,
+              });
+              domState.completedDbs[dbEntry.name] = {
+                name: dbEntry.name,
+                db_user: dbEntry.user,
+                engine: 'MYSQL',
+                file: dumpRes.fileName,
+                size_bytes: dumpRes.sizeBytes,
+              };
+              domState.deltaBytes += dumpRes.sizeBytes;
+              saveState(stateFilePath, state);
+            }
           }
         }
       }
@@ -427,6 +476,7 @@ export async function executeBackupJob(
         databases: dbList.map((d) => ({
           name: d.name,
           user: d.db_user,
+          engine: d.engine || 'MYSQL',
           dump_file: d.file,
           size_bytes: d.size_bytes,
         })),
@@ -470,6 +520,31 @@ export async function executeBackupJob(
       aggDeltaBytes += domState.deltaBytes;
       aggFilesTotal += domState.filesTotal;
       aggFilesChanged += domState.filesChanged;
+    }
+
+    // 3b. Sao lưu Mở rộng Hosting (Mailboxes / User Cronjobs / Vhost & SSL Configs - v1.5.0)
+    if (
+      server.backup_mailboxes ||
+      server.backup_cronjobs ||
+      server.backup_vhost_configs
+    ) {
+      throwIfCancelled(jobId);
+      updateProgress({
+        progressPercent: 83,
+        currentPhase:
+          'Đang sao lưu mở rộng (Mailboxes / Cronjobs / Vhost & SSL)...',
+        currentDomain: '',
+      });
+      const extrasStats = await syncExtendedHostingExtras({
+        jobId,
+        server,
+        domains,
+        inProgressDir,
+        latestSnapshotDir,
+        appendLog,
+      });
+      aggTotalBytes += extrasStats.totalBytes;
+      aggDeltaBytes += extrasStats.deltaBytes;
     }
 
     // 4. Hoàn tất nguyên tử (Atomic Commit - Mục 6.2.4)
@@ -587,6 +662,41 @@ export async function executeBackupJob(
       deltaSizeBytes: aggDeltaBytes,
     });
     emitJobUpdated(jobId);
+
+    // 7. Đồng bộ Offsite Cloud 3-2-1 tự động (v1.5.0 — không làm hỏng bản sao lưu nội bộ nếu mạng Cloud lỗi)
+    const offsiteProvider = getSetting('offsite_provider', 'NONE')
+      .trim()
+      .toUpperCase();
+    const offsiteAutoPush = getSetting('offsite_auto_push', 'NONE')
+      .trim()
+      .toUpperCase();
+    const shouldPushOffsite =
+      offsiteProvider !== 'NONE' &&
+      (offsiteAutoPush === 'EVERY_BACKUP' ||
+        (offsiteAutoPush === 'WEEKLY_SUNDAY' && new Date().getDay() === 0));
+
+    if (shouldPushOffsite) {
+      appendLog(
+        `☁️ [Offsite Cloud] Đang mã hóa luồng AES-256-GCM và đẩy bản sao lưu lên ${offsiteProvider} (${offsiteAutoPush})...`
+      );
+      try {
+        const syncedJob = await pushSnapshotToOffsiteCloud(jobId, {
+          triggerSource: offsiteAutoPush,
+        });
+        appendLog(
+          `☁️ [Offsite Cloud] ✅ Đã tải lên ${offsiteProvider} thành công: ${syncedJob.remote_object_key} (${(
+            syncedJob.encrypted_size_bytes /
+            1024 ** 2
+          ).toFixed(2)} MB trong ${syncedJob.duration_seconds}s).`
+        );
+      } catch (offsiteErr) {
+        appendLog(
+          `☁️ [Offsite Cloud] ⚠️ Cảnh báo đồng bộ Cloud (bản sao lưu nội bộ trên NAS vẫn an toàn): ${
+            (offsiteErr as Error).message
+          }`
+        );
+      }
+    }
   } catch (err) {
     if (err instanceof RetryableNetworkError) {
       const nextRetry = job.retry_count + 1;

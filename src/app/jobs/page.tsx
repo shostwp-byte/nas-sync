@@ -46,6 +46,16 @@ export default function JobsPage() {
   const [jobItems, setJobItems] = useState<BackupItem[]>([]);
   const [detailLoading, setDetailLoading] = useState(false);
 
+  // Offsite Cloud 3-2-1 Push State
+  const [pushingOffsiteJobId, setPushingOffsiteJobId] = useState<number | null>(
+    null
+  );
+  const [offsiteFeedback, setOffsiteFeedback] = useState<{
+    jobId: number;
+    ok: boolean;
+    text: string;
+  } | null>(null);
+
   useEffect(() => {
     let active = true;
     fetch('/api/auth/me')
@@ -133,6 +143,49 @@ export default function JobsPage() {
     await loadJobs();
   };
 
+  const handlePushOffsite = async (job: ExtendedJob) => {
+    setPushingOffsiteJobId(job.id);
+    setOffsiteFeedback(null);
+    try {
+      const resp = await fetch('/api/offsite', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'push_snapshot', jobId: job.id }),
+      });
+      const json = await resp.json().catch(() => ({}));
+      if (!resp.ok || json.ok === false) {
+        const errMsg =
+          json.error ||
+          'Chưa cấu hình Đám mây Offsite 3-2-1. Vui lòng thiết lập Google Drive hoặc S3 tại mục Cài đặt Hệ thống trước khi đẩy bản sao lưu.';
+        setOffsiteFeedback({
+          jobId: job.id,
+          ok: false,
+          text: errMsg,
+        });
+        return;
+      }
+      setOffsiteFeedback({
+        jobId: job.id,
+        ok: true,
+        text:
+          json.message ||
+          'Đã khởi chạy mã hóa AES-256-GCM và đẩy bản sao lưu lên Đám mây Offsite 3-2-1!',
+      });
+    } catch (err) {
+      setOffsiteFeedback({
+        jobId: job.id,
+        ok: false,
+        text:
+          (err as Error).message ||
+          'Lỗi kết nối khi đẩy bản sao lưu lên Đám mây Offsite 3-2-1.',
+      });
+    } finally {
+      setPushingOffsiteJobId(null);
+    }
+  };
+
+  const canPushOffsiteRole = userRole === 'ADMIN' || userRole === 'OPERATOR';
+
   return (
     <div className="space-y-6">
       <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
@@ -180,6 +233,41 @@ export default function JobsPage() {
           </button>
         </div>
       </div>
+
+      {!selectedJob && offsiteFeedback && (
+        <div
+          className={`p-3.5 rounded-xl border text-xs flex items-start justify-between gap-3 ${
+            offsiteFeedback.ok
+              ? 'bg-emerald-500/15 border-emerald-500/35 text-emerald-200'
+              : 'bg-rose-500/15 border-rose-500/35 text-rose-200'
+          }`}
+        >
+          <div className="min-w-0 break-words space-y-1">
+            <div>
+              {offsiteFeedback.ok ? '✅ ' : '❌ '}
+              {offsiteFeedback.text}
+            </div>
+            {!offsiteFeedback.ok && userRole === 'ADMIN' && (
+              <div>
+                <Link
+                  href="/settings"
+                  className="text-cyan-300 hover:underline font-semibold"
+                >
+                  → Mở Cài đặt Hệ thống để thiết lập Đám mây Offsite 3-2-1
+                </Link>
+              </div>
+            )}
+          </div>
+          <button
+            type="button"
+            onClick={() => setOffsiteFeedback(null)}
+            aria-label="Đóng thông báo"
+            className="text-slate-400 hover:text-white shrink-0"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
 
       <div className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden">
         {/* Mobile & Tablet Job Cards (< lg) */}
@@ -304,13 +392,32 @@ export default function JobsPage() {
                     </button>
 
                     {job.job_type === 'BACKUP' && status === 'COMPLETED' && (
-                      <Link
-                        href={`/explorer?jobId=${job.id}`}
-                        className="min-h-[38px] inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-cyan-400 border border-slate-700"
-                      >
-                        <FolderGit2 className="w-3.5 h-3.5 shrink-0" />
-                        Explorer
-                      </Link>
+                      <>
+                        <Link
+                          href={`/explorer?jobId=${job.id}`}
+                          className="min-h-[38px] inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-cyan-400 border border-slate-700"
+                        >
+                          <FolderGit2 className="w-3.5 h-3.5 shrink-0" />
+                          Explorer
+                        </Link>
+                        {canPushOffsiteRole && (
+                          <button
+                            type="button"
+                            disabled={pushingOffsiteJobId === job.id}
+                            onClick={() => void handlePushOffsite(job)}
+                            className="min-h-[38px] inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-emerald-600/20 hover:bg-emerald-600 text-emerald-300 hover:text-white border border-emerald-500/35 font-medium disabled:opacity-50 transition-colors"
+                          >
+                            {pushingOffsiteJobId === job.id ? (
+                              <>
+                                <RefreshCw className="w-3.5 h-3.5 animate-spin shrink-0" />
+                                <span>Đang đẩy Offsite...</span>
+                              </>
+                            ) : (
+                              <span>☁️ Đẩy Offsite 3-2-1</span>
+                            )}
+                          </button>
+                        )}
+                      </>
                     )}
 
                     {userRole !== 'VIEWER' && (
@@ -533,13 +640,33 @@ export default function JobsPage() {
 
                           {job.job_type === 'BACKUP' &&
                             status === 'COMPLETED' && (
-                              <Link
-                                href={`/explorer?jobId=${job.id}`}
-                                title="Mở File Explorer & Diff Viewer"
-                                className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-cyan-400 border border-slate-700"
-                              >
-                                <FolderGit2 className="w-3.5 h-3.5" />
-                              </Link>
+                              <>
+                                <Link
+                                  href={`/explorer?jobId=${job.id}`}
+                                  title="Mở File Explorer & Diff Viewer"
+                                  className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-cyan-400 border border-slate-700"
+                                >
+                                  <FolderGit2 className="w-3.5 h-3.5" />
+                                </Link>
+                                {canPushOffsiteRole && (
+                                  <button
+                                    type="button"
+                                    disabled={pushingOffsiteJobId === job.id}
+                                    onClick={() => void handlePushOffsite(job)}
+                                    title="Mã hóa AES-256-GCM và đẩy bản sao lưu lên Đám mây Offsite 3-2-1"
+                                    className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-emerald-600/20 hover:bg-emerald-600 text-emerald-300 hover:text-white border border-emerald-500/35 font-medium whitespace-nowrap disabled:opacity-50 transition-colors"
+                                  >
+                                    {pushingOffsiteJobId === job.id ? (
+                                      <>
+                                        <RefreshCw className="w-3.5 h-3.5 animate-spin shrink-0" />
+                                        <span>Đang đẩy...</span>
+                                      </>
+                                    ) : (
+                                      <span>☁️ Đẩy Offsite 3-2-1</span>
+                                    )}
+                                  </button>
+                                )}
+                              </>
                             )}
 
                           {userRole !== 'VIEWER' && (
@@ -641,17 +768,97 @@ export default function JobsPage() {
                   {selectedJob.files_total} (Đổi: {selectedJob.files_changed})
                 </p>
               </div>
-              <button
-                type="button"
-                onClick={() => setSelectedJob(null)}
-                aria-label="Đóng"
-                className="h-10 w-10 inline-flex items-center justify-center rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 shrink-0"
-              >
-                <X className="w-5 h-5" />
-              </button>
+              <div className="flex items-center gap-2 shrink-0">
+                {selectedJob.job_type === 'BACKUP' &&
+                  (progressMap[selectedJob.id]?.status ||
+                    selectedJob.status) === 'COMPLETED' &&
+                  canPushOffsiteRole && (
+                    <button
+                      type="button"
+                      disabled={pushingOffsiteJobId === selectedJob.id}
+                      onClick={() => void handlePushOffsite(selectedJob)}
+                      className="hidden sm:inline-flex min-h-[38px] items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-emerald-600/20 hover:bg-emerald-600 text-emerald-300 hover:text-white border border-emerald-500/35 whitespace-nowrap disabled:opacity-50 transition-colors"
+                    >
+                      {pushingOffsiteJobId === selectedJob.id ? (
+                        <>
+                          <RefreshCw className="w-3.5 h-3.5 animate-spin shrink-0" />
+                          <span>Đang đẩy Offsite...</span>
+                        </>
+                      ) : (
+                        <span>☁️ Đẩy Offsite 3-2-1</span>
+                      )}
+                    </button>
+                  )}
+                <button
+                  type="button"
+                  onClick={() => setSelectedJob(null)}
+                  aria-label="Đóng"
+                  className="h-10 w-10 inline-flex items-center justify-center rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 shrink-0"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
             </div>
 
+            {selectedJob.job_type === 'BACKUP' &&
+              (progressMap[selectedJob.id]?.status || selectedJob.status) ===
+                'COMPLETED' &&
+              canPushOffsiteRole && (
+                <div className="sm:hidden shrink-0">
+                  <button
+                    type="button"
+                    disabled={pushingOffsiteJobId === selectedJob.id}
+                    onClick={() => void handlePushOffsite(selectedJob)}
+                    className="w-full min-h-[40px] inline-flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold bg-emerald-600/20 hover:bg-emerald-600 text-emerald-300 hover:text-white border border-emerald-500/35 disabled:opacity-50 transition-colors"
+                  >
+                    {pushingOffsiteJobId === selectedJob.id ? (
+                      <>
+                        <RefreshCw className="w-3.5 h-3.5 animate-spin shrink-0" />
+                        <span>Đang đẩy Offsite...</span>
+                      </>
+                    ) : (
+                      <span>☁️ Đẩy Offsite 3-2-1</span>
+                    )}
+                  </button>
+                </div>
+              )}
+
             <div className="flex-1 overflow-y-auto space-y-5 min-h-0 pr-0.5">
+              {offsiteFeedback && offsiteFeedback.jobId === selectedJob.id && (
+                <div
+                  className={`p-3.5 rounded-xl border text-xs flex items-start justify-between gap-3 ${
+                    offsiteFeedback.ok
+                      ? 'bg-emerald-500/15 border-emerald-500/35 text-emerald-200'
+                      : 'bg-rose-500/15 border-rose-500/35 text-rose-200'
+                  }`}
+                >
+                  <div className="min-w-0 break-words space-y-1">
+                    <div>
+                      {offsiteFeedback.ok ? '✅ ' : '❌ '}
+                      {offsiteFeedback.text}
+                    </div>
+                    {!offsiteFeedback.ok && userRole === 'ADMIN' && (
+                      <div>
+                        <Link
+                          href="/settings"
+                          className="text-cyan-300 hover:underline font-semibold"
+                        >
+                          → Mở Cài đặt Hệ thống để thiết lập Đám mây Offsite 3-2-1
+                        </Link>
+                      </div>
+                    )}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setOffsiteFeedback(null)}
+                    aria-label="Đóng thông báo"
+                    className="text-slate-400 hover:text-white shrink-0"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+              )}
+
               {selectedJob.anomaly_detected === 1 && (
                 <div className="p-3.5 rounded-xl bg-rose-500/15 border border-rose-500/40 text-xs text-rose-200 break-words">
                   🚨 <strong>Cảnh báo Bất thường (Anomaly Detection):</strong>{' '}
@@ -746,18 +953,32 @@ export default function JobsPage() {
                                     {formatBytes(it.webroot_size_bytes)}
                                   </strong>
                                 </span>
-                                <span className="font-mono text-cyan-300 break-all">
-                                  {it.databases_list.length === 0
-                                    ? 'Không dùng DB'
-                                    : it.databases_list
-                                        .map(
-                                          (d) =>
-                                            `${d.name} (${formatBytes(
-                                              d.size_bytes
-                                            )})`
-                                        )
-                                        .join(', ')}
-                                </span>
+                                <div className="flex flex-wrap items-center gap-1.5 font-mono text-cyan-300">
+                                  {it.databases_list.length === 0 ? (
+                                    <span>Không dùng DB</span>
+                                  ) : (
+                                    it.databases_list.map((d) => {
+                                      const isPg =
+                                        d.engine === 'POSTGRESQL' ||
+                                        Boolean(d.file?.startsWith('pg_'));
+                                      return (
+                                        <span
+                                          key={d.name}
+                                          className="inline-flex items-center gap-1 break-all"
+                                        >
+                                          <span>
+                                            {d.name} ({formatBytes(d.size_bytes)})
+                                          </span>
+                                          {isPg && (
+                                            <span className="px-1.5 py-0.5 rounded bg-violet-500/20 text-violet-300 border border-violet-500/35 text-[10px] font-sans font-semibold shrink-0">
+                                              PostgreSQL
+                                            </span>
+                                          )}
+                                        </span>
+                                      );
+                                    })
+                                  )}
+                                </div>
                               </div>
 
                               <div className="flex flex-wrap items-center gap-2">
@@ -791,7 +1012,7 @@ export default function JobsPage() {
                               <tr>
                                 <th className="p-3">Domain / System User</th>
                                 <th className="p-3">Mã nguồn</th>
-                                <th className="p-3">Databases (.sql.zst/.gz)</th>
+                                <th className="p-3">Databases (MySQL / PostgreSQL)</th>
                                 <th className="p-3">Trạng thái Sandbox</th>
                                 <th className="p-3 text-right">
                                   Tải gói / Khôi phục
@@ -818,16 +1039,34 @@ export default function JobsPage() {
                                     {formatBytes(it.webroot_size_bytes)}
                                   </td>
                                   <td className="p-3 font-mono text-[11px] text-cyan-300">
-                                    {it.databases_list.length === 0
-                                      ? 'Không dùng DB'
-                                      : it.databases_list
-                                          .map(
-                                            (d) =>
-                                              `${d.name} (${formatBytes(
-                                                d.size_bytes
-                                              )})`
-                                          )
-                                          .join(', ')}
+                                    {it.databases_list.length === 0 ? (
+                                      <span className="text-slate-500 font-sans">
+                                        Không dùng DB
+                                      </span>
+                                    ) : (
+                                      <div className="flex flex-wrap items-center gap-1.5">
+                                        {it.databases_list.map((d) => {
+                                          const isPg =
+                                            d.engine === 'POSTGRESQL' ||
+                                            Boolean(d.file?.startsWith('pg_'));
+                                          return (
+                                            <span
+                                              key={d.name}
+                                              className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-slate-950 border border-slate-800"
+                                            >
+                                              <span>
+                                                {d.name} ({formatBytes(d.size_bytes)})
+                                              </span>
+                                              {isPg && (
+                                                <span className="px-1.5 py-0.5 rounded bg-violet-500/20 text-violet-300 border border-violet-500/35 text-[10px] font-sans font-semibold">
+                                                  PostgreSQL
+                                                </span>
+                                              )}
+                                            </span>
+                                          );
+                                        })}
+                                      </div>
+                                    )}
                                   </td>
                                   <td className="p-3 whitespace-nowrap">
                                     {it.verification_status === 'PASSED' ? (

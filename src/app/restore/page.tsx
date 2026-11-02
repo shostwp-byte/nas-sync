@@ -17,13 +17,28 @@ import {
   Wrench,
 } from 'lucide-react';
 import { formatBytes, getPanelBadgeClass } from '@/lib/format';
-import type { BackupItem, RestoreMode, ServerRecord } from '@/types';
+import type { BackupItem, PanelType, RestoreMode, ServerRecord } from '@/types';
 
 interface RestorableItem extends BackupItem {
   server_hostname: string;
   server_panel: string;
   volume_name: string;
   completed_at: string;
+}
+
+const PANEL_LABELS: Record<PanelType, string> = {
+  DIRECTADMIN: 'DirectAdmin',
+  CPANEL: 'cPanel / WHM',
+  PLESK: 'Plesk Obsidian',
+  AAPANEL: 'aaPanel / BT Panel',
+  CYBERPANEL: 'CyberPanel (OpenLiteSpeed)',
+  HESTIACP: 'HestiaCP',
+  CLOUDPANEL: 'CloudPanel',
+};
+
+function getPanelDisplayLabel(panel?: string): string {
+  if (!panel) return 'Unknown';
+  return PANEL_LABELS[panel as PanelType] || panel;
 }
 
 function computePreviewWebroot(
@@ -40,6 +55,12 @@ function computePreviewWebroot(
       return `/var/www/vhosts/${domain}/httpdocs`;
     case 'AAPANEL':
       return `/www/wwwroot/${domain}`;
+    case 'CYBERPANEL':
+      return `/home/${domain}/public_html`;
+    case 'HESTIACP':
+      return `/home/${user}/web/${domain}/public_html`;
+    case 'CLOUDPANEL':
+      return `/home/${user}/htdocs/${domain}`;
     default:
       return `/home/${user}/domains/${domain}/public_html`;
   }
@@ -198,7 +219,7 @@ function RestoreContent() {
           </span>
         </h2>
         <p className="text-xs text-slate-400 mt-0.5">
-          Khôi phục riêng lẻ Mã nguồn, Database hoặc di chuyển trực tiếp Website giữa DirectAdmin, cPanel, Plesk và aaPanel.
+          Khôi phục riêng lẻ Mã nguồn, Database (MySQL / PostgreSQL) hoặc di chuyển trực tiếp Website giữa DirectAdmin, cPanel, Plesk, aaPanel, CyberPanel, HestiaCP và CloudPanel.
         </p>
       </div>
 
@@ -279,11 +300,12 @@ function RestoreContent() {
                     </div>
                     <div className="flex flex-wrap items-center gap-2 text-[11px] text-slate-400">
                       <span
+                        title={getPanelDisplayLabel(it.server_panel)}
                         className={`px-1.5 py-0.5 rounded border text-[10px] shrink-0 ${getPanelBadgeClass(
                           it.server_panel
                         )}`}
                       >
-                        {it.server_panel}
+                        {getPanelDisplayLabel(it.server_panel)}
                       </span>
                       <span className="break-all">{it.server_hostname}</span>
                     </div>
@@ -316,7 +338,7 @@ function RestoreContent() {
                       {
                         key: 'FULL' as RestoreMode,
                         title: 'Toàn bộ (Code + DB)',
-                        desc: 'Khôi phục đầy đủ mã nguồn & nạp lại MySQL',
+                        desc: 'Khôi phục đầy đủ mã nguồn & nạp lại MySQL / PostgreSQL',
                         icon: RotateCcw,
                       },
                       {
@@ -328,7 +350,7 @@ function RestoreContent() {
                       {
                         key: 'DB_ONLY' as RestoreMode,
                         title: 'Chỉ Database (SQL)',
-                        desc: 'Giải nén luồng zstdcat qua SSH vào MySQL',
+                        desc: 'Giải nén luồng zstdcat qua SSH vào MySQL / PostgreSQL',
                         icon: Database,
                       },
                     ].map((opt) => {
@@ -364,12 +386,15 @@ function RestoreContent() {
                         <div className="space-y-2">
                           {selectedItem.databases_list.map((d) => {
                             const isChecked = selectedDbs.includes(d.name);
+                            const isPg =
+                              d.engine === 'POSTGRESQL' ||
+                              Boolean(d.file?.startsWith('pg_'));
                             return (
                               <div
                                 key={d.name}
                                 className="flex flex-col sm:flex-row sm:items-center gap-2"
                               >
-                                <label className="inline-flex items-start sm:items-center gap-2 text-cyan-300 font-mono cursor-pointer min-w-0 sm:w-1/2">
+                                <label className="inline-flex items-start sm:items-center gap-2 text-cyan-300 font-mono cursor-pointer min-w-0 sm:w-1/2 flex-wrap">
                                   <input
                                     type="checkbox"
                                     checked={isChecked}
@@ -385,6 +410,15 @@ function RestoreContent() {
                                   <span className="break-all">
                                     {d.name} ({formatBytes(d.size_bytes)})
                                   </span>
+                                  {isPg ? (
+                                    <span className="px-1.5 py-0.5 rounded bg-violet-500/20 text-violet-300 border border-violet-500/35 text-[10px] font-sans font-semibold shrink-0">
+                                      PostgreSQL
+                                    </span>
+                                  ) : (
+                                    <span className="px-1.5 py-0.5 rounded bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 text-[10px] font-sans font-medium shrink-0">
+                                      MySQL/MariaDB
+                                    </span>
+                                  )}
                                 </label>
                                 {isChecked && (
                                   <input
@@ -415,8 +449,9 @@ function RestoreContent() {
                     </h3>
                     {isCrossPanel && (
                       <span className="px-2.5 py-1 rounded-full bg-amber-500/20 border border-amber-500/40 text-amber-300 font-semibold text-[11px]">
-                        ⚡ Cross-Panel Migration ({selectedItem.server_panel} ➔{' '}
-                        {targetServer?.panel_type})
+                        ⚡ Cross-Panel Migration (
+                        {getPanelDisplayLabel(selectedItem.server_panel)} ➔{' '}
+                        {getPanelDisplayLabel(targetServer?.panel_type)})
                       </span>
                     )}
                   </div>
@@ -442,7 +477,7 @@ function RestoreContent() {
                       >
                         {servers.map((s) => (
                           <option key={s.id} value={s.id}>
-                            {s.hostname} ({s.panel_type}){' '}
+                            {s.hostname} ({getPanelDisplayLabel(s.panel_type)}){' '}
                             {s.id === selectedItem.server_id
                               ? '— Máy chủ gốc'
                               : ''}

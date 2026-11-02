@@ -51,6 +51,7 @@ export class DirectAdminAdapter implements PanelAdapter {
       DA_MYSQL_PWD=$(grep -E '^passwd=' "$DA_MYSQL_CONF" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d '\\r\\n')
       ALL_DBS=$(MYSQL_PWD="$DA_MYSQL_PWD" mysql -u ${quotedMysqlUser} -N -B -e "SHOW DATABASES;" 2>/dev/null | grep -Ev '^(information_schema|performance_schema|mysql|sys)$' || true)
       unset DA_MYSQL_PWD
+      ALL_PG_DBS=$(command -v psql >/dev/null 2>&1 && su - postgres -c "psql -Atc \"SELECT datname FROM pg_database WHERE datistemplate = false AND datname NOT IN ('postgres')\"" 2>/dev/null || true)
       DA_SUB_IN_DOMAINS=$(grep -E '^(create_subdomain_docroot_in_domains_dir|subdomain_docroot_in_domains_dir)=1' /usr/local/directadmin/conf/directadmin.conf 2>/dev/null | head -n1 || true)
 
       detect_dbs_in_webroot() {
@@ -84,7 +85,9 @@ $(head -n 120 "$cf" 2>/dev/null || true)"
         user_dir=$(dirname "$dlist")
         sys_user=$(basename "$user_dir")
         user_dbs=$(printf "%s\\n" "$ALL_DBS" | grep -E "^$\{sys_user}_" | paste -sd "," - || true)
+        user_pg_dbs=$(printf "%s\\n" "$ALL_PG_DBS" | grep -E "^$\{sys_user}_" | paste -sd "," - || true)
         printf "USERDBS|%s|%s\\n" "$sys_user" "$user_dbs"
+        [ -n "$user_pg_dbs" ] && printf "USERPGDBS|%s|%s\\n" "$sys_user" "$user_pg_dbs"
 
         while IFS= read -r dom || [ -n "$dom" ]; do
           dom=$(printf "%s" "$dom" | tr -d '\\r\\n ')
@@ -171,10 +174,24 @@ $(head -n 120 "$cf" 2>/dev/null || true)"
     }
 
     const userAllDbs = new Map<string, string[]>();
+    const userAllPgDbs = new Map<string, string[]>();
     const claimedUserDbs = new Map<string, Set<string>>();
     const rawOut: DiscoveredDomain[] = [];
 
     for (const line of res.stdout.split('\n')) {
+      if (line.startsWith('USERPGDBS|')) {
+        const [, sysUser, dbsCsv] = line.split('|');
+        if (sysUser) {
+          userAllPgDbs.set(
+            sysUser.trim(),
+            (dbsCsv || '')
+              .split(',')
+              .map((s) => s.trim())
+              .filter(Boolean)
+          );
+        }
+        continue;
+      }
       if (line.startsWith('USERDBS|')) {
         const [, sysUser, dbsCsv] = line.split('|');
         if (sysUser) {
@@ -227,7 +244,24 @@ $(head -n 120 "$cf" 2>/dev/null || true)"
           rawOut.find((d) => d.systemUser === sysUser);
         if (primaryDom) {
           for (const dbName of unclaimed) {
-            primaryDom.databases.push({ name: dbName, user: sysUser });
+            primaryDom.databases.push({ name: dbName, user: sysUser, engine: 'MYSQL' });
+          }
+        }
+      }
+    }
+
+    for (const [sysUser, pgDbs] of userAllPgDbs.entries()) {
+      if (pgDbs.length > 0) {
+        const primaryDom =
+          rawOut.find((d) => d.systemUser === sysUser && !d.isSubdomain) ||
+          rawOut.find((d) => d.systemUser === sysUser);
+        if (primaryDom) {
+          for (const pgName of pgDbs) {
+            primaryDom.databases.push({
+              name: pgName,
+              user: sysUser,
+              engine: 'POSTGRESQL',
+            });
           }
         }
       }

@@ -52,6 +52,7 @@ export class CPanelAdapter implements PanelAdapter {
   async discoverDomains(server: ServerRecord): Promise<DiscoveredDomain[]> {
     const script = `
       ALL_DBS=$(mysql --defaults-extra-file=/root/.my.cnf -N -B -e "SHOW DATABASES;" 2>/dev/null | grep -Ev '^(information_schema|performance_schema|mysql|sys|cphulkd|eximstats|leechprotect|modsec|roundcube)$' || true)
+      ALL_PG_DBS=$(command -v psql >/dev/null 2>&1 && su - postgres -c "psql -Atc \"SELECT datname FROM pg_database WHERE datistemplate = false AND datname NOT IN ('postgres')\"" 2>/dev/null || true)
 
       detect_dbs_in_webroot() {
         wroot="$1"
@@ -93,10 +94,12 @@ $(head -n 120 "$cf" 2>/dev/null || true)"
           [ "$dtype" = "parked" ] && continue
 
           user_dbs=$(printf "%s\\n" "$ALL_DBS" | grep -E "^$\{sys_user}_" | paste -sd "," - || true)
+          user_pg_dbs=$(printf "%s\\n" "$ALL_PG_DBS" | grep -E "^$\{sys_user}_" | paste -sd "," - || true)
           case "$SEEN_USERS" in
             *,"$sys_user",*) ;;
             *)
               printf "USERDBS|%s|%s\\n" "$sys_user" "$user_dbs"
+              [ -n "$user_pg_dbs" ] && printf "USERPGDBS|%s|%s\\n" "$sys_user" "$user_pg_dbs"
               SEEN_USERS="$\{SEEN_USERS}$\{sys_user},"
               ;;
           esac
@@ -130,10 +133,24 @@ $(head -n 120 "$cf" 2>/dev/null || true)"
     }
 
     const userAllDbs = new Map<string, string[]>();
+    const userAllPgDbs = new Map<string, string[]>();
     const claimedUserDbs = new Map<string, Set<string>>();
     const rawOut: DiscoveredDomain[] = [];
 
     for (const line of res.stdout.split('\n')) {
+      if (line.startsWith('USERPGDBS|')) {
+        const [, sysUser, dbsCsv] = line.split('|');
+        if (sysUser) {
+          userAllPgDbs.set(
+            sysUser.trim(),
+            (dbsCsv || '')
+              .split(',')
+              .map((s) => s.trim())
+              .filter(Boolean)
+          );
+        }
+        continue;
+      }
       if (line.startsWith('USERDBS|')) {
         const [, sysUser, dbsCsv] = line.split('|');
         if (sysUser) {
@@ -190,7 +207,24 @@ $(head -n 120 "$cf" 2>/dev/null || true)"
           rawOut.find((d) => d.systemUser === sysUser);
         if (primaryDom) {
           for (const dbName of unclaimed) {
-            primaryDom.databases.push({ name: dbName, user: sysUser });
+            primaryDom.databases.push({ name: dbName, user: sysUser, engine: 'MYSQL' });
+          }
+        }
+      }
+    }
+
+    for (const [sysUser, pgDbs] of userAllPgDbs.entries()) {
+      if (pgDbs.length > 0) {
+        const primaryDom =
+          rawOut.find((d) => d.systemUser === sysUser && !d.isSubdomain) ||
+          rawOut.find((d) => d.systemUser === sysUser);
+        if (primaryDom) {
+          for (const pgName of pgDbs) {
+            primaryDom.databases.push({
+              name: pgName,
+              user: sysUser,
+              engine: 'POSTGRESQL',
+            });
           }
         }
       }

@@ -34,6 +34,26 @@ interface ExtendedServer extends ServerRecord {
   last_backup_at?: string | null;
 }
 
+const PANEL_OPTIONS: Array<{ value: PanelType; label: string }> = [
+  { value: 'DIRECTADMIN', label: 'DirectAdmin' },
+  { value: 'CPANEL', label: 'cPanel / WHM' },
+  { value: 'PLESK', label: 'Plesk Obsidian' },
+  { value: 'AAPANEL', label: 'aaPanel / BT Panel' },
+  { value: 'CYBERPANEL', label: 'CyberPanel (OpenLiteSpeed)' },
+  { value: 'HESTIACP', label: 'HestiaCP' },
+  { value: 'CLOUDPANEL', label: 'CloudPanel' },
+];
+
+const PANEL_LABELS: Record<PanelType, string> = {
+  DIRECTADMIN: 'DirectAdmin',
+  CPANEL: 'cPanel / WHM',
+  PLESK: 'Plesk Obsidian',
+  AAPANEL: 'aaPanel / BT Panel',
+  CYBERPANEL: 'CyberPanel (OpenLiteSpeed)',
+  HESTIACP: 'HestiaCP',
+  CLOUDPANEL: 'CloudPanel',
+};
+
 function formatTofuShort(fingerprint?: string): string {
   const raw = (fingerprint || '').trim();
   if (!raw) return 'SHA256:(Đã ghim)';
@@ -70,6 +90,9 @@ export default function ServersPage() {
     is_mock: false,
     notes: '',
     custom_excludes: '',
+    backup_mailboxes: 0 as 0 | 1,
+    backup_cronjobs: 0 as 0 | 1,
+    backup_vhost_configs: 0 as 0 | 1,
   });
 
   // SSH Keys Modal
@@ -144,6 +167,9 @@ export default function ServersPage() {
       is_mock: false,
       notes: '',
       custom_excludes: '',
+      backup_mailboxes: 0,
+      backup_cronjobs: 0,
+      backup_vhost_configs: 0,
     });
     setShowServerModal(true);
   };
@@ -162,6 +188,9 @@ export default function ServersPage() {
       is_mock: srv.is_mock === 1,
       notes: srv.notes || '',
       custom_excludes: srv.custom_excludes || '',
+      backup_mailboxes: srv.backup_mailboxes ? 1 : 0,
+      backup_cronjobs: srv.backup_cronjobs ? 1 : 0,
+      backup_vhost_configs: srv.backup_vhost_configs ? 1 : 0,
     });
     setShowServerModal(true);
   };
@@ -181,6 +210,9 @@ export default function ServersPage() {
         assigned_volume_id: form.assigned_volume_id
           ? Number(form.assigned_volume_id)
           : null,
+        backup_mailboxes: form.backup_mailboxes ? 1 : 0,
+        backup_cronjobs: form.backup_cronjobs ? 1 : 0,
+        backup_vhost_configs: form.backup_vhost_configs ? 1 : 0,
       }),
     });
     const data = await resp.json();
@@ -447,6 +479,42 @@ export default function ServersPage() {
     );
   };
 
+  const renderExtendedHostingBadges = (srv: ExtendedServer) => {
+    const hasMail = srv.backup_mailboxes === 1;
+    const hasCron = srv.backup_cronjobs === 1;
+    const hasVhost = srv.backup_vhost_configs === 1;
+    if (!hasMail && !hasCron && !hasVhost) return null;
+
+    return (
+      <div className="flex flex-wrap items-center gap-1 mt-1.5">
+        {hasMail && (
+          <span
+            title="Sao lưu Hộp thư Email (Maildir / IMAP)"
+            className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 text-[10px] font-medium whitespace-nowrap"
+          >
+            📬 Mail
+          </span>
+        )}
+        {hasCron && (
+          <span
+            title="Sao lưu Lịch Crontab của User"
+            className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/30 text-[10px] font-medium whitespace-nowrap"
+          >
+            ⏰ Cron
+          </span>
+        )}
+        {hasVhost && (
+          <span
+            title="Sao lưu Cấu hình Webserver Vhost & SSL"
+            className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-violet-500/15 text-violet-300 border border-violet-500/30 text-[10px] font-medium whitespace-nowrap"
+          >
+            🔒 Vhost
+          </span>
+        )}
+      </div>
+    );
+  };
+
   const mismatchServers = servers.filter(
     (s) => s.host_key_status === 'MISMATCH'
   );
@@ -460,7 +528,7 @@ export default function ServersPage() {
             <span>Quản lý Máy chủ VPS Đa Control Panel</span>
           </h2>
           <p className="text-xs text-slate-400 mt-0.5">
-            Kết nối Agentless Pull qua SSH Root, tự động đọc cấu hình DirectAdmin, cPanel, Plesk, aaPanel với Zero-Impact (nice/ionice).
+            Kết nối Agentless Pull qua SSH Root, tự động đọc cấu hình DirectAdmin, cPanel, Plesk, aaPanel, CyberPanel, HestiaCP, CloudPanel với Zero-Impact (nice/ionice).
           </p>
         </div>
 
@@ -599,14 +667,16 @@ export default function ServersPage() {
                       <div className="font-bold text-sm text-white break-all">
                         {srv.hostname}
                       </div>
+                      {renderExtendedHostingBadges(srv)}
                     </div>
 
                     <span
+                      title={PANEL_LABELS[srv.panel_type] || srv.panel_type}
                       className={`px-2.5 py-1 rounded-md border font-semibold text-[11px] shrink-0 ${getPanelBadgeClass(
                         srv.panel_type
                       )}`}
                     >
-                      {srv.panel_type}
+                      {PANEL_LABELS[srv.panel_type] || srv.panel_type}
                     </span>
                   </div>
 
@@ -783,14 +853,16 @@ export default function ServersPage() {
                       {renderHostKeyPinning(srv, 'desktop')}
                     </td>
 
-                    <td className="p-4">
+                    <td className="p-4 align-top">
                       <span
-                        className={`px-2.5 py-1 rounded-md border font-semibold text-[11px] ${getPanelBadgeClass(
+                        title={PANEL_LABELS[srv.panel_type] || srv.panel_type}
+                        className={`inline-block px-2.5 py-1 rounded-md border font-semibold text-[11px] ${getPanelBadgeClass(
                           srv.panel_type
                         )}`}
                       >
-                        {srv.panel_type}
+                        {PANEL_LABELS[srv.panel_type] || srv.panel_type}
                       </span>
+                      {renderExtendedHostingBadges(srv)}
                     </td>
 
                     <td className="p-4">
@@ -930,10 +1002,11 @@ export default function ServersPage() {
                     }
                     className="w-full min-h-[42px] bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white"
                   >
-                    <option value="DIRECTADMIN">DirectAdmin</option>
-                    <option value="CPANEL">cPanel / WHM</option>
-                    <option value="PLESK">Plesk Obsidian</option>
-                    <option value="AAPANEL">aaPanel / BT Panel</option>
+                    {PANEL_OPTIONS.map((opt) => (
+                      <option key={opt.value} value={opt.value}>
+                        {opt.label}
+                      </option>
+                    ))}
                   </select>
                 </div>
               </div>
@@ -1029,6 +1102,78 @@ export default function ServersPage() {
                     </option>
                   ))}
                 </select>
+              </div>
+
+              <div className="p-3.5 rounded-xl bg-slate-950 border border-slate-800 space-y-2.5">
+                <div className="font-semibold text-slate-200">
+                  Sao lưu Mở rộng Hệ thống Hosting (Tùy chọn)
+                </div>
+
+                <label className="flex items-start gap-2.5 p-2.5 rounded-lg bg-slate-900/70 border border-slate-800/80 hover:border-cyan-500/30 cursor-pointer transition-colors">
+                  <input
+                    type="checkbox"
+                    checked={form.backup_mailboxes === 1}
+                    onChange={(e) =>
+                      setForm({
+                        ...form,
+                        backup_mailboxes: e.target.checked ? 1 : 0,
+                      })
+                    }
+                    className="mt-0.5 shrink-0 rounded border-slate-700"
+                  />
+                  <div className="min-w-0 space-y-0.5">
+                    <div className="font-semibold text-cyan-200 break-words">
+                      📬 Hộp thư Email (Maildir / IMAP)
+                    </div>
+                    <p className="text-[11px] text-slate-400 italic leading-relaxed break-words">
+                      Sao lưu tăng dần Hard-Link toàn bộ hộp thư tên miền
+                    </p>
+                  </div>
+                </label>
+
+                <label className="flex items-start gap-2.5 p-2.5 rounded-lg bg-slate-900/70 border border-slate-800/80 hover:border-amber-500/30 cursor-pointer transition-colors">
+                  <input
+                    type="checkbox"
+                    checked={form.backup_cronjobs === 1}
+                    onChange={(e) =>
+                      setForm({
+                        ...form,
+                        backup_cronjobs: e.target.checked ? 1 : 0,
+                      })
+                    }
+                    className="mt-0.5 shrink-0 rounded border-slate-700"
+                  />
+                  <div className="min-w-0 space-y-0.5">
+                    <div className="font-semibold text-amber-200 break-words">
+                      ⏰ Lịch Crontab của User
+                    </div>
+                    <p className="text-[11px] text-slate-400 italic leading-relaxed break-words">
+                      Trích xuất lịch chạy định kỳ của từng tài khoản Linux
+                    </p>
+                  </div>
+                </label>
+
+                <label className="flex items-start gap-2.5 p-2.5 rounded-lg bg-slate-900/70 border border-slate-800/80 hover:border-violet-500/30 cursor-pointer transition-colors">
+                  <input
+                    type="checkbox"
+                    checked={form.backup_vhost_configs === 1}
+                    onChange={(e) =>
+                      setForm({
+                        ...form,
+                        backup_vhost_configs: e.target.checked ? 1 : 0,
+                      })
+                    }
+                    className="mt-0.5 shrink-0 rounded border-slate-700"
+                  />
+                  <div className="min-w-0 space-y-0.5">
+                    <div className="font-semibold text-violet-200 break-words">
+                      🔒 Cấu hình Webserver Vhost &amp; SSL
+                    </div>
+                    <p className="text-[11px] text-slate-400 italic leading-relaxed break-words">
+                      Lưu cấu hình Nginx/Apache/OpenLiteSpeed &amp; SSL của từng miền
+                    </p>
+                  </div>
+                </label>
               </div>
 
               <label className="flex items-start gap-2.5 p-3 rounded-lg bg-slate-950 border border-slate-800 cursor-pointer">
@@ -1211,8 +1356,10 @@ export default function ServersPage() {
           <div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-2xl w-full p-4 sm:p-6 space-y-4 max-h-[calc(100dvh-2rem)] overflow-y-auto">
             <div className="flex items-start justify-between gap-3">
               <h3 className="text-sm sm:text-base font-bold text-white break-all">
-                Kiểm tra SSH & Quét Tự động {testingServer.panel_type} —{' '}
-                {testingServer.hostname}
+                Kiểm tra SSH & Quét Tự động{' '}
+                {PANEL_LABELS[testingServer.panel_type] ||
+                  testingServer.panel_type}{' '}
+                — {testingServer.hostname}
               </h3>
               <button
                 type="button"
@@ -1226,7 +1373,10 @@ export default function ServersPage() {
 
             {testLoading ? (
               <div className="py-12 text-center text-xs text-slate-400">
-                Đang kết nối SSH và đọc dữ liệu cấu hình {testingServer.panel_type}...
+                Đang kết nối SSH và đọc dữ liệu cấu hình{' '}
+                {PANEL_LABELS[testingServer.panel_type] ||
+                  testingServer.panel_type}
+                ...
               </div>
             ) : testResult?.ok ? (
               <div className="space-y-4 text-xs">
@@ -1245,7 +1395,7 @@ export default function ServersPage() {
 
                 <div>
                   <div className="font-semibold text-slate-200 mb-2">
-                    Danh sách Website, Subdomain & MySQL Database tự động phát hiện (
+                    Danh sách Website, Subdomain &amp; Database (MySQL / PostgreSQL) tự động phát hiện (
                     {testResult.domains?.length || 0} websites —{' '}
                     {(testResult.domains || []).filter((d) => d.isSubdomain).length}{' '}
                     subdomains):
@@ -1279,17 +1429,29 @@ export default function ServersPage() {
                           <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
                             {d.databases.length === 0 ? (
                               <span className="text-[11px] text-slate-500">
-                                Không dùng MySQL DB
+                                Không dùng Database
                               </span>
                             ) : (
-                              d.databases.map((db) => (
-                                <span
-                                  key={db.name}
-                                  className="px-2 py-0.5 rounded bg-emerald-500/10 border border-emerald-500/25 text-emerald-300 font-mono text-[11px] break-all"
-                                >
-                                  {db.name}
-                                </span>
-                              ))
+                              d.databases.map((db) => {
+                                const isPg = db.engine === 'POSTGRESQL';
+                                return (
+                                  <span
+                                    key={db.name}
+                                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-emerald-500/10 border border-emerald-500/25 text-emerald-300 font-mono text-[11px] break-all"
+                                  >
+                                    <span>{db.name}</span>
+                                    <span
+                                      className={`px-1 py-0.5 rounded text-[9px] font-sans font-semibold shrink-0 border ${
+                                        isPg
+                                          ? 'bg-violet-500/20 text-violet-300 border-violet-500/35'
+                                          : 'bg-cyan-500/15 text-cyan-300 border-cyan-500/30'
+                                      }`}
+                                    >
+                                      {isPg ? 'PostgreSQL' : 'MySQL'}
+                                    </span>
+                                  </span>
+                                );
+                              })
                             )}
                           </div>
                         </div>
@@ -1304,7 +1466,7 @@ export default function ServersPage() {
                             <th className="p-2.5">Domain / Subdomain</th>
                             <th className="p-2.5">System User</th>
                             <th className="p-2.5">Đường dẫn gốc trên VPS</th>
-                            <th className="p-2.5">MySQL Databases</th>
+                            <th className="p-2.5">Databases (MySQL / PostgreSQL)</th>
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-slate-800">
@@ -1326,9 +1488,33 @@ export default function ServersPage() {
                               <td className="p-2.5 font-mono text-slate-400">
                                 {d.webroot}
                               </td>
-                              <td className="p-2.5 text-emerald-300 font-mono">
-                                {d.databases.map((db) => db.name).join(', ') ||
-                                  '—'}
+                              <td className="p-2.5 font-mono">
+                                {d.databases.length === 0 ? (
+                                  <span className="text-slate-500">—</span>
+                                ) : (
+                                  <div className="flex flex-wrap items-center gap-1.5">
+                                    {d.databases.map((db) => {
+                                      const isPg = db.engine === 'POSTGRESQL';
+                                      return (
+                                        <span
+                                          key={db.name}
+                                          className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-slate-950 border border-slate-800 text-emerald-300 text-[11px]"
+                                        >
+                                          <span>{db.name}</span>
+                                          <span
+                                            className={`px-1 py-0.5 rounded text-[9px] font-sans font-semibold border ${
+                                              isPg
+                                                ? 'bg-violet-500/20 text-violet-300 border-violet-500/35'
+                                                : 'bg-cyan-500/15 text-cyan-300 border-cyan-500/30'
+                                            }`}
+                                          >
+                                            {isPg ? 'PostgreSQL' : 'MySQL'}
+                                          </span>
+                                        </span>
+                                      );
+                                    })}
+                                  </div>
+                                )}
                               </td>
                             </tr>
                           ))}

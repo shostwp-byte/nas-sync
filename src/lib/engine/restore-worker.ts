@@ -28,6 +28,7 @@ import {
   verifyRemoteWebrootSafety,
 } from './adapters/base';
 import { patchRestoredWebConfigOverSsh } from './config-rewriter';
+import { streamRestorePostgresOverSsh } from './postgres-streamer';
 import {
   assertSafe,
   isSafeDbName,
@@ -515,9 +516,14 @@ export async function executeRestoreJob(jobId: number): Promise<void> {
       if (dbsToRestore.length === 0) {
         appendLog(`[DB Restore] Không có database nào được chọn hoặc domain không dùng DB.`);
       } else {
-        const creds = await targetAdapter.getMysqlAdminCredentials(targetServer);
-        const authFlags = buildMysqlAuthFlags(creds);
-        const envPrelude = buildRemoteMysqlEnvPrelude(creds);
+        const needsMysqlCreds = dbsToRestore.some(
+          (d) => !(d.engine === 'POSTGRESQL' || d.file.startsWith('pg_'))
+        );
+        const creds = needsMysqlCreds
+          ? await targetAdapter.getMysqlAdminCredentials(targetServer)
+          : null;
+        const authFlags = creds ? buildMysqlAuthFlags(creds) : '';
+        const envPrelude = creds ? buildRemoteMysqlEnvPrelude(creds) : '';
 
         for (let i = 0; i < dbsToRestore.length; i++) {
           if (isJobCancelled(jobId)) {
@@ -525,6 +531,8 @@ export async function executeRestoreJob(jobId: number): Promise<void> {
           }
 
           const dbInfo = dbsToRestore[i];
+          const isPostgres =
+            dbInfo.engine === 'POSTGRESQL' || dbInfo.file.startsWith('pg_');
           const targetDbName = assertSafe(
             isSafeDbName,
             payload.targetDbMap?.[dbInfo.name]?.trim() || dbInfo.name,
@@ -550,40 +558,64 @@ export async function executeRestoreJob(jobId: number): Promise<void> {
 
           setStep(
             65 + Math.round(((i + 1) / dbsToRestore.length) * 30),
-            `Đang giải nén luồng & nạp Database ${targetDbName}...`
+            `Đang giải nén luồng & nạp ${isPostgres ? 'PostgreSQL' : 'MySQL'} Database ${targetDbName}...`
           );
 
-          appendLog(
-            `[DB Stream Restore] Stream ${dbInfo.file} ➔ MySQL(${targetServer.hostname}) / DB: ${targetDbName}`
-          );
-
-          if (targetServer.is_mock) {
-            await new Promise((r) => setTimeout(r, 450));
+          if (isPostgres) {
             appendLog(
-              `[DB Stream Restore] ✅ Đã nạp thành công toàn bộ bảng vào database "${targetDbName}" trên ${targetServer.hostname}.`
+              `[PG Stream Restore] Stream ${dbInfo.file} ➔ PostgreSQL(${targetServer.hostname}) / DB: ${targetDbName}`
             );
-          } else {
-            const createDbCmd = `bash -o pipefail -c ${shellSingleQuote(
-              `${envPrelude}mysql ${authFlags} -e "CREATE DATABASE IF NOT EXISTS \\\`${targetDbName}\\\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"`
-            )}`;
-            const createRes = await execRemoteSSH(targetServer, createDbCmd, {
-              zeroImpact: true,
-            });
-            if (createRes.code !== 0) {
-              throw new Error(
-                `Không thể khởi tạo database đích "${targetDbName}": ${createRes.stderr.trim()}`
+
+            if (targetServer.is_mock) {
+              await new Promise((r) => setTimeout(r, 450));
+              appendLog(
+                `[PG Stream Restore] ✅ Đã nạp thành công toàn bộ bảng PostgreSQL vào database "${targetDbName}" trên ${targetServer.hostname}.`
+              );
+            } else {
+              await streamRestorePostgresOverSsh({
+                jobId,
+                targetServer,
+                dumpFilePath: dumpPath,
+                targetDbName,
+                targetDbUser: dbInfo.db_user || targetUser,
+              });
+              appendLog(
+                `[PG Stream Restore] ✅ Hoàn tất nạp PostgreSQL Database "${targetDbName}".`
               );
             }
-            await streamRestoreDatabaseOverSsh({
-              jobId,
-              targetServer,
-              creds,
-              dumpFilePath: dumpPath,
-              targetDbName,
-            });
+          } else {
             appendLog(
-              `[DB Stream Restore] ✅ Hoàn tất nạp Database "${targetDbName}".`
+              `[DB Stream Restore] Stream ${dbInfo.file} ➔ MySQL(${targetServer.hostname}) / DB: ${targetDbName}`
             );
+
+            if (targetServer.is_mock) {
+              await new Promise((r) => setTimeout(r, 450));
+              appendLog(
+                `[DB Stream Restore] ✅ Đã nạp thành công toàn bộ bảng vào database "${targetDbName}" trên ${targetServer.hostname}.`
+              );
+            } else {
+              const createDbCmd = `bash -o pipefail -c ${shellSingleQuote(
+                `${envPrelude}mysql ${authFlags} -e "CREATE DATABASE IF NOT EXISTS \\\`${targetDbName}\\\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"`
+              )}`;
+              const createRes = await execRemoteSSH(targetServer, createDbCmd, {
+                zeroImpact: true,
+              });
+              if (createRes.code !== 0) {
+                throw new Error(
+                  `Không thể khởi tạo database đích "${targetDbName}": ${createRes.stderr.trim()}`
+                );
+              }
+              await streamRestoreDatabaseOverSsh({
+                jobId,
+                targetServer,
+                creds: creds!,
+                dumpFilePath: dumpPath,
+                targetDbName,
+              });
+              appendLog(
+                `[DB Stream Restore] ✅ Hoàn tất nạp Database "${targetDbName}".`
+              );
+            }
           }
         }
       }

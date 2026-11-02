@@ -156,6 +156,13 @@ if (fs.existsSync(path.join(projectRoot, 'public'))) {
     path.join(stageDir, 'public')
   );
 }
+const decryptCliSrc = path.join(projectRoot, 'scripts', 'decrypt-offsite-backup.mjs');
+if (fs.existsSync(decryptCliSrc)) {
+  copyFileNormalizedLf(
+    decryptCliSrc,
+    path.join(stageDir, 'scripts', 'decrypt-offsite-backup.mjs')
+  );
+}
 
 // Tạo sẵn thư mục bind-mount để Synology Container Manager không báo lỗi "Bind mount folder does not exist"
 for (const emptyDir of ['app_data', 'ssh_keys']) {

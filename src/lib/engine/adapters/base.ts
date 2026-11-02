@@ -69,10 +69,11 @@ export function buildRemoteMysqlEnvPrelude(creds: MysqlAdminCredentials): string
 /**
  * Kiểm tra Symlink Webroot Jail trực tiếp trên VPS trước khi chạy rsync pull/push hoặc chown:
  * - Phân giải đường dẫn thực tế qua `realpath` / `readlink`
- * - Trên cPanel/DirectAdmin: bắt buộc nằm bên trong thư mục home thực của `systemUser` trong `/etc/passwd`
+ * - Trên cPanel/DirectAdmin/HestiaCP/CloudPanel: bắt buộc nằm bên trong thư mục home thực của `systemUser` trong `/etc/passwd`
+ * - Trên CyberPanel: bắt buộc nằm bên trong `/home/<domain_or_user>/...` (không bao giờ là `/home` gốc)
  * - Trên Plesk: bắt buộc nằm trong vhost root của `systemUser` hoặc `/var/www/vhosts/<domain>/...`
  * - Trên aaPanel: bắt buộc nằm trong `/www/wwwroot/<site>`
- * - Chặn tuyệt đối mọi symlink trỏ sang `/root`, `/etc`, `/proc`, `/var/lib/mysql` hoặc tài khoản user khác.
+ * - Chặn tuyệt đối mọi symlink trỏ sang `/root`, `/etc`, `/proc`, `/var/lib/mysql`, `/var/lib/postgresql` hoặc tài khoản user khác.
  */
 export async function verifyRemoteWebrootSafety(
   server: ServerRecord,
@@ -120,7 +121,7 @@ export async function verifyRemoteWebrootSafety(
     fi
 
     case "$REAL/" in
-      /|/etc/*|/root/*|/proc/*|/sys/*|/dev/*|/boot/*|/usr/*|/bin/*|/sbin/*|/lib/*|/lib64/*|/run/*|/var/lib/mysql/*|/var/cpanel/*|/usr/local/directadmin/*|/www/server/panel/*)
+      /|/etc/*|/root/*|/proc/*|/sys/*|/dev/*|/boot/*|/usr/*|/bin/*|/sbin/*|/lib/*|/lib64/*|/run/*|/var/lib/mysql/*|/var/lib/postgresql/*|/var/cpanel/*|/usr/local/directadmin/*|/usr/local/CyberCP/*|/usr/local/hestia/*|/home/clp/*|/www/server/panel/*)
         echo "ERR_JAIL|Đường dẫn webroot trỏ tới vùng hệ thống bị cấm ($REAL)"
         exit 0
         ;;
@@ -136,6 +137,19 @@ export async function verifyRemoteWebrootSafety(
           ;;
         *)
           echo "ERR_JAIL|Webroot aaPanel ($REAL) nằm ngoài phạm vi /www/wwwroot/"
+          exit 0
+          ;;
+      esac
+    elif [ "$PANEL" = "CYBERPANEL" ]; then
+      case "$REAL" in
+        /home/*/*)
+          ;;
+        /home|/home/*)
+          echo "ERR_JAIL|Webroot CyberPanel ($REAL) phải nằm bên trong /home/<domain_or_user>/... (không được là /home hoặc thư mục cấp 1)"
+          exit 0
+          ;;
+        *)
+          echo "ERR_JAIL|Webroot CyberPanel ($REAL) nằm ngoài phạm vi /home/<domain_or_user>/..."
           exit 0
           ;;
       esac

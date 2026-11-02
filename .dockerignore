@@ -1,7 +1,7 @@
 node_modules
 .next
 release
-scripts
+scripts/package-*.mjs
 tests
 app_data
 redis_data

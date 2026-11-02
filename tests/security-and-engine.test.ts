@@ -32,8 +32,24 @@ import {
   isSafeSnapshotName,
   isSafeSystemUser,
   isSafeWebroot,
+  isValidPanelType,
   validateServerConnectionFields,
 } from '@/lib/engine/safe-names';
+import { getPanelAdapter } from '@/lib/engine/adapters';
+import { executeBackupJob } from '@/lib/engine/backup-worker';
+import { syncExtendedHostingExtras } from '@/lib/engine/extended-hosting-backup';
+import {
+  buildAwsSigV4Headers,
+  createGoogleServiceAccountJwt,
+  normalizeGoogleDriveFolderId,
+  pushSnapshotToOffsiteCloud,
+  testOffsiteConnection,
+} from '@/lib/engine/offsite-cloud';
+import {
+  createOffsiteDecryptStream,
+  createOffsiteEncryptStream,
+} from '@/lib/engine/offsite-crypto';
+import { verifyPostgresDumpFile } from '@/lib/engine/sandbox-verifier';
 import { encodeQrMatrix, renderQrSvg } from '@/lib/qr-svg';
 import {
   buildRsyncSshTransport,
@@ -656,5 +672,511 @@ Total transferred file size: 52,428,800 bytes
     assert.ok(digestSummary.hostKeyMismatchCount >= 1); // from tofu-vps test above
     assert.ok(digestSummary.savingsPercent > 0);
     assert.ok(digestSummary.verifiedDbs24h >= 2);
+  });
+});
+
+describe('7. v1.5.0 Offsite AES-256-GCM Crypto, Cloud SigV4/GDrive JWT, New Panels, Extended Extras & PostgreSQL', () => {
+  it('encrypts & decrypts multi-chunk NASSYNC1 AES-256-GCM streams and rejects bit-flip / truncated EOF / wrong passphrase', async () => {
+    const { Readable } = await import('node:stream');
+    const { pipeline } = await import('node:stream/promises');
+    const { execFileSync } = await import('node:child_process');
+
+    // Tạo dữ liệu 11.5 KiB chia qua nhiều chunk nhỏ 2048 bytes (6 frames + 1 EOF frame)
+    const plainOriginal = crypto.randomBytes(11_777);
+    const pass = 'Strong-Offsite-Passphrase-2026!';
+
+    const encChunks: Buffer[] = [];
+    const encStream = createOffsiteEncryptStream(pass, 2048);
+    encStream.on('data', (c: Buffer) => encChunks.push(c));
+    await pipeline(
+      Readable.from([
+        plainOriginal.subarray(0, 1500),
+        plainOriginal.subarray(1500, 6100),
+        plainOriginal.subarray(6100),
+      ]),
+      encStream
+    );
+
+    const encryptedBlob = Buffer.concat(encChunks);
+    assert.equal(encryptedBlob.subarray(0, 8).toString('ascii'), 'NASSYNC1');
+    assert.equal(encryptedBlob[8], 0x01);
+    assert.equal(encryptedBlob.readUInt32BE(41), 2048);
+
+    // 1. Giải mã hợp lệ qua luồng bị cắt lẻ ngẫu nhiên -> khớp 100% byte-for-byte
+    const decChunks: Buffer[] = [];
+    const decStream = createOffsiteDecryptStream(pass);
+    decStream.on('data', (c: Buffer) => decChunks.push(c));
+    await pipeline(
+      Readable.from([
+        encryptedBlob.subarray(0, 17),
+        encryptedBlob.subarray(17, 45),
+        encryptedBlob.subarray(45, 3100),
+        encryptedBlob.subarray(3100),
+      ]),
+      decStream
+    );
+    assert.deepEqual(Buffer.concat(decChunks), plainOriginal);
+
+    // 2. Kiểm tra standalone CLI `scripts/decrypt-offsite-backup.mjs`
+    const encFile = path.join(tempRootDir, 'test-archive.tar.gz.enc');
+    const outDecFile = path.join(tempRootDir, 'test-archive.tar.gz');
+    fs.writeFileSync(encFile, encryptedBlob);
+    execFileSync(
+      process.execPath,
+      [
+        path.resolve(process.cwd(), 'scripts/decrypt-offsite-backup.mjs'),
+        encFile,
+        outDecFile,
+        pass,
+      ],
+      { stdio: 'pipe' }
+    );
+    assert.deepEqual(fs.readFileSync(outDecFile), plainOriginal);
+
+    // 3. Đảo 1 bit trong vùng ciphertext -> bắt buộc ném lỗi xác thực AES-256-GCM
+    const tampered = Buffer.from(encryptedBlob);
+    tampered[90] ^= 0xff;
+    await assert.rejects(async () => {
+      const s = createOffsiteDecryptStream(pass);
+      s.resume();
+      await pipeline(Readable.from([tampered]), s);
+    }, /Giải mã|Xác thực/i);
+
+    // 4. Cắt cụt mất khung xác thực kết thúc EOF -> bắt buộc ném lỗi cắt cụt luồng
+    const truncated = encryptedBlob.subarray(0, encryptedBlob.length - 8);
+    await assert.rejects(async () => {
+      const s = createOffsiteDecryptStream(pass);
+      s.resume();
+      await pipeline(Readable.from([truncated]), s);
+    }, /cắt cụt|EOF/i);
+
+    // 5. Sai mật khẩu -> bắt buộc từ chối giải mã
+    await assert.rejects(async () => {
+      const s = createOffsiteDecryptStream('Wrong-Passphrase-999');
+      s.resume();
+      await pipeline(Readable.from([encryptedBlob]), s);
+    }, /Sai mật khẩu|thất bại/i);
+  });
+
+  it('computes deterministic AWS SigV4 signatures, normalizes Google Drive folder URLs, and signs valid RS256 Service Account JWTs', () => {
+    // 1. AWS Signature Version 4 official RFC / AWS docs test vector (GET examplebucket)
+    const fixedDate = new Date('2013-05-24T00:00:00.000Z');
+    const emptySha256 =
+      'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
+    const sigRes = buildAwsSigV4Headers({
+      method: 'GET',
+      url: 'https://examplebucket.s3.amazonaws.com/test.txt',
+      accessKeyId: 'AKIAIOSFODNN7EXAMPLE',
+      secretAccessKey: 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
+      region: 'us-east-1',
+      service: 's3',
+      headers: {
+        range: 'bytes=0-9',
+      },
+      payloadHash: emptySha256,
+      now: fixedDate,
+    });
+
+    assert.equal(sigRes.amzDate, '20130524T000000Z');
+    // Official AWS S3 SigV4 documentation signature for GET /test.txt with Range: bytes=0-9 on 20130524T000000Z
+    assert.equal(
+      sigRes.signature,
+      'f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41'
+    );
+    assert.match(
+      sigRes.authorization,
+      /^AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE\/20130524\/us-east-1\/s3\/aws4_request/
+    );
+
+    // 2. Google Drive Folder ID extraction from URLs & raw IDs
+    assert.equal(
+      normalizeGoogleDriveFolderId(
+        'https://drive.google.com/drive/folders/1AbCdEfGhIjKlMnOpQrStUvWxYz?usp=sharing'
+      ),
+      '1AbCdEfGhIjKlMnOpQrStUvWxYz'
+    );
+    assert.equal(
+      normalizeGoogleDriveFolderId(
+        'https://drive.google.com/drive/u/1/folders/19_Folder_ID-Test999'
+      ),
+      '19_Folder_ID-Test999'
+    );
+    assert.equal(
+      normalizeGoogleDriveFolderId('1PlainFolderId_001'),
+      '1PlainFolderId_001'
+    );
+    assert.equal(normalizeGoogleDriveFolderId('   '), '');
+    assert.throws(() =>
+      normalizeGoogleDriveFolderId("bad' or name contains 'x")
+    );
+
+    // 3. Google Cloud Service Account RS256 JWT generation & cryptographic verification
+    const { publicKey, privateKey } = crypto.generateKeyPairSync('rsa', {
+      modulusLength: 2048,
+      publicKeyEncoding: { type: 'spki', format: 'pem' },
+      privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+    });
+
+    const jwt = createGoogleServiceAccountJwt(
+      {
+        client_email: 'nas-sync-bot@my-backup-proj.iam.gserviceaccount.com',
+        private_key: privateKey.replace(/\n/g, '\\n'),
+      },
+      'https://www.googleapis.com/auth/drive.file',
+      1_762_000_000
+    );
+
+    const parts = jwt.split('.');
+    assert.equal(parts.length, 3);
+    const headerObj = JSON.parse(
+      Buffer.from(parts[0], 'base64url').toString('utf8')
+    );
+    const payloadObj = JSON.parse(
+      Buffer.from(parts[1], 'base64url').toString('utf8')
+    );
+    assert.equal(headerObj.alg, 'RS256');
+    assert.equal(
+      payloadObj.iss,
+      'nas-sync-bot@my-backup-proj.iam.gserviceaccount.com'
+    );
+    assert.equal(payloadObj.aud, 'https://oauth2.googleapis.com/token');
+    assert.equal(payloadObj.exp - payloadObj.iat, 3600);
+
+    const verifier = crypto.createVerify('RSA-SHA256');
+    verifier.update(`${parts[0]}.${parts[1]}`, 'utf8');
+    verifier.end();
+    assert.equal(
+      verifier.verify(publicKey, Buffer.from(parts[2], 'base64url')),
+      true
+    );
+  });
+
+  it('validates CyberPanel/HestiaCP/CloudPanel adapters, syncs Extended Hosting Extras, and verifies PostgreSQL .sql.zst dumps', async () => {
+    const zlibMod = await import('node:zlib');
+
+    // 1. Kiểm tra safe-names & adapter factory cho 3 panel mới
+    for (const panel of ['CYBERPANEL', 'HESTIACP', 'CLOUDPANEL'] as const) {
+      assert.equal(isValidPanelType(panel), true);
+      assert.equal(
+        validateServerConnectionFields({
+          hostname: `vps-${panel.toLowerCase()}.example.com`,
+          ipAddress: '103.221.220.250',
+          sshUser: 'root',
+          panelType: panel,
+        }),
+        null
+      );
+
+      const liveAdapter = getPanelAdapter({
+        id: 1,
+        hostname: 'live.example.com',
+        ip_address: '103.221.220.250',
+        ssh_port: 22,
+        ssh_user: 'root',
+        ssh_key_path: '',
+        panel_type: panel,
+        assigned_volume_id: null,
+        bw_limit_kbps: 0,
+        status: 'ONLINE',
+        is_mock: 0,
+        last_connected_at: null,
+        notes: '',
+        created_at: new Date().toISOString(),
+      });
+      assert.equal(liveAdapter.panelType, panel);
+
+      const mockAdapter = getPanelAdapter({
+        id: 2,
+        hostname: 'mock.example.com',
+        ip_address: '103.221.220.251',
+        ssh_port: 22,
+        ssh_user: 'root',
+        ssh_key_path: '',
+        panel_type: panel,
+        assigned_volume_id: null,
+        bw_limit_kbps: 0,
+        status: 'ONLINE',
+        is_mock: 1,
+        last_connected_at: null,
+        notes: '',
+        created_at: new Date().toISOString(),
+      });
+      const discovered = await mockAdapter.discoverDomains({
+        id: 2,
+        hostname: 'mock.example.com',
+        ip_address: '103.221.220.251',
+        ssh_port: 22,
+        ssh_user: 'root',
+        ssh_key_path: '',
+        panel_type: panel,
+        assigned_volume_id: null,
+        bw_limit_kbps: 0,
+        status: 'ONLINE',
+        is_mock: 1,
+        last_connected_at: null,
+        notes: '',
+        created_at: new Date().toISOString(),
+      });
+      assert.ok(discovered.length >= 2);
+      if (panel === 'HESTIACP') {
+        assert.ok(
+          discovered.some((d) =>
+            d.databases.some((db) => db.engine === 'POSTGRESQL')
+          ),
+          'HestiaCP mock discovery must include a POSTGRESQL database'
+        );
+      }
+    }
+
+    // 2. Chạy toàn trình executeBackupJob trên HestiaCP Mock (có PostgreSQL .sql.zst + Mailboxes + Cronjobs + Vhosts)
+    const db = getDb();
+    const vol = db
+      .prepare('SELECT id, mount_path FROM storage_volumes ORDER BY id ASC LIMIT 1')
+      .get() as { id: number; mount_path: string };
+
+    const srvIns = db
+      .prepare(
+        `INSERT INTO servers
+         (hostname, ip_address, ssh_port, ssh_user, panel_type, assigned_volume_id, is_mock, backup_mailboxes, backup_cronjobs, backup_vhost_configs)
+         VALUES ('hestia-pg.example.com', '103.221.220.245', 22, 'root', 'HESTIACP', ?, 1, 1, 1, 1)`
+      )
+      .run(vol.id);
+    const hestiaServerId = Number(srvIns.lastInsertRowid);
+
+    const jobIns = db
+      .prepare(
+        `INSERT INTO backup_jobs (job_type, server_id, volume_id, snapshot_name, status)
+         VALUES ('BACKUP', ?, ?, '2026-11-02_12-00', 'QUEUED')`
+      )
+      .run(hestiaServerId, vol.id);
+    const hestiaJobId = Number(jobIns.lastInsertRowid);
+
+    await executeBackupJob(hestiaJobId, { verifyDb: true });
+
+    const completedJob = db
+      .prepare('SELECT status, error_log FROM backup_jobs WHERE id = ?')
+      .get(hestiaJobId) as { status: string; error_log: string | null };
+    assert.equal(completedJob.status, 'COMPLETED');
+
+    const snapshotDir = path.join(
+      vol.mount_path,
+      'hestia-pg.example.com',
+      '2026-11-02_12-00'
+    );
+
+    // Kiểm tra Extended Hosting Extras (Mailboxes, Cronjobs, Vhosts) đã tạo đủ
+    assert.equal(
+      fs.existsSync(
+        path.join(
+          snapshotDir,
+          'system_extras',
+          'mailboxes',
+          'saas-platform.vn',
+          'Maildir',
+          'cur',
+          'welcome.eml'
+        )
+      ),
+      true
+    );
+    assert.equal(
+      fs.existsSync(
+        path.join(
+          snapshotDir,
+          'system_extras',
+          'cronjobs',
+          'hestiausr.crontab'
+        )
+      ),
+      true
+    );
+    assert.equal(
+      fs.existsSync(
+        path.join(
+          snapshotDir,
+          'system_extras',
+          'vhosts',
+          'saas-platform.vn.conf'
+        )
+      ),
+      true
+    );
+
+    // Kiểm tra tất cả backup_items (bao gồm cả PostgreSQL .sql.zst) đều PASSED Sandbox Verification
+    const items = db
+      .prepare('SELECT domain_name, verification_status, databases_list FROM backup_items WHERE job_id = ?')
+      .all(hestiaJobId) as Array<{
+      domain_name: string;
+      verification_status: string;
+      databases_list: string;
+    }>;
+    assert.ok(items.length >= 2);
+    for (const it of items) {
+      assert.equal(it.verification_status, 'PASSED');
+    }
+
+    const pgDumpPath = path.join(
+      snapshotDir,
+      'home',
+      'domains',
+      'saas-platform.vn',
+      'databases',
+      'pg_hestiausr_pgdata.sql.zst'
+    );
+    assert.equal(fs.existsSync(pgDumpPath), true);
+    const validPgRes = await verifyPostgresDumpFile(pgDumpPath);
+    assert.equal(validPgRes.ok, true);
+    assert.equal(validPgRes.tablesCount, 2);
+
+    // Kiểm tra file .sql.zst thiếu trailer `PostgreSQL database dump complete` bị từ chối CORRUPTED
+    const zlibZstd = zlibMod.default as typeof zlibMod.default & {
+      zstdCompressSync?: (b: Buffer) => Buffer;
+    };
+    if (typeof zlibZstd.zstdCompressSync === 'function') {
+      const brokenPgPath = path.join(tempRootDir, 'pg_truncated.sql.zst');
+      fs.writeFileSync(
+        brokenPgPath,
+        zlibZstd.zstdCompressSync(
+          Buffer.from(
+            '-- PostgreSQL database dump\nCREATE TABLE public.t1 (id int);\n-- abruptly cut off without trailer',
+            'utf8'
+          )
+        )
+      );
+      const brokenRes = await verifyPostgresDumpFile(brokenPgPath);
+      assert.equal(brokenRes.ok, false);
+      assert.match(brokenRes.error || '', /complete/i);
+    }
+
+    // Kiểm tra syncExtendedHostingExtras trả về 0 ngay lập tức khi tắt cả 3 cờ
+    const zeroExtras = await syncExtendedHostingExtras({
+      jobId: hestiaJobId,
+      server: {
+        id: hestiaServerId,
+        hostname: 'hestia-pg.example.com',
+        ip_address: '103.221.220.245',
+        ssh_port: 22,
+        ssh_user: 'root',
+        ssh_key_path: '',
+        panel_type: 'HESTIACP',
+        assigned_volume_id: vol.id,
+        bw_limit_kbps: 0,
+        status: 'ONLINE',
+        is_mock: 1,
+        backup_mailboxes: 0,
+        backup_cronjobs: 0,
+        backup_vhost_configs: 0,
+        last_connected_at: null,
+        notes: '',
+        created_at: new Date().toISOString(),
+      },
+      domains: [],
+      inProgressDir: tempRootDir,
+      latestSnapshotDir: null,
+      appendLog: () => {},
+    });
+    assert.deepEqual(zeroExtras, { deltaBytes: 0, totalBytes: 0 });
+
+    // 3. Kiểm tra đẩy Snapshot lên Mock S3 Offsite Cloud toàn trình (tar.gz -> AES-256-GCM -> S3 PUT + Prune)
+    const httpMod = await import('node:http');
+    const { Readable } = await import('node:stream');
+    const { pipeline } = await import('node:stream/promises');
+
+    let capturedPutKey = '';
+    let capturedAuthHeader = '';
+    let capturedEncryptedBody = Buffer.alloc(0);
+    const deletedKeys: string[] = [];
+
+    const mockS3Server = httpMod.createServer((req, res) => {
+      const reqUrl = new URL(req.url || '/', 'http://127.0.0.1');
+      if (req.method === 'PUT') {
+        capturedPutKey = reqUrl.pathname;
+        capturedAuthHeader = String(req.headers.authorization || '');
+        const chunks: Buffer[] = [];
+        req.on('data', (c: Buffer) => chunks.push(c));
+        req.on('end', () => {
+          capturedEncryptedBody = Buffer.concat(chunks);
+          res.writeHead(200, { ETag: '"mock-etag-1"' });
+          res.end();
+        });
+        return;
+      }
+      if (req.method === 'GET' && reqUrl.searchParams.get('list-type') === '2') {
+        res.writeHead(200, { 'Content-Type': 'application/xml' });
+        res.end(`<?xml version="1.0" encoding="UTF-8"?>
+          <ListBucketResult>
+            <IsTruncated>false</IsTruncated>
+            <Contents>
+              <Key>nas-sync/hestia-pg.example.com/nas-sync-hestia-pg.example.com-2026-01-01_00-00.tar.gz.enc</Key>
+              <LastModified>2026-01-01T00:00:00.000Z</LastModified>
+            </Contents>
+            <Contents>
+              <Key>nas-sync/hestia-pg.example.com/nas-sync-hestia-pg.example.com-2026-11-02_12-00.tar.gz.enc</Key>
+              <LastModified>2026-11-02T12:00:00.000Z</LastModified>
+            </Contents>
+          </ListBucketResult>`);
+        return;
+      }
+      if (req.method === 'DELETE') {
+        deletedKeys.push(reqUrl.pathname);
+        res.writeHead(204);
+        res.end();
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+
+    await new Promise<void>((resolve) =>
+      mockS3Server.listen(0, '127.0.0.1', () => resolve())
+    );
+    const s3Addr = mockS3Server.address() as { port: number };
+
+    try {
+      setSettings({
+        offsite_provider: 'S3_COMPATIBLE',
+        offsite_s3_preset: 'R2',
+        offsite_s3_endpoint: `http://127.0.0.1:${s3Addr.port}`,
+        offsite_s3_region: 'auto',
+        offsite_s3_bucket: 'vault-bucket',
+        offsite_s3_prefix: 'nas-sync',
+        offsite_s3_access_key: 'R2TESTACCESSKEY',
+        offsite_s3_secret_key: 'R2TESTSECRETKEY',
+        offsite_encryption_passphrase: 'Offsite-Vault-Secret-Passphrase!',
+        offsite_keep_count: '1',
+      });
+
+      const connTest = await testOffsiteConnection({
+        offsite_s3_secret_key: '••••••••', // Phải bỏ qua chuỗi mask và lấy secret thật từ DB!
+      });
+      assert.equal(connTest.ok, true);
+      assert.equal(connTest.providerLabel, 'Cloudflare R2');
+
+      const offsiteJob = await pushSnapshotToOffsiteCloud(hestiaJobId, {
+        triggerSource: 'UNIT_TEST',
+      });
+      assert.equal(offsiteJob.status, 'COMPLETED');
+      assert.ok(offsiteJob.encrypted_size_bytes > 45);
+      assert.match(capturedAuthHeader, /^AWS4-HMAC-SHA256 Credential=R2TESTACCESSKEY\//);
+      assert.match(
+        capturedPutKey,
+        /^\/vault-bucket\/nas-sync\/hestia-pg\.example\.com\/nas-sync-hestia-pg\.example\.com-2026-11-02_12-00\.tar\.gz\.enc$/
+      );
+      // keep_count = 1 -> bản cũ 2026-01-01 tự động bị xóa prune
+      assert.equal(deletedKeys.length, 1);
+      assert.match(deletedKeys[0], /2026-01-01_00-00\.tar\.gz\.enc$/);
+
+      // Giải mã ngược luồng S3 đã tải lên -> phải ra đúng luồng Gzip hợp lệ (magic 0x1f 0x8b)
+      const decryptedTarGzChunks: Buffer[] = [];
+      const dec = createOffsiteDecryptStream('Offsite-Vault-Secret-Passphrase!');
+      dec.on('data', (c: Buffer) => decryptedTarGzChunks.push(c));
+      await pipeline(Readable.from([capturedEncryptedBody]), dec);
+      const tarGzBuf = Buffer.concat(decryptedTarGzChunks);
+      assert.equal(tarGzBuf[0], 0x1f);
+      assert.equal(tarGzBuf[1], 0x8b);
+    } finally {
+      setSettings({ offsite_provider: 'NONE' });
+      await new Promise<void>((resolve) => mockS3Server.close(() => resolve()));
+    }
   });
 });

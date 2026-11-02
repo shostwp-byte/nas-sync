@@ -1,4 +1,17 @@
-export type PanelType = 'DIRECTADMIN' | 'CPANEL' | 'PLESK' | 'AAPANEL';
+export type PanelType =
+  | 'DIRECTADMIN'
+  | 'CPANEL'
+  | 'PLESK'
+  | 'AAPANEL'
+  | 'CYBERPANEL'
+  | 'HESTIACP'
+  | 'CLOUDPANEL';
+
+export type DatabaseEngine = 'MYSQL' | 'POSTGRESQL';
+
+export type OffsiteProviderType = 'NONE' | 'S3_COMPATIBLE' | 'GOOGLE_DRIVE';
+
+export type OffsiteSyncStatus = 'QUEUED' | 'UPLOADING' | 'COMPLETED' | 'FAILED';
 
 export type UserRole = 'ADMIN' | 'OPERATOR' | 'VIEWER';
 
@@ -68,6 +81,9 @@ export interface ServerRecord {
   last_connected_at: string | null;
   notes: string;
   custom_excludes?: string;
+  backup_mailboxes?: number;
+  backup_cronjobs?: number;
+  backup_vhost_configs?: number;
   host_key_fingerprint?: string;
   known_host_entry?: string;
   host_key_status?: HostKeyStatus;
@@ -120,6 +136,7 @@ export interface BackupSchedule {
 export interface DatabaseBackupInfo {
   name: string;
   db_user?: string;
+  engine?: DatabaseEngine;
   file: string;
   size_bytes: number;
   tables_count?: number;
@@ -195,6 +212,7 @@ export interface DiscoveredDomain {
   databases: Array<{
     name: string;
     user?: string;
+    engine?: DatabaseEngine;
   }>;
 }
 
@@ -219,6 +237,7 @@ export interface DomainMetadataJson {
   databases: Array<{
     name: string;
     user?: string;
+    engine?: DatabaseEngine;
     dump_file: string;
     size_bytes: number;
   }>;
@@ -359,6 +378,23 @@ export interface MorningDigestSummary {
     status: VolumeStatus;
   }>;
 }
+
+export interface OffsiteSyncJob {
+  id: number;
+  backup_job_id: number;
+  server_id: number;
+  server_hostname?: string;
+  snapshot_name: string;
+  provider: OffsiteProviderType;
+  remote_object_key: string;
+  status: OffsiteSyncStatus;
+  encrypted_size_bytes: number;
+  duration_seconds: number;
+  error_message: string | null;
+  created_at: string;
+  completed_at: string | null;
+}
+
 
 
 

@@ -1,7 +1,7 @@
 # 🛡️ NAS-Sync — Open-Source Agentless Multi-Panel Backup Platform for Synology NAS
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-emerald.svg)](https://github.com/shostwp-byte/nas-sync/blob/main/LICENSE)
-[![Version](https://img.shields.io/badge/version-1.4.0-blue.svg)](https://github.com/shostwp-byte/nas-sync/releases)
+[![Version](https://img.shields.io/badge/version-1.5.0-blue.svg)](https://github.com/shostwp-byte/nas-sync/releases)
 [![Node.js](https://img.shields.io/badge/Node.js-24%20Alpine-339933.svg)](https://nodejs.org/)
 [![Docker](https://img.shields.io/badge/Synology-Container%20Manager-2496ED.svg)](https://www.synology.com/)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/shostwp-byte/nas-sync/pulls)
@@ -15,12 +15,12 @@
 - **🔌 Kiến trúc Agentless Pull & Zero-Impact trên VPS**:
   - NAS chủ động kết nối một chiều qua SSH Key (`Ed25519` / `RSA`) về VPS — nếu VPS bị tấn công hoặc nhiễm mã độc, hacker **tuyệt đối không có quyền ngược lại** để xóa bản sao lưu trên NAS.
   - Mọi tiến trình đọc file/dump SQL trên VPS đều tự động bọc trong `ionice -c 2 -n 7 nice -n 19` và giới hạn băng thông `--bwlimit`, không gây nghẽn CPU hay Disk I/O của website đang chạy.
-- **🌐 Tự động Quét Đa Control Panel (Đầy đủ Domain, Addon Domain & Subdomain)**:
-  - **DirectAdmin**: Tự động đọc `domains.list`, `<domain>.subdomains`, `<domain>.subdomains.docroot.override` (hỗ trợ cả cấu trúc thư mục độc lập lẫn thư mục con lồng nhau) và MySQL `mysql.conf`.
-  - **cPanel / WHM**: Tự động đọc `/etc/userdatadomains`, `/var/cpanel/userdata/` và `/root/.my.cnf` kèm lọc trùng thông minh.
-  - **Plesk Obsidian**: Truy vấn trực tiếp CSDL `psa` lấy toàn bộ Subscription, Domain & Subdomain kèm ánh xạ Database.
-  - **aaPanel / BT Panel**: Đọc SQLite `default.db` (`sites` + `binding` subdirectory).
+- **🌐 Tự động Quét 7 Control Panel & Đa Hệ Quản trị CSDL (`MySQL/MariaDB` + `PostgreSQL`)**:
+  - **DirectAdmin**, **cPanel / WHM**, **Plesk Obsidian**, **aaPanel / BT Panel**, **CyberPanel (OpenLiteSpeed)**, **HestiaCP**, **CloudPanel**: Tự động khám phá toàn bộ Domain chính, Addon Domain, Subdomain, System User, PHP Version và ánh xạ chính xác cả cơ sở dữ liệu **MySQL/MariaDB** lẫn **PostgreSQL (`pg_dump` / `psql`)**.
+  - **Sao lưu Mở rộng Hệ thống Hosting**: Tùy chọn sao lưu tăng dần Hard-Link **Hộp thư Email (`Maildir/IMAP`)**, **Lịch Crontab của User** và **Cấu hình Webserver Vhost & SSL** vào phân vùng `system_extras/` của từng Snapshot.
   - **Chống sao lưu trùng lặp (Nested Webroot Deduplication)**: Tự động tách riêng các Subdomain nằm lồng bên trong `public_html` của domain cha và bảo vệ thư mục Subdomain khi chạy Restore domain cha.
+- **☁️ Sao lưu Đám mây Offsite Chuẩn `3-2-1` Mã hóa Đầu-Cuối (`AES-256-GCM`)**:
+  - Nén và mã hóa luồng `NASSYNC1` (`PBKDF2-SHA256` 210.000 vòng + `AES-256-GCM` chống cắt cụt) trực tiếp không tốn ổ cứng tạm trên NAS, đẩy tự động hoặc 1-Click lên **Google Drive** (hỗ trợ cả `OAuth2` 1-Click cho Gmail cá nhân / Google One / Workspace lẫn `Service Account JSON` qua `Resumable Upload API v3`), **Cloudflare R2**, **Backblaze B2**, **AWS S3** hoặc **MinIO**, kèm công cụ giải mã khẩn cấp độc lập `scripts/decrypt-offsite-backup.mjs`.
 - **💾 Sao lưu Tăng dần Hard-Link (`rsync --link-dest`) & Zero-Temp-Disk SQL Stream**:
   - Tiết kiệm **85% – 95% dung lượng ổ cứng NAS**: các file không thay đổi giữa các ngày dùng chung Inode vật lý nhưng mỗi ngày vẫn là một cây thư mục hoàn chỉnh độc lập.
   - Stream trực tiếp `mysqldump --single-transaction --quick | zstd -3` qua ống dẫn SSH về thẳng NAS — **không tạo bất kỳ file `.tar.gz`/`.sql` tạm nào trên ổ cứng VPS**.

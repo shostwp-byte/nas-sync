@@ -14,6 +14,9 @@ export const VALID_PANEL_TYPES: ReadonlySet<string> = new Set<PanelType>([
   'CPANEL',
   'PLESK',
   'AAPANEL',
+  'CYBERPANEL',
+  'HESTIACP',
+  'CLOUDPANEL',
 ]);
 
 // Nhãn tên miền chuẩn (bao gồm punycode xn--), không có "..", không bắt đầu bằng "-" hay "."
@@ -98,7 +101,7 @@ export function validateServerConnectionFields(fields: {
     return 'SSH User không hợp lệ (chỉ gồm chữ, số, "_", ".", "-", dài 1–64 ký tự và không bắt đầu bằng "-").';
   }
   if (fields.panelType !== undefined && !isValidPanelType(fields.panelType)) {
-    return 'Loại Control Panel không hợp lệ (chỉ hỗ trợ DIRECTADMIN, CPANEL, PLESK, AAPANEL).';
+    return 'Loại Control Panel không hợp lệ (chỉ hỗ trợ DIRECTADMIN, CPANEL, PLESK, AAPANEL, CYBERPANEL, HESTIACP, CLOUDPANEL).';
   }
   if (
     fields.sshPort !== undefined &&

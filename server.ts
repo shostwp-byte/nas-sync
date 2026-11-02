@@ -142,7 +142,8 @@ function evaluateApiRbac(
       p === '/api/jobs' ||
       /^\/api\/jobs\/[^/]+$/.test(p) ||
       p === '/api/schedules' ||
-      p === '/api/restore')
+      p === '/api/restore' ||
+      p === '/api/offsite')
   ) {
     return { allowed: true };
   }
@@ -166,7 +167,8 @@ function evaluateApiRbac(
     (m === 'POST' && /^\/api\/servers\/[^/]+\/test$/.test(p)) ||
     (m === 'POST' && p === '/api/jobs') ||
     (m === 'PATCH' && /^\/api\/jobs\/[^/]+$/.test(p)) ||
-    (m === 'POST' && p === '/api/schedules/retention')
+    (m === 'POST' && p === '/api/schedules/retention') ||
+    (m === 'POST' && p === '/api/offsite')
   ) {
     if (role === 'ADMIN' || role === 'OPERATOR') {
       return { allowed: true };

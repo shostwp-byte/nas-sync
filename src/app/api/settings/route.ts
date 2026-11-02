@@ -22,6 +22,11 @@ const SECRET_SETTING_KEYS = new Set([
   'dsm_password',
   'telegram_bot_token',
   'github_token',
+  'offsite_encryption_passphrase',
+  'offsite_s3_secret_key',
+  'offsite_gdrive_client_secret',
+  'offsite_gdrive_refresh_token',
+  'offsite_gdrive_service_account_json',
 ]);
 
 const ALLOWED_SETTING_KEYS = new Set([
@@ -52,6 +57,23 @@ const ALLOWED_SETTING_KEYS = new Set([
   'global_exclude_patterns',
   'digest_enabled',
   'digest_cron_time',
+  'offsite_provider',
+  'offsite_auto_push',
+  'offsite_keep_count',
+  'offsite_encryption_passphrase',
+  'offsite_s3_preset',
+  'offsite_s3_endpoint',
+  'offsite_s3_region',
+  'offsite_s3_bucket',
+  'offsite_s3_prefix',
+  'offsite_s3_access_key',
+  'offsite_s3_secret_key',
+  'offsite_gdrive_auth_mode',
+  'offsite_gdrive_folder_id',
+  'offsite_gdrive_client_id',
+  'offsite_gdrive_client_secret',
+  'offsite_gdrive_refresh_token',
+  'offsite_gdrive_service_account_json',
 ]);
 
 const CRON_TRIGGER_KEYS = new Set([
@@ -97,6 +119,35 @@ function applySettingsDictionary(
         );
       }
       sanitized[k] = strVal.trim();
+      continue;
+    }
+    if (k === 'offsite_provider') {
+      const upper = strVal.trim().toUpperCase();
+      if (!['NONE', 'S3_COMPATIBLE', 'GOOGLE_DRIVE'].includes(upper)) {
+        return NextResponse.json(
+          { error: 'Nhà cung cấp Offsite Cloud không hợp lệ.' },
+          { status: 400 }
+        );
+      }
+      sanitized[k] = upper;
+      continue;
+    }
+    if (k === 'offsite_auto_push') {
+      const upper = strVal.trim().toUpperCase();
+      if (!['NONE', 'WEEKLY_SUNDAY', 'EVERY_BACKUP'].includes(upper)) {
+        return NextResponse.json(
+          { error: 'Chế độ tự động đồng bộ Offsite không hợp lệ.' },
+          { status: 400 }
+        );
+      }
+      sanitized[k] = upper;
+      continue;
+    }
+    if (k === 'offsite_keep_count') {
+      const num = parseInt(strVal.trim(), 10);
+      sanitized[k] = String(
+        Number.isFinite(num) && num >= 1 ? Math.min(num, 3650) : 12
+      );
       continue;
     }
     sanitized[k] = strVal;

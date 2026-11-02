@@ -54,6 +54,12 @@ export function getPanelBadgeClass(panel?: PanelType | string): string {
       return 'bg-indigo-500/15 text-indigo-300 border-indigo-500/30';
     case 'AAPANEL':
       return 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30';
+    case 'CYBERPANEL':
+      return 'bg-cyan-500/15 text-cyan-300 border-cyan-500/30';
+    case 'HESTIACP':
+      return 'bg-rose-500/15 text-rose-300 border-rose-500/30';
+    case 'CLOUDPANEL':
+      return 'bg-violet-500/15 text-violet-300 border-violet-500/30';
     default:
       return 'bg-slate-700/40 text-slate-300 border-slate-600';
   }

@@ -86,13 +86,20 @@ copyDirectoryRecursiveLf(
   path.join(stageDir, 'src')
 );
 
-// Sao chép public/ nếu có
+// Sao chép public/ và công cụ giải mã khẩn cấp scripts/decrypt-offsite-backup.mjs nếu có
 const publicSrc = path.join(projectRoot, 'public');
 if (fs.existsSync(publicSrc)) {
   fs.cpSync(publicSrc, path.join(stageDir, 'public'), {
     recursive: true,
     force: true,
   });
+}
+const decryptCliSrc = path.join(projectRoot, 'scripts', 'decrypt-offsite-backup.mjs');
+if (fs.existsSync(decryptCliSrc)) {
+  copyFileNormalizedLf(
+    decryptCliSrc,
+    path.join(stageDir, 'scripts', 'decrypt-offsite-backup.mjs')
+  );
 }
 
 // Sao chép .next/ nhưng loại bỏ hoàn toàn .next/cache/ để giảm dung lượng gói từ ~80MB xuống ~3-6MB

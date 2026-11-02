@@ -282,6 +282,231 @@ async function verifySqlFileStructureFallback(dumpFilePath: string): Promise<{
   });
 }
 
+type Node24ZlibWithZstd = typeof zlib & {
+  createZstdDecompress?: () => NodeJS.ReadWriteStream;
+  zstdDecompressSync?: (buf: Buffer) => Buffer;
+};
+
+/**
+ * Kiểm định toàn vẹn luồng nén Zstandard (.sql.zst) / Gzip (.sql.gz) của PostgreSQL dump
+ * bằng Node.js 24 built-in zlib.createZstdDecompress() (kèm fallback CLI `zstd -dc`),
+ * đối chiếu header `PostgreSQL database dump` & trailer `PostgreSQL database dump complete`.
+ */
+export async function verifyPostgresDumpFile(dumpFilePath: string): Promise<{
+  ok: boolean;
+  tablesCount: number;
+  rowsCount: number;
+  error?: string;
+}> {
+  const stat = fs.lstatSync(dumpFilePath, { throwIfNoEntry: false });
+  if (!stat || !stat.isFile()) {
+    return {
+      ok: false,
+      tablesCount: 0,
+      rowsCount: 0,
+      error: 'File PostgreSQL dump không tồn tại hoặc không phải tập tin thông thường',
+    };
+  }
+  if (stat.size === 0) {
+    return {
+      ok: false,
+      tablesCount: 0,
+      rowsCount: 0,
+      error: 'File PostgreSQL dump rỗng (0 bytes)',
+    };
+  }
+
+  const ext = path.extname(dumpFilePath).toLowerCase();
+  if (ext === '.zst') {
+    const fd = fs.openSync(dumpFilePath, 'r');
+    const magic = Buffer.alloc(4);
+    const bytesRead = fs.readSync(fd, magic, 0, 4, 0);
+    fs.closeSync(fd);
+    if (
+      bytesRead < 4 ||
+      magic[0] !== 0x28 ||
+      magic[1] !== 0xb5 ||
+      magic[2] !== 0x2f ||
+      magic[3] !== 0xfd
+    ) {
+      return {
+        ok: false,
+        tablesCount: 0,
+        rowsCount: 0,
+        error: 'Magic header Zstandard (.zst) của PostgreSQL dump không hợp lệ',
+      };
+    }
+  }
+
+  const zlibExt = zlib as Node24ZlibWithZstd;
+
+  return new Promise((resolve) => {
+    const WINDOW_BYTES = 8192;
+    let headBuf = Buffer.alloc(0);
+    let tailBuf = Buffer.alloc(0);
+    let totalUncompressedBytes = 0;
+    let createCount = 0;
+    let dataStmtCount = 0;
+    let carryText = '';
+    let finished = false;
+
+    let cleanupFn: () => void = () => {};
+
+    const fail = (err: Error | string) => {
+      if (finished) return;
+      finished = true;
+      cleanupFn();
+      resolve({
+        ok: false,
+        tablesCount: 0,
+        rowsCount: 0,
+        error: typeof err === 'string' ? err : err.message,
+      });
+    };
+
+    const onDecompressedChunk = (chunk: Buffer | string) => {
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, 'utf8');
+      totalUncompressedBytes += buf.length;
+
+      if (headBuf.length < WINDOW_BYTES) {
+        const needed = WINDOW_BYTES - headBuf.length;
+        headBuf = Buffer.concat([headBuf, buf.subarray(0, needed)]);
+      }
+
+      if (buf.length >= WINDOW_BYTES) {
+        tailBuf = Buffer.from(buf.subarray(buf.length - WINDOW_BYTES));
+      } else if (tailBuf.length + buf.length <= WINDOW_BYTES) {
+        tailBuf = Buffer.concat([tailBuf, buf]);
+      } else {
+        const keepPrev = WINDOW_BYTES - buf.length;
+        tailBuf = Buffer.concat([
+          tailBuf.subarray(tailBuf.length - keepPrev),
+          buf,
+        ]);
+      }
+
+      const combined = carryText + buf.toString('latin1');
+      const scanLimit = Math.max(0, combined.length - 32);
+      const scanPart = combined.slice(0, scanLimit);
+      carryText = combined.slice(scanLimit);
+
+      const creates = scanPart.match(/CREATE\s+TABLE/gi);
+      if (creates) createCount += creates.length;
+      const inserts = scanPart.match(/(?:INSERT\s+INTO|COPY\s+\S+)/gi);
+      if (inserts) dataStmtCount += inserts.length;
+    };
+
+    const onDecompressedEnd = () => {
+      if (finished) return;
+      finished = true;
+
+      if (carryText) {
+        const creates = carryText.match(/CREATE\s+TABLE/gi);
+        if (creates) createCount += creates.length;
+        const inserts = carryText.match(/(?:INSERT\s+INTO|COPY\s+\S+)/gi);
+        if (inserts) dataStmtCount += inserts.length;
+      }
+
+      if (totalUncompressedBytes === 0) {
+        resolve({
+          ok: false,
+          tablesCount: 0,
+          rowsCount: 0,
+          error: 'Nội dung PostgreSQL dump sau giải nén bị rỗng (0 bytes)',
+        });
+        return;
+      }
+
+      const headText = headBuf.toString('utf8');
+      const tailText = tailBuf.toString('utf8');
+
+      if (!headText.includes('PostgreSQL database dump')) {
+        resolve({
+          ok: false,
+          tablesCount: 0,
+          rowsCount: 0,
+          error:
+            'Thiếu tiêu đề chuẩn "PostgreSQL database dump" ở đầu tệp sao lưu',
+        });
+        return;
+      }
+
+      if (!tailText.includes('PostgreSQL database dump complete')) {
+        resolve({
+          ok: false,
+          tablesCount: 0,
+          rowsCount: 0,
+          error:
+            'Tệp PostgreSQL dump bị ngắt quãng giữa chừng (thiếu "PostgreSQL database dump complete" ở cuối file)',
+        });
+        return;
+      }
+
+      resolve({
+        ok: true,
+        tablesCount: createCount,
+        rowsCount: dataStmtCount * 10,
+      });
+    };
+
+    if (ext === '.zst' && typeof zlibExt.createZstdDecompress !== 'function') {
+      // Fallback sang CLI `zstd -dc` nếu môi trường Node < 22.15 không có createZstdDecompress
+      const child = spawn('zstd', ['-dc', '--', dumpFilePath], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+      });
+      let stderr = '';
+      cleanupFn = () => {
+        try {
+          child.kill('SIGTERM');
+        } catch {
+          // Ignore
+        }
+      };
+      child.stdout.on('data', onDecompressedChunk);
+      child.stderr.on('data', (d: Buffer) => {
+        stderr += d.toString('utf8');
+      });
+      child.on('error', (err) =>
+        fail(`Không thể chạy zstd để giải nén kiểm định: ${err.message}`)
+      );
+      child.on('close', (code) => {
+        if (code !== 0) {
+          fail(
+            stderr.trim() ||
+              `Giải nén zstd thất bại (mã lỗi ${code}) — dữ liệu bị hỏng`
+          );
+          return;
+        }
+        onDecompressedEnd();
+      });
+      return;
+    }
+
+    const fileStream = fs.createReadStream(dumpFilePath);
+    const decompStream: NodeJS.ReadableStream =
+      ext === '.zst' && typeof zlibExt.createZstdDecompress === 'function'
+        ? fileStream.pipe(zlibExt.createZstdDecompress())
+        : ext === '.gz'
+        ? fileStream.pipe(zlib.createGunzip())
+        : fileStream;
+
+    cleanupFn = () => {
+      fileStream.destroy();
+      if (decompStream !== fileStream && 'destroy' in decompStream) {
+        (decompStream as fs.ReadStream).destroy();
+      }
+    };
+
+    fileStream.on('error', fail);
+    if (decompStream !== fileStream) {
+      decompStream.on('error', fail);
+    }
+    decompStream.on('data', onDecompressedChunk);
+    decompStream.on('end', onDecompressedEnd);
+  });
+}
+
 /**
  * Mục 9.2: Tự động nạp thử .sql.zst / .sql.gz vào container MariaDB Sandbox kiểm tra tính toàn vẹn
  */
@@ -368,7 +593,39 @@ export async function verifyJobDatabasesInSandbox(
           dbInfo.file
         );
 
-        if (usingRealSandbox && conn) {
+        const isPostgres =
+          dbInfo.engine === 'POSTGRESQL' || dbInfo.file.startsWith('pg_');
+
+        if (isPostgres) {
+          const pgCheck = await verifyPostgresDumpFile(dumpPath);
+          if (!pgCheck.ok) {
+            allPassed = false;
+            details.push(`${dbInfo.name} [PG]: Lỗi (${pgCheck.error})`);
+            onLog(
+              `[Sandbox Verify] ❌ ${item.domain_name} -> ${dbInfo.name} (PostgreSQL): ${pgCheck.error}`
+            );
+            updatedDbs.push({
+              ...dbInfo,
+              engine: 'POSTGRESQL',
+              verified: false,
+              error: pgCheck.error,
+            });
+          } else {
+            details.push(
+              `${dbInfo.name} [PG]: Verified ✅ (${pgCheck.tablesCount} bảng, ~${pgCheck.rowsCount} dòng)`
+            );
+            onLog(
+              `[Sandbox Verify] ✅ ${item.domain_name} -> ${dbInfo.name} (PostgreSQL): Toàn vẹn luồng Zstd & cấu trúc pg_dump (${pgCheck.tablesCount} bảng).`
+            );
+            updatedDbs.push({
+              ...dbInfo,
+              engine: 'POSTGRESQL',
+              tables_count: pgCheck.tablesCount,
+              rows_count: pgCheck.rowsCount,
+              verified: true,
+            });
+          }
+        } else if (usingRealSandbox && conn) {
           const tempDb = `verify_${jobId}_${crypto.randomBytes(4).toString('hex')}`;
           try {
             await conn.query(

@@ -181,6 +181,9 @@ function initializeSchema(db: SqliteDatabase) {
       last_connected_at TEXT,
       notes TEXT NOT NULL DEFAULT '',
       custom_excludes TEXT NOT NULL DEFAULT '',
+      backup_mailboxes INTEGER NOT NULL DEFAULT 0,
+      backup_cronjobs INTEGER NOT NULL DEFAULT 0,
+      backup_vhost_configs INTEGER NOT NULL DEFAULT 0,
       host_key_fingerprint TEXT NOT NULL DEFAULT '',
       known_host_entry TEXT NOT NULL DEFAULT '',
       host_key_status TEXT NOT NULL DEFAULT 'UNPINNED',
@@ -284,11 +287,27 @@ function initializeSchema(db: SqliteDatabase) {
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    CREATE TABLE IF NOT EXISTS offsite_sync_jobs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      backup_job_id INTEGER NOT NULL REFERENCES backup_jobs(id) ON DELETE CASCADE,
+      server_id INTEGER NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+      snapshot_name TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      remote_object_key TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'QUEUED',
+      encrypted_size_bytes INTEGER NOT NULL DEFAULT 0,
+      duration_seconds INTEGER NOT NULL DEFAULT 0,
+      error_message TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      completed_at TEXT
+    );
+
     CREATE INDEX IF NOT EXISTS idx_jobs_server_status ON backup_jobs(server_id, status);
     CREATE INDEX IF NOT EXISTS idx_items_job ON backup_items(job_id);
     CREATE INDEX IF NOT EXISTS idx_items_server_domain ON backup_items(server_id, domain_name);
     CREATE INDEX IF NOT EXISTS idx_alerts_created ON system_alerts(created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs(created_at DESC, id DESC);
+    CREATE INDEX IF NOT EXISTS idx_offsite_created ON offsite_sync_jobs(created_at DESC, id DESC);
   `);
 
   // Tự động nâng cấp lược đồ CSDL an toàn cho các bản cài đặt từ v1.0.0 / v1.1.x / v1.2.x
@@ -322,6 +341,9 @@ function initializeSchema(db: SqliteDatabase) {
     `ALTER TABLE backup_items ADD COLUMN is_subdomain INTEGER NOT NULL DEFAULT 0`,
     `ALTER TABLE backup_items ADD COLUMN parent_domain TEXT`,
     `ALTER TABLE servers ADD COLUMN custom_excludes TEXT NOT NULL DEFAULT ''`,
+    `ALTER TABLE servers ADD COLUMN backup_mailboxes INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE servers ADD COLUMN backup_cronjobs INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE servers ADD COLUMN backup_vhost_configs INTEGER NOT NULL DEFAULT 0`,
     `ALTER TABLE servers ADD COLUMN host_key_fingerprint TEXT NOT NULL DEFAULT ''`,
     `ALTER TABLE servers ADD COLUMN known_host_entry TEXT NOT NULL DEFAULT ''`,
     `ALTER TABLE servers ADD COLUMN host_key_status TEXT NOT NULL DEFAULT 'UNPINNED'`,
@@ -467,6 +489,23 @@ function seedDefaults(db: SqliteDatabase) {
     global_exclude_patterns: '',
     digest_enabled: 'false',
     digest_cron_time: '0 7 * * *',
+    offsite_provider: 'NONE',
+    offsite_auto_push: 'NONE',
+    offsite_keep_count: '12',
+    offsite_encryption_passphrase: '',
+    offsite_s3_preset: 'R2',
+    offsite_s3_endpoint: '',
+    offsite_s3_region: 'auto',
+    offsite_s3_bucket: '',
+    offsite_s3_prefix: 'nas-sync',
+    offsite_s3_access_key: '',
+    offsite_s3_secret_key: '',
+    offsite_gdrive_auth_mode: 'OAUTH2',
+    offsite_gdrive_folder_id: '',
+    offsite_gdrive_client_id: '',
+    offsite_gdrive_client_secret: '',
+    offsite_gdrive_refresh_token: '',
+    offsite_gdrive_service_account_json: '',
   };
 
   const insertSetting = db.prepare(
