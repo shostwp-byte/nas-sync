@@ -44,7 +44,13 @@ import type {
   UserRole,
 } from '@/types';
 
-type SettingsTab = 'config' | 'account' | 'rbac' | 'audit' | 'update';
+type SettingsTab =
+  | 'config'
+  | 'backup'
+  | 'account'
+  | 'rbac'
+  | 'audit'
+  | 'update';
 
 const EMERGENCY_DECRYPT_CMD =
   'node scripts/decrypt-offsite-backup.mjs <file.tar.gz.enc> <out.tar.gz> "<passphrase>"';
@@ -436,6 +442,7 @@ export default function SettingsPage() {
     const tabParam = params.get('tab');
     if (
       tabParam === 'config' ||
+      tabParam === 'backup' ||
       tabParam === 'account' ||
       tabParam === 'rbac' ||
       tabParam === 'audit' ||
@@ -450,20 +457,21 @@ export default function SettingsPage() {
         ok: true,
         text: '✅ Đã liên kết tài khoản Google Drive thành công!',
       });
-      setActiveTab('config');
+      setActiveTab('backup');
       window.history.replaceState({}, '', window.location.pathname);
     } else if (gdriveError) {
       setGdriveOAuthBanner({
         ok: false,
         text: `❌ Liên kết tài khoản Google Drive thất bại: ${gdriveError}`,
       });
-      setActiveTab('config');
+      setActiveTab('backup');
       window.history.replaceState({}, '', window.location.pathname);
     }
 
     const handleTabEvent = (ev: Event) => {
       const detail = (ev as CustomEvent<SettingsTab>).detail;
       if (detail) {
+        setFeedback('');
         setActiveTab(detail);
       }
     };
@@ -475,12 +483,12 @@ export default function SettingsPage() {
 
   // Auto-refresh Offsite sync transfers when realtime events arrive or while an upload is active
   useEffect(() => {
-    if (!isAdmin || activeTab !== 'config' || lastUpdateCounter === 0) return;
+    if (!isAdmin || activeTab !== 'backup' || lastUpdateCounter === 0) return;
     void loadOffsiteJobs();
   }, [isAdmin, activeTab, lastUpdateCounter, loadOffsiteJobs]);
 
   useEffect(() => {
-    if (!isAdmin || activeTab !== 'config') return;
+    if (!isAdmin || activeTab !== 'backup') return;
     const hasActiveUpload = offsiteJobs.some(
       (j) => j.status === 'QUEUED' || j.status === 'UPLOADING'
     );
@@ -493,12 +501,14 @@ export default function SettingsPage() {
 
   useEffect(() => {
     if (!currentUser || currentUser.role !== 'ADMIN') return;
-    if (activeTab === 'rbac') {
+    if (activeTab === 'backup') {
+      void loadOffsiteJobs();
+    } else if (activeTab === 'rbac') {
       void loadUsers();
     } else if (activeTab === 'audit') {
       void loadAuditLogs();
     }
-  }, [activeTab, currentUser, loadUsers, loadAuditLogs]);
+  }, [activeTab, currentUser, loadOffsiteJobs, loadUsers, loadAuditLogs]);
 
   // Tự động kiểm tra dịch vụ và tải lại trình duyệt sau khi container khởi động lại hoàn tất
   useEffect(() => {
@@ -1271,22 +1281,52 @@ export default function SettingsPage() {
       {/* Section Tab Bar (Wrapped & Scroll-Safe down to 320px) */}
       <div className="flex flex-wrap gap-1.5 p-1.5 bg-slate-900 border border-slate-800 rounded-2xl text-xs">
         {isAdmin && (
-          <button
-            type="button"
-            onClick={() => setActiveTab('config')}
-            className={`flex-1 sm:flex-initial min-h-[42px] px-3.5 py-2 rounded-xl font-semibold inline-flex items-center justify-center gap-1.5 transition-all ${
-              activeTab === 'config'
-                ? 'bg-blue-600 text-white shadow-lg shadow-blue-600/20'
-                : 'text-slate-400 hover:text-white hover:bg-slate-800/70'
-            }`}
-          >
-            <span>⚙️ Cấu hình Hệ thống</span>
-          </button>
+          <>
+            <button
+              type="button"
+              onClick={() => {
+                setFeedback('');
+                setActiveTab('config');
+              }}
+              className={`flex-1 sm:flex-initial min-h-[42px] px-3.5 py-2 rounded-xl font-semibold inline-flex items-center justify-center gap-1.5 transition-all ${
+                activeTab === 'config'
+                  ? 'bg-blue-600 text-white shadow-lg shadow-blue-600/20'
+                  : 'text-slate-400 hover:text-white hover:bg-slate-800/70'
+              }`}
+            >
+              <span>⚙️ Cấu hình Hệ thống</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => {
+                setFeedback('');
+                setActiveTab('backup');
+              }}
+              className={`flex-1 sm:flex-initial min-h-[42px] px-3.5 py-2 rounded-xl font-semibold inline-flex items-center justify-center gap-1.5 transition-all ${
+                activeTab === 'backup'
+                  ? 'bg-blue-600 text-white shadow-lg shadow-blue-600/20'
+                  : 'text-slate-400 hover:text-white hover:bg-slate-800/70'
+              }`}
+            >
+              <Cloud className="w-3.5 h-3.5 shrink-0" />
+              <span>Sao lưu</span>
+              {settings.offsite_provider &&
+                settings.offsite_provider !== 'NONE' && (
+                  <span className="px-1.5 py-0.5 text-[10px] rounded bg-emerald-500/20 text-emerald-200 border border-emerald-400/30">
+                    ON
+                  </span>
+                )}
+            </button>
+          </>
         )}
 
         <button
           type="button"
-          onClick={() => setActiveTab('account')}
+          onClick={() => {
+            setFeedback('');
+            setActiveTab('account');
+          }}
           className={`flex-1 sm:flex-initial min-h-[42px] px-3.5 py-2 rounded-xl font-semibold inline-flex items-center justify-center gap-1.5 transition-all ${
             activeTab === 'account'
               ? 'bg-blue-600 text-white shadow-lg shadow-blue-600/20'
@@ -1305,7 +1345,10 @@ export default function SettingsPage() {
           <>
             <button
               type="button"
-              onClick={() => setActiveTab('rbac')}
+              onClick={() => {
+                setFeedback('');
+                setActiveTab('rbac');
+              }}
               className={`flex-1 sm:flex-initial min-h-[42px] px-3.5 py-2 rounded-xl font-semibold inline-flex items-center justify-center gap-1.5 transition-all ${
                 activeTab === 'rbac'
                   ? 'bg-blue-600 text-white shadow-lg shadow-blue-600/20'
@@ -1317,7 +1360,10 @@ export default function SettingsPage() {
 
             <button
               type="button"
-              onClick={() => setActiveTab('audit')}
+              onClick={() => {
+                setFeedback('');
+                setActiveTab('audit');
+              }}
               className={`flex-1 sm:flex-initial min-h-[42px] px-3.5 py-2 rounded-xl font-semibold inline-flex items-center justify-center gap-1.5 transition-all ${
                 activeTab === 'audit'
                   ? 'bg-blue-600 text-white shadow-lg shadow-blue-600/20'
@@ -1329,7 +1375,10 @@ export default function SettingsPage() {
 
             <button
               type="button"
-              onClick={() => setActiveTab('update')}
+              onClick={() => {
+                setFeedback('');
+                setActiveTab('update');
+              }}
               className={`flex-1 sm:flex-initial min-h-[42px] px-3.5 py-2 rounded-xl font-semibold inline-flex items-center justify-center gap-1.5 transition-all ${
                 activeTab === 'update'
                   ? 'bg-blue-600 text-white shadow-lg shadow-blue-600/20'
@@ -1349,9 +1398,9 @@ export default function SettingsPage() {
       </div>
 
       {/* =====================================================================
-          TAB 1: CẤU HÌNH HỆ THỐNG (ADMIN ONLY)
+          TAB SAO LƯU: OFFSITE CLOUD 3-2-1 AES-256-GCM (ADMIN ONLY)
          ===================================================================== */}
-      {isAdmin && activeTab === 'config' && (
+      {isAdmin && activeTab === 'backup' && (
         <div className="space-y-6">
           {gdriveOAuthBanner && (
             <div
@@ -1428,7 +1477,7 @@ export default function SettingsPage() {
                       <h3 className="text-sm font-bold text-white flex items-center gap-2 flex-wrap">
                         <Cloud className="w-4 h-4 text-cyan-400 shrink-0" />
                         <span>
-                          ☁️ Sao lưu Đám mây Offsite chuẩn 3-2-1 (Mã hóa Đầu-Cuối
+                          Sao lưu Đám mây Offsite chuẩn 3-2-1 (Mã hóa Đầu-Cuối
                           AES-256-GCM)
                         </span>
                       </h3>
@@ -2166,6 +2215,23 @@ export default function SettingsPage() {
                     </div>
                   )}
 
+                  {offsiteProvider === 'NONE' && (
+                    <div className="flex justify-end pt-2 border-t border-slate-800/80">
+                      <button
+                        type="submit"
+                        disabled={saving}
+                        className="w-full sm:w-auto justify-center min-h-[42px] inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white font-semibold shadow-lg shadow-blue-600/20 transition-colors"
+                      >
+                        <Save className="w-4 h-4 shrink-0" />
+                        <span>
+                          {saving
+                            ? 'Đang lưu...'
+                            : 'Lưu Cấu hình Offsite 3-2-1'}
+                        </span>
+                      </button>
+                    </div>
+                  )}
+
                   {/* Recent Offsite Transfers History */}
                   {(offsiteProvider !== 'NONE' || offsiteJobs.length > 0) && (
                     <div className="pt-3 border-t border-slate-800 space-y-3">
@@ -2345,11 +2411,32 @@ export default function SettingsPage() {
                 </div>
               );
             })()}
+          </form>
+        </div>
+      )}
 
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-              {/* Left Column: Telegram & SMTP + Global Exclude Rules */}
-              <div className="space-y-6">
-                <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-6 space-y-4">
+      {/* =====================================================================
+          TAB 1: CẤU HÌNH HỆ THỐNG (ADMIN ONLY)
+         ===================================================================== */}
+      {isAdmin && activeTab === 'config' && (
+        <div className="space-y-6">
+          {feedback && (
+            <div
+              className={`p-3.5 rounded-xl border text-xs break-words ${
+                feedback.startsWith('❌')
+                  ? 'bg-rose-500/15 border-rose-500/35 text-rose-200'
+                  : 'bg-emerald-500/15 border-emerald-500/35 text-emerald-200'
+              }`}
+            >
+              {feedback}
+            </div>
+          )}
+
+          <form onSubmit={handleSaveSettings} className="space-y-6 text-xs">
+            {/* Row 1: Telegram & SMTP (Left) + Anomaly Detection & Synology DSM Btrfs WORM (Right) */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 items-start">
+              {/* Left Column: Telegram & SMTP */}
+              <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-6 space-y-4">
                   <div className="flex items-center justify-between gap-2 flex-wrap">
                     <h3 className="text-sm font-bold text-white flex items-center gap-2">
                       <BellRing className="w-4 h-4 text-cyan-400 shrink-0" />
@@ -2555,109 +2642,262 @@ export default function SettingsPage() {
                   </div>
                 </div>
 
-                {/* Daily Morning Digest Card */}
-                <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-6 space-y-4">
-                  <div className="flex flex-wrap items-start justify-between gap-3">
-                    <div className="min-w-0 space-y-1 flex-1">
-                      <h3 className="text-sm font-bold text-white flex items-center gap-2">
-                        <CalendarClock className="w-4 h-4 text-emerald-400 shrink-0" />
-                        <span>
-                          Báo cáo Tổng hợp Sáng sớm (Daily Morning Digest)
-                        </span>
-                      </h3>
-                      <p className="text-[11px] text-slate-400 leading-relaxed">
-                        Tự động gửi bản tin tổng kết 24 giờ qua (Job thành công/lỗi,
-                        dung lượng Delta thực tốn, SQL Verified, sức khỏe Volume
-                        NAS &amp; khóa SSH TOFU) qua Telegram &amp; Email mỗi sáng.
-                      </p>
+                {/* Right Column: Anomaly Detection & Synology DSM Btrfs API */}
+                <div className="space-y-6">
+                  <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-6 space-y-4">
+                    <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                      <ShieldAlert className="w-4 h-4 text-amber-400 shrink-0" />
+                      <span>
+                        Ngưỡng Phát hiện Sớm Ransomware (Anomaly Detection)
+                      </span>
+                    </h3>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                      <div className="flex flex-col justify-between">
+                        <label className="block text-slate-400 mb-1">
+                          Tỷ lệ file thay đổi tối đa / ngày (%)
+                        </label>
+                        <input
+                          type="number"
+                          value={settings.anomaly_max_changed_percent || '50'}
+                          onChange={(e) =>
+                            updateField(
+                              'anomaly_max_changed_percent',
+                              e.target.value
+                            )
+                          }
+                          className="w-full min-h-[42px] bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white font-mono"
+                        />
+                      </div>
+                      <div className="flex flex-col justify-between">
+                        <label className="block text-slate-400 mb-1">
+                          Dung lượng tăng đột biến tối đa (GB)
+                        </label>
+                        <input
+                          type="number"
+                          value={settings.anomaly_max_delta_gb || '10'}
+                          onChange={(e) =>
+                            updateField('anomaly_max_delta_gb', e.target.value)
+                          }
+                          className="w-full min-h-[42px] bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white font-mono"
+                        />
+                      </div>
                     </div>
+                    <p className="text-[11px] text-slate-500">
+                      Khi vượt ngưỡng, hệ thống gửi cảnh báo Telegram khẩn cấp và
+                      tự động khóa (Pin) toàn bộ các bản sao lưu sạch trước đó.
+                    </p>
+                  </div>
 
-                    {/* Accessible Switch for digest_enabled */}
-                    <button
-                      type="button"
-                      role="switch"
-                      aria-checked={settings.digest_enabled === 'true'}
-                      onClick={handleToggleDigestEnabled}
-                      className={`min-h-[38px] px-3 py-1.5 rounded-xl border inline-flex items-center gap-2 font-semibold transition-all shrink-0 ${
-                        settings.digest_enabled === 'true'
-                          ? 'bg-emerald-500/20 border-emerald-500/40 text-emerald-300'
-                          : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
-                      }`}
-                    >
-                      <span
-                        className={`w-8 h-4 rounded-full relative transition-colors inline-block ${
+                  <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-6 space-y-4">
+                    <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                      <Lock className="w-4 h-4 text-emerald-400 shrink-0" />
+                      <span>
+                        Tích hợp Synology DSM Btrfs Immutable Snapshot (WORM)
+                      </span>
+                    </h3>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      <div className="flex flex-col justify-between">
+                        <label className="block text-slate-400 mb-1">
+                          Synology DSM URL
+                        </label>
+                        <input
+                          value={settings.dsm_api_url || ''}
+                          onChange={(e) =>
+                            updateField('dsm_api_url', e.target.value)
+                          }
+                          placeholder="https://192.168.1.10:5001"
+                          className="w-full min-h-[42px] bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white font-mono"
+                        />
+                      </div>
+                      <div className="flex flex-col justify-between">
+                        <label className="block text-slate-400 mb-1">
+                          Shared Folders (cách nhau dấu phẩy)
+                        </label>
+                        <input
+                          value={settings.dsm_backup_shares || 'VPS_Backups'}
+                          onChange={(e) =>
+                            updateField('dsm_backup_shares', e.target.value)
+                          }
+                          className="w-full min-h-[42px] bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white font-mono"
+                        />
+                      </div>
+                    </div>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      <div className="flex flex-col justify-between">
+                        <label className="block text-slate-400 mb-1">
+                          DSM Admin User
+                        </label>
+                        <input
+                          value={settings.dsm_username || ''}
+                          onChange={(e) =>
+                            updateField('dsm_username', e.target.value)
+                          }
+                          className="w-full min-h-[42px] bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white"
+                        />
+                      </div>
+                      <div className="flex flex-col justify-between">
+                        <label className="block text-slate-400 mb-1">
+                          DSM Password
+                        </label>
+                        <div className="relative">
+                          <input
+                            type={showDsmPass ? 'text' : 'password'}
+                            value={settings.dsm_password || ''}
+                            onChange={(e) =>
+                              updateField('dsm_password', e.target.value)
+                            }
+                            className="w-full min-h-[42px] bg-slate-950 border border-slate-800 rounded-lg pl-3 pr-10 py-2 text-white"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => setShowDsmPass((v) => !v)}
+                            aria-label={
+                              showDsmPass
+                                ? 'Ẩn mật khẩu DSM'
+                                : 'Hiện mật khẩu DSM'
+                            }
+                            className="h-9 w-9 inline-flex items-center justify-center rounded-md text-slate-400 hover:text-white absolute right-1 top-1/2 -translate-y-1/2"
+                          >
+                            {showDsmPass ? (
+                              <EyeOff className="w-4 h-4" />
+                            ) : (
+                              <Eye className="w-4 h-4" />
+                            )}
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                    <label className="flex items-start gap-2.5 text-slate-300 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={settings.btrfs_auto_enabled === 'true'}
+                        onChange={(e) =>
+                          updateField(
+                            'btrfs_auto_enabled',
+                            e.target.checked ? 'true' : 'false'
+                          )
+                        }
+                        className="mt-0.5 shrink-0"
+                      />
+                      <span>
+                        Tự động tạo Btrfs WORM Snapshot lúc 06:00 AM hàng ngày
+                        (Khóa chống xóa 7 ngày)
+                      </span>
+                    </label>
+                  </div>
+                </div>
+              </div>
+
+              {/* Row 2: Daily Morning Digest (Left) + Global Exclude Rules (Right — Horizontal Pair) */}
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 items-stretch">
+                {/* Daily Morning Digest Card */}
+                <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-6 space-y-4 flex flex-col justify-between">
+                  <div className="space-y-4">
+                    <div className="flex flex-wrap items-start justify-between gap-3">
+                      <div className="min-w-0 space-y-1 flex-1">
+                        <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                          <CalendarClock className="w-4 h-4 text-emerald-400 shrink-0" />
+                          <span>
+                            Báo cáo Tổng hợp Sáng sớm (Daily Morning Digest)
+                          </span>
+                        </h3>
+                        <p className="text-[11px] text-slate-400 leading-relaxed">
+                          Tự động gửi bản tin tổng kết 24 giờ qua (Job thành công/lỗi,
+                          dung lượng Delta thực tốn, SQL Verified, sức khỏe Volume
+                          NAS &amp; khóa SSH TOFU) qua Telegram &amp; Email mỗi sáng.
+                        </p>
+                      </div>
+
+                      {/* Accessible Switch for digest_enabled */}
+                      <button
+                        type="button"
+                        role="switch"
+                        aria-checked={settings.digest_enabled === 'true'}
+                        onClick={handleToggleDigestEnabled}
+                        className={`min-h-[38px] px-3 py-1.5 rounded-xl border inline-flex items-center gap-2 font-semibold transition-all shrink-0 ${
                           settings.digest_enabled === 'true'
-                            ? 'bg-emerald-500'
-                            : 'bg-slate-700'
+                            ? 'bg-emerald-500/20 border-emerald-500/40 text-emerald-300'
+                            : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
                         }`}
                       >
                         <span
-                          className={`w-3 h-3 rounded-full bg-white absolute top-0.5 transition-all ${
+                          className={`w-8 h-4 rounded-full relative transition-colors inline-block ${
                             settings.digest_enabled === 'true'
-                              ? 'left-4'
-                              : 'left-0.5'
+                              ? 'bg-emerald-500'
+                              : 'bg-slate-700'
                           }`}
-                        />
-                      </span>
-                      <span>
-                        {settings.digest_enabled === 'true'
-                          ? 'Đang bật'
-                          : 'Đang tắt'}
-                      </span>
-                    </button>
-                  </div>
-
-                  <div className="space-y-2.5">
-                    <label className="block text-slate-400">
-                      Khung giờ gửi tự động hàng ngày (Chọn nhanh hoặc nhập biểu thức Cron)
-                    </label>
-                    <div className="flex flex-wrap items-center gap-1.5">
-                      {DIGEST_CRON_PRESETS.map((preset) => {
-                        const activeCron =
-                          (settings.digest_cron_time || '0 7 * * *').trim() ===
-                          preset.cron;
-                        return (
-                          <button
-                            key={preset.cron}
-                            type="button"
-                            onClick={() =>
-                              updateField('digest_cron_time', preset.cron)
-                            }
-                            className={`min-h-[38px] px-3 py-1.5 rounded-lg border font-mono text-xs font-medium transition-colors ${
-                              activeCron
-                                ? 'bg-cyan-500/20 border-cyan-500/40 text-cyan-300'
-                                : 'bg-slate-950 border-slate-800 text-slate-300 hover:bg-slate-800'
+                        >
+                          <span
+                            className={`w-3 h-3 rounded-full bg-white absolute top-0.5 transition-all ${
+                              settings.digest_enabled === 'true'
+                                ? 'left-4'
+                                : 'left-0.5'
                             }`}
-                          >
-                            ⏰ {preset.label}
-                          </button>
-                        );
-                      })}
-                    </div>
-
-                    <div className="flex flex-col sm:flex-row sm:items-center gap-2.5 pt-1">
-                      <input
-                        value={settings.digest_cron_time ?? '0 7 * * *'}
-                        onChange={(e) =>
-                          updateField('digest_cron_time', e.target.value)
-                        }
-                        placeholder="0 7 * * *"
-                        aria-label="Biểu thức Cron cho Báo cáo Sáng sớm"
-                        className="flex-1 min-w-0 min-h-[42px] bg-slate-950 border border-slate-800 focus:border-cyan-500 rounded-lg px-3 py-2 text-white font-mono outline-none"
-                      />
-                      <button
-                        type="button"
-                        onClick={() => void handleTestMorningDigest()}
-                        disabled={testingDigest}
-                        className="w-full sm:w-auto justify-center min-h-[42px] whitespace-nowrap inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-emerald-600/20 hover:bg-emerald-600 text-emerald-300 hover:text-white border border-emerald-500/35 font-semibold disabled:opacity-50 transition-all"
-                      >
+                          />
+                        </span>
                         <span>
-                          {testingDigest
-                            ? '⏳ Đang tổng hợp & gửi...'
-                            : '📨 Gửi thử Báo cáo Sáng ngay'}
+                          {settings.digest_enabled === 'true'
+                            ? 'Đang bật'
+                            : 'Đang tắt'}
                         </span>
                       </button>
                     </div>
+
+                    <div className="space-y-2.5">
+                      <label className="block text-slate-400">
+                        Khung giờ gửi tự động hàng ngày (Chọn nhanh hoặc nhập biểu thức Cron)
+                      </label>
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        {DIGEST_CRON_PRESETS.map((preset) => {
+                          const activeCron =
+                            (settings.digest_cron_time || '0 7 * * *').trim() ===
+                            preset.cron;
+                          return (
+                            <button
+                              key={preset.cron}
+                              type="button"
+                              onClick={() =>
+                                updateField('digest_cron_time', preset.cron)
+                              }
+                              className={`min-h-[38px] px-3 py-1.5 rounded-lg border font-mono text-xs font-medium transition-colors ${
+                                activeCron
+                                  ? 'bg-cyan-500/20 border-cyan-500/40 text-cyan-300'
+                                  : 'bg-slate-950 border-slate-800 text-slate-300 hover:bg-slate-800'
+                              }`}
+                            >
+                              ⏰ {preset.label}
+                            </button>
+                          );
+                        })}
+                      </div>
+
+                      <div className="flex flex-col sm:flex-row sm:items-center gap-2.5 pt-1">
+                        <input
+                          value={settings.digest_cron_time ?? '0 7 * * *'}
+                          onChange={(e) =>
+                            updateField('digest_cron_time', e.target.value)
+                          }
+                          placeholder="0 7 * * *"
+                          aria-label="Biểu thức Cron cho Báo cáo Sáng sớm"
+                          className="flex-1 min-w-0 min-h-[42px] bg-slate-950 border border-slate-800 focus:border-cyan-500 rounded-lg px-3 py-2 text-white font-mono outline-none"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => void handleTestMorningDigest()}
+                          disabled={testingDigest}
+                          className="w-full sm:w-auto justify-center min-h-[42px] whitespace-nowrap inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-emerald-600/20 hover:bg-emerald-600 text-emerald-300 hover:text-white border border-emerald-500/35 font-semibold disabled:opacity-50 transition-all"
+                        >
+                          <span>
+                            {testingDigest
+                              ? '⏳ Đang tổng hợp & gửi...'
+                              : '📨 Gửi thử Báo cáo Sáng ngay'}
+                          </span>
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="space-y-3">
                     <p className="text-[11px] text-slate-500">
                       Mặc định: <code>0 7 * * *</code> (07:00 sáng hàng ngày). Nhấn{' '}
                       <strong className="text-slate-300">
@@ -2665,107 +2905,107 @@ export default function SettingsPage() {
                       </strong>{' '}
                       ở cuối trang để lưu lịch tự động.
                     </p>
-                  </div>
 
-                  {digestResult && (
-                    <div
-                      className={`p-3.5 rounded-xl border text-xs space-y-2.5 break-words ${
-                        digestResult.ok
-                          ? 'bg-emerald-500/10 border-emerald-500/35 text-emerald-100'
-                          : 'bg-amber-500/10 border-amber-500/35 text-amber-100'
-                      }`}
-                    >
-                      <div className="flex flex-wrap items-center justify-between gap-2">
-                        <span className="font-semibold">
-                          {digestResult.message}
-                        </span>
-                        <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
-                          <span
-                            className={`px-2 py-0.5 rounded border font-medium ${
-                              digestResult.telegramSent
-                                ? 'bg-emerald-500/20 border-emerald-500/40 text-emerald-200'
-                                : 'bg-slate-900/80 border-slate-700 text-slate-300'
-                            }`}
-                          >
-                            Telegram {digestResult.telegramSent ? '✅' : '—'}
+                    {digestResult && (
+                      <div
+                        className={`p-3.5 rounded-xl border text-xs space-y-2.5 break-words ${
+                          digestResult.ok
+                            ? 'bg-emerald-500/10 border-emerald-500/35 text-emerald-100'
+                            : 'bg-amber-500/10 border-amber-500/35 text-amber-100'
+                        }`}
+                      >
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <span className="font-semibold">
+                            {digestResult.message}
                           </span>
-                          <span
-                            className={`px-2 py-0.5 rounded border font-medium ${
-                              digestResult.emailSent
-                                ? 'bg-emerald-500/20 border-emerald-500/40 text-emerald-200'
-                                : 'bg-slate-900/80 border-slate-700 text-slate-300'
-                            }`}
-                          >
-                            Email {digestResult.emailSent ? '✅' : '—'}
-                          </span>
+                          <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
+                            <span
+                              className={`px-2 py-0.5 rounded border font-medium ${
+                                digestResult.telegramSent
+                                  ? 'bg-emerald-500/20 border-emerald-500/40 text-emerald-200'
+                                  : 'bg-slate-900/80 border-slate-700 text-slate-300'
+                              }`}
+                            >
+                              Telegram {digestResult.telegramSent ? '✅' : '—'}
+                            </span>
+                            <span
+                              className={`px-2 py-0.5 rounded border font-medium ${
+                                digestResult.emailSent
+                                  ? 'bg-emerald-500/20 border-emerald-500/40 text-emerald-200'
+                                  : 'bg-slate-900/80 border-slate-700 text-slate-300'
+                              }`}
+                            >
+                              Email {digestResult.emailSent ? '✅' : '—'}
+                            </span>
+                          </div>
                         </div>
-                      </div>
 
-                      {digestResult.summary && (
-                        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-2 border-t border-slate-800/70 text-[11px]">
-                          <div className="p-2 rounded-lg bg-slate-950/80 border border-slate-800/80">
-                            <div className="text-slate-400">VPS Online</div>
-                            <div className="font-mono font-bold text-white mt-0.5">
-                              {digestResult.summary.onlineServers}/
-                              {digestResult.summary.totalServers}
-                            </div>
-                            {digestResult.summary.hostKeyMismatchCount > 0 && (
-                              <div className="text-[10px] text-rose-300 mt-0.5">
-                                🚨 {digestResult.summary.hostKeyMismatchCount}{' '}
-                                lệch TOFU
+                        {digestResult.summary && (
+                          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-2 border-t border-slate-800/70 text-[11px]">
+                            <div className="p-2 rounded-lg bg-slate-950/80 border border-slate-800/80">
+                              <div className="text-slate-400">VPS Online</div>
+                              <div className="font-mono font-bold text-white mt-0.5">
+                                {digestResult.summary.onlineServers}/
+                                {digestResult.summary.totalServers}
                               </div>
-                            )}
-                          </div>
+                              {digestResult.summary.hostKeyMismatchCount > 0 && (
+                                <div className="text-[10px] text-rose-300 mt-0.5">
+                                  🚨 {digestResult.summary.hostKeyMismatchCount}{' '}
+                                  lệch TOFU
+                                </div>
+                              )}
+                            </div>
 
-                          <div className="p-2 rounded-lg bg-slate-950/80 border border-slate-800/80">
-                            <div className="text-slate-400">Phiên 24h qua</div>
-                            <div className="font-mono font-bold text-emerald-300 mt-0.5">
-                              {digestResult.summary.jobsSucceeded24h} hoàn tất
+                            <div className="p-2 rounded-lg bg-slate-950/80 border border-slate-800/80">
+                              <div className="text-slate-400">Phiên 24h qua</div>
+                              <div className="font-mono font-bold text-emerald-300 mt-0.5">
+                                {digestResult.summary.jobsSucceeded24h} hoàn tất
+                              </div>
+                              <div className="text-[10px] text-slate-400">
+                                {digestResult.summary.jobsFailed24h} thất bại
+                              </div>
                             </div>
-                            <div className="text-[10px] text-slate-400">
-                              {digestResult.summary.jobsFailed24h} thất bại
+
+                            <div className="p-2 rounded-lg bg-slate-950/80 border border-slate-800/80">
+                              <div className="text-slate-400">Delta 24h</div>
+                              <div className="font-mono font-bold text-cyan-300 mt-0.5">
+                                +{formatBytes(digestResult.summary.netDeltaBytes24h)}
+                              </div>
+                              <div className="text-[10px] text-slate-400">
+                                Tiết kiệm{' '}
+                                {Number(
+                                  digestResult.summary.savingsPercent || 0
+                                ).toFixed(1)}
+                                %
+                              </div>
+                            </div>
+
+                            <div className="p-2 rounded-lg bg-slate-950/80 border border-slate-800/80">
+                              <div className="text-slate-400">Kiểm định SQL</div>
+                              <div className="font-mono font-bold text-emerald-300 mt-0.5">
+                                {digestResult.summary.verifiedDbs24h} DB ✅
+                              </div>
+                              <div className="text-[10px] text-slate-400">
+                                {digestResult.summary.anomalies24h} bất thường
+                              </div>
                             </div>
                           </div>
+                        )}
 
-                          <div className="p-2 rounded-lg bg-slate-950/80 border border-slate-800/80">
-                            <div className="text-slate-400">Delta 24h</div>
-                            <div className="font-mono font-bold text-cyan-300 mt-0.5">
-                              +{formatBytes(digestResult.summary.netDeltaBytes24h)}
-                            </div>
-                            <div className="text-[10px] text-slate-400">
-                              Tiết kiệm{' '}
-                              {Number(
-                                digestResult.summary.savingsPercent || 0
-                              ).toFixed(1)}
-                              %
-                            </div>
-                          </div>
-
-                          <div className="p-2 rounded-lg bg-slate-950/80 border border-slate-800/80">
-                            <div className="text-slate-400">Kiểm định SQL</div>
-                            <div className="font-mono font-bold text-emerald-300 mt-0.5">
-                              {digestResult.summary.verifiedDbs24h} DB ✅
-                            </div>
-                            <div className="text-[10px] text-slate-400">
-                              {digestResult.summary.anomalies24h} bất thường
-                            </div>
-                          </div>
-                        </div>
-                      )}
-
-                      {digestResult.errors && digestResult.errors.length > 0 && (
-                        <ul className="list-disc pl-4 space-y-1 text-[11px] text-rose-200 pt-1">
-                          {digestResult.errors.map((err, idx) => (
-                            <li key={idx}>{err}</li>
-                          ))}
-                        </ul>
-                      )}
-                    </div>
-                  )}
+                        {digestResult.errors && digestResult.errors.length > 0 && (
+                          <ul className="list-disc pl-4 space-y-1 text-[11px] text-rose-200 pt-1">
+                            {digestResult.errors.map((err, idx) => (
+                              <li key={idx}>{err}</li>
+                            ))}
+                          </ul>
+                        )}
+                      </div>
+                    )}
+                  </div>
                 </div>
 
-                {/* Global Exclude Rules Card */}
-                <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-6 space-y-3.5">
+                {/* Global Exclude Rules Card (Horizontal right neighbor of Daily Morning Digest) */}
+                <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-6 space-y-3.5 flex flex-col">
                   <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
                     <h3 className="text-sm font-bold text-white flex items-center gap-2">
                       <Filter className="w-4 h-4 text-violet-400 shrink-0" />
@@ -2789,7 +3029,7 @@ export default function SettingsPage() {
                       updateField('global_exclude_patterns', e.target.value)
                     }
                     placeholder={STANDARD_WP_EXCLUDES.join('\n')}
-                    className="w-full bg-slate-950 border border-slate-800 focus:border-blue-500 rounded-xl px-3.5 py-2.5 text-white font-mono text-xs outline-none leading-relaxed"
+                    className="w-full flex-1 min-h-[120px] bg-slate-950 border border-slate-800 focus:border-blue-500 rounded-xl px-3.5 py-2.5 text-white font-mono text-xs outline-none leading-relaxed"
                   />
                   <p className="text-[11px] text-slate-500 leading-relaxed">
                     Mỗi dòng 1 mẫu đường dẫn chuẩn Rsync{' '}
@@ -2802,152 +3042,6 @@ export default function SettingsPage() {
                   </p>
                 </div>
               </div>
-
-              {/* Right Column: Anomaly Detection & Synology DSM Btrfs API */}
-              <div className="space-y-6">
-                <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-6 space-y-4">
-                  <h3 className="text-sm font-bold text-white flex items-center gap-2">
-                    <ShieldAlert className="w-4 h-4 text-amber-400 shrink-0" />
-                    <span>
-                      Ngưỡng Phát hiện Sớm Ransomware (Anomaly Detection)
-                    </span>
-                  </h3>
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                    <div className="flex flex-col justify-between">
-                      <label className="block text-slate-400 mb-1">
-                        Tỷ lệ file thay đổi tối đa / ngày (%)
-                      </label>
-                      <input
-                        type="number"
-                        value={settings.anomaly_max_changed_percent || '50'}
-                        onChange={(e) =>
-                          updateField(
-                            'anomaly_max_changed_percent',
-                            e.target.value
-                          )
-                        }
-                        className="w-full min-h-[42px] bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white font-mono"
-                      />
-                    </div>
-                    <div className="flex flex-col justify-between">
-                      <label className="block text-slate-400 mb-1">
-                        Dung lượng tăng đột biến tối đa (GB)
-                      </label>
-                      <input
-                        type="number"
-                        value={settings.anomaly_max_delta_gb || '10'}
-                        onChange={(e) =>
-                          updateField('anomaly_max_delta_gb', e.target.value)
-                        }
-                        className="w-full min-h-[42px] bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white font-mono"
-                      />
-                    </div>
-                  </div>
-                  <p className="text-[11px] text-slate-500">
-                    Khi vượt ngưỡng, hệ thống gửi cảnh báo Telegram khẩn cấp và
-                    tự động khóa (Pin) toàn bộ các bản sao lưu sạch trước đó.
-                  </p>
-                </div>
-
-                <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-6 space-y-4">
-                  <h3 className="text-sm font-bold text-white flex items-center gap-2">
-                    <Lock className="w-4 h-4 text-emerald-400 shrink-0" />
-                    <span>
-                      Tích hợp Synology DSM Btrfs Immutable Snapshot (WORM)
-                    </span>
-                  </h3>
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                    <div className="flex flex-col justify-between">
-                      <label className="block text-slate-400 mb-1">
-                        Synology DSM URL
-                      </label>
-                      <input
-                        value={settings.dsm_api_url || ''}
-                        onChange={(e) =>
-                          updateField('dsm_api_url', e.target.value)
-                        }
-                        placeholder="https://192.168.1.10:5001"
-                        className="w-full min-h-[42px] bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white font-mono"
-                      />
-                    </div>
-                    <div className="flex flex-col justify-between">
-                      <label className="block text-slate-400 mb-1">
-                        Shared Folders (cách nhau dấu phẩy)
-                      </label>
-                      <input
-                        value={settings.dsm_backup_shares || 'VPS_Backups'}
-                        onChange={(e) =>
-                          updateField('dsm_backup_shares', e.target.value)
-                        }
-                        className="w-full min-h-[42px] bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white font-mono"
-                      />
-                    </div>
-                  </div>
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                    <div className="flex flex-col justify-between">
-                      <label className="block text-slate-400 mb-1">
-                        DSM Admin User
-                      </label>
-                      <input
-                        value={settings.dsm_username || ''}
-                        onChange={(e) =>
-                          updateField('dsm_username', e.target.value)
-                        }
-                        className="w-full min-h-[42px] bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white"
-                      />
-                    </div>
-                    <div className="flex flex-col justify-between">
-                      <label className="block text-slate-400 mb-1">
-                        DSM Password
-                      </label>
-                      <div className="relative">
-                        <input
-                          type={showDsmPass ? 'text' : 'password'}
-                          value={settings.dsm_password || ''}
-                          onChange={(e) =>
-                            updateField('dsm_password', e.target.value)
-                          }
-                          className="w-full min-h-[42px] bg-slate-950 border border-slate-800 rounded-lg pl-3 pr-10 py-2 text-white"
-                        />
-                        <button
-                          type="button"
-                          onClick={() => setShowDsmPass((v) => !v)}
-                          aria-label={
-                            showDsmPass
-                              ? 'Ẩn mật khẩu DSM'
-                              : 'Hiện mật khẩu DSM'
-                          }
-                          className="h-9 w-9 inline-flex items-center justify-center rounded-md text-slate-400 hover:text-white absolute right-1 top-1/2 -translate-y-1/2"
-                        >
-                          {showDsmPass ? (
-                            <EyeOff className="w-4 h-4" />
-                          ) : (
-                            <Eye className="w-4 h-4" />
-                          )}
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-                  <label className="flex items-start gap-2.5 text-slate-300 cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={settings.btrfs_auto_enabled === 'true'}
-                      onChange={(e) =>
-                        updateField(
-                          'btrfs_auto_enabled',
-                          e.target.checked ? 'true' : 'false'
-                        )
-                      }
-                      className="mt-0.5 shrink-0"
-                    />
-                    <span>
-                      Tự động tạo Btrfs WORM Snapshot lúc 06:00 AM hàng ngày
-                      (Khóa chống xóa 7 ngày)
-                    </span>
-                  </label>
-                </div>
-              </div>
-            </div>
 
             <div className="flex justify-end">
               <button

@@ -2,6 +2,13 @@
 
 Mọi thay đổi đáng chú ý của dự án **NAS-Sync** (<https://github.com/shostwp-byte/nas-sync>) đều được ghi nhận tại tài liệu này theo chuẩn [Keep a Changelog](https://keepachangelog.com/vi/1.1.0/) và [Semantic Versioning](https://semver.org/).
 
+## [1.5.4] - 2026-11-02
+
+### Added & Improved
+- **Tách riêng Tab `Sao lưu` (Offsite Cloud 3-2-1) & Tối ưu Bố cục 2 cột tại `/settings` (`src/app/settings/page.tsx`, `src/app/jobs/page.tsx`)**:
+  - Đưa toàn bộ khối **Sao lưu Đám mây Offsite chuẩn 3-2-1 (Mã hóa Đầu-Cuối AES-256-GCM)** sang tab độc lập **Sao lưu** (kèm hỗ trợ chuyển hướng Google Drive OAuth2 & `?tab=backup`) và lược bỏ icon đám mây trùng lặp trước tiêu đề.
+  - Sắp xếp lại lưới cấu hình tại tab **Cấu hình Hệ thống**: đưa thẻ **Bộ lọc Loại trừ File Toàn cục (Global Exclude Rules)** nằm ngang hàng cân đối với thẻ **Báo cáo Tổng hợp Sáng sớm (Daily Morning Digest)**.
+
 ## [1.5.3] - 2026-11-02
 
 ### Added & Improved

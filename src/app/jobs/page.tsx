@@ -250,10 +250,10 @@ export default function JobsPage() {
             {!offsiteFeedback.ok && userRole === 'ADMIN' && (
               <div>
                 <Link
-                  href="/settings"
+                  href="/settings?tab=backup"
                   className="text-cyan-300 hover:underline font-semibold"
                 >
-                  → Mở Cài đặt Hệ thống để thiết lập Đám mây Offsite 3-2-1
+                  → Mở tab Sao lưu để thiết lập Đám mây Offsite 3-2-1
                 </Link>
               </div>
             )}
@@ -840,10 +840,10 @@ export default function JobsPage() {
                     {!offsiteFeedback.ok && userRole === 'ADMIN' && (
                       <div>
                         <Link
-                          href="/settings"
+                          href="/settings?tab=backup"
                           className="text-cyan-300 hover:underline font-semibold"
                         >
-                          → Mở Cài đặt Hệ thống để thiết lập Đám mây Offsite 3-2-1
+                          → Mở tab Sao lưu để thiết lập Đám mây Offsite 3-2-1
                         </Link>
                       </div>
                     )}
