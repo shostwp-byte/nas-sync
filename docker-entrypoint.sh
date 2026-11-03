@@ -125,7 +125,7 @@ if [ "$(id -u)" = "0" ] && [ "${RUN_AS_ROOT:-false}" != "true" ] && command -v s
       export HOME=/home/nassync
       exec su-exec "$TARGET_UID:$TARGET_GID" "$@"
     else
-      echo "[NAS-Sync Entrypoint] CẢNH BÁO: Phân vùng /mnt/vol1 chưa cấp quyền ghi cho UID $TARGET_UID — vui lòng cấu hình PUID/PGID tương ứng với tài khoản Synology DSM."
+      echo "[NAS-Sync Entrypoint] CẢNH BÁO: Phân vùng /mnt/vol1 chưa cấp quyền ghi cho UID $TARGET_UID — vui lòng cấu hình PUID/PGID tương ứng với tài khoản quản lý trên NAS."
     fi
   fi
 fi

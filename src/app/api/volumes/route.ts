@@ -4,7 +4,10 @@ import { NextRequest, NextResponse } from 'next/server';
 import { safeErrorJson } from '@/lib/api-error';
 import { requireRole } from '@/lib/auth';
 import { getDataDir, getDb, getSshKeysDir } from '@/lib/db';
-import { refreshAllVolumes } from '@/lib/engine/volume-manager';
+import {
+  attachCapabilitiesToVolumes,
+  refreshAllVolumes,
+} from '@/lib/engine/volume-manager';
 
 const FORBIDDEN_POSIX_PREFIXES = [
   '/app',
@@ -128,9 +131,10 @@ export async function GET(req: NextRequest) {
       const volumes = await refreshAllVolumes();
       return NextResponse.json({ volumes });
     }
-    const volumes = getDb()
+    const rawVolumes = getDb()
       .prepare('SELECT * FROM storage_volumes ORDER BY priority ASC, id ASC')
-      .all();
+      .all() as unknown as import('@/types').StorageVolume[];
+    const volumes = await attachCapabilitiesToVolumes(rawVolumes, false);
     return NextResponse.json({ volumes });
   } catch (err) {
     return safeErrorJson(err, 'Không thể tải danh sách phân vùng lưu trữ.', 500);
@@ -190,7 +194,7 @@ export async function POST(req: NextRequest) {
 
     if (!Number.isInteger(btrfsDays) || btrfsDays < 1 || btrfsDays > 3650) {
       return NextResponse.json(
-        { error: 'Số ngày khóa Btrfs WORM phải là số nguyên từ 1 đến 3650.' },
+        { error: 'Số ngày khóa WORM Snapshot phải là số nguyên từ 1 đến 3650.' },
         { status: 400 }
       );
     }

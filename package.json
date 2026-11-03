@@ -1,9 +1,9 @@
 {
   "name": "nas-sync",
-  "version": "1.6.0",
+  "version": "1.7.0",
   "private": false,
   "license": "MIT",
-  "description": "Open-Source Agentless Multi-Panel VPS Backup & Cross-Panel Migration Platform for Synology NAS (DirectAdmin, cPanel, Plesk, aaPanel)",
+  "description": "Open-Source Agentless Multi-Panel VPS Backup & Cross-Panel Migration Platform for Multi-NAS & Docker (DirectAdmin, cPanel, Plesk, aaPanel, CyberPanel, HestiaCP, CloudPanel)",
   "homepage": "https://github.com/shostwp-byte/nas-sync",
   "repository": {
     "type": "git",
@@ -13,8 +13,14 @@
     "url": "https://github.com/shostwp-byte/nas-sync/issues"
   },
   "keywords": [
-    "synology",
     "nas",
+    "multi-nas",
+    "docker",
+    "truenas",
+    "qnap",
+    "ugreen",
+    "unraid",
+    "openmediavault",
     "backup",
     "rsync",
     "hardlink",
@@ -22,6 +28,7 @@
     "cpanel",
     "plesk",
     "aapanel",
+    "zfs",
     "btrfs",
     "worm",
     "ransomware-protection"
@@ -33,8 +40,8 @@
     "start:prod": "NODE_ENV=production node --import tsx server.ts",
     "lint": "eslint src server.ts scripts tests",
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test tests/security-and-engine.test.ts tests/v160-security-audit.test.ts",
-    "pack:synology": "node scripts/package-synology.mjs",
+    "test": "node --import tsx --test tests/security-and-engine.test.ts tests/v160-security-audit.test.ts tests/v170-multi-nas.test.ts",
+    "pack:release": "node scripts/package-release.mjs",
     "pack:prebuilt": "node scripts/package-prebuilt.mjs"
   },
   "dependencies": {

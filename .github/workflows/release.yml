@@ -1,4 +1,4 @@
-name: Release — Package Signed Synology NAS Bundle & GHCR Image
+name: Release — Package Signed Multi-NAS Bundle & GHCR Image
 
 on:
   push:
@@ -35,10 +35,10 @@ jobs:
           npm test
           npm run build
 
-      - name: Package Synology ZIP, TAR.GZ & Prebuilt SHA-256 bundles
+      - name: Package Multi-NAS ZIP, TAR.GZ & Prebuilt SHA-256 bundles
         run: |
           sudo apt-get update && sudo apt-get install -y zip
-          npm run pack:synology
+          npm run pack:release
           node scripts/package-prebuilt.mjs
 
       - name: Upload unsigned release bundle artifact
@@ -46,8 +46,10 @@ jobs:
         with:
           name: nas-sync-release-bundle
           path: |
-            release/nas-sync-synology.zip
-            release/nas-sync-synology.tar.gz
+            release/nas-sync-bundle.zip
+            release/nas-sync-bundle.zip.sha256
+            release/nas-sync-bundle.tar.gz
+            release/nas-sync-bundle.tar.gz.sha256
             release/nas-sync-prebuilt.tar.gz
             release/nas-sync-prebuilt.tar.gz.sha256
           if-no-files-found: error
@@ -109,8 +111,10 @@ jobs:
         with:
           generate_release_notes: true
           files: |
-            release/nas-sync-synology.zip
-            release/nas-sync-synology.tar.gz
+            release/nas-sync-bundle.zip
+            release/nas-sync-bundle.zip.sha256
+            release/nas-sync-bundle.tar.gz
+            release/nas-sync-bundle.tar.gz.sha256
             release/nas-sync-prebuilt.tar.gz
             release/nas-sync-prebuilt.tar.gz.sha256
             release/nas-sync-prebuilt.tar.gz.sig

@@ -1,5 +1,5 @@
 name: 🐛 Báo lỗi (Bug Report)
-description: Báo cáo lỗi phát sinh trong quá trình cài đặt hoặc sao lưu/khôi phục trên Synology NAS
+description: Báo cáo lỗi phát sinh trong quá trình cài đặt hoặc sao lưu/khôi phục trên hệ thống NAS & Docker
 title: "[Bug]: "
 labels: ["bug"]
 body:
@@ -10,9 +10,9 @@ body:
   - type: input
     id: version
     attributes:
-      label: Phiên bản NAS-Sync & DSM
-      description: Ví dụ NAS-Sync v1.1.0 trên Synology DSM 7.2.2
-      placeholder: "v1.1.0 / DSM 7.2"
+      label: Phiên bản NAS-Sync & Nền tảng NAS / OS
+      description: Ví dụ NAS-Sync v1.7.0 trên TrueNAS SCALE 24.10 / QNAP QuTS hero / UGREEN UGOS Pro / Unraid / Ubuntu Docker
+      placeholder: "v1.7.0 / TrueNAS SCALE 24.10"
     validations:
       required: true
   - type: dropdown
@@ -24,6 +24,9 @@ body:
         - cPanel / WHM
         - Plesk Obsidian
         - aaPanel / BT Panel
+        - CyberPanel
+        - HestiaCP
+        - CloudPanel
         - Không liên quan tới VPS (Lỗi giao diện / Docker NAS)
     validations:
       required: true
@@ -38,6 +41,5 @@ body:
     id: logs
     attributes:
       label: Nhật ký lỗi (Logs)
-      description: Dán đoạn log liên quan từ giao diện NAS-Sync hoặc Container Manager
+      description: Dán đoạn log liên quan từ giao diện NAS-Sync hoặc trình quản lý Container trên NAS
       render: shell
-

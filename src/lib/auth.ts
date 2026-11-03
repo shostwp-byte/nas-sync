@@ -104,7 +104,7 @@ export async function requireRole(
 
 /**
  * Tùy chọn cookie phiên dùng chung cho login / đổi mật khẩu / logout.
- * Bật cờ Secure khi truy cập qua HTTPS (trực tiếp hoặc sau Synology Reverse Proxy / Cloudflare Tunnel),
+ * Bật cờ Secure khi truy cập qua HTTPS (trực tiếp hoặc sau Reverse Proxy / Cloudflare Tunnel),
  * vẫn cho phép HTTP thuần trong LAN.
  */
 export function sessionCookieOptions(req: NextRequest, maxAge = SESSION_MAX_AGE_SECONDS) {

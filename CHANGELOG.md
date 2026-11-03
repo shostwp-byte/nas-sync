@@ -2,6 +2,23 @@
 
 Mọi thay đổi đáng chú ý của dự án **NAS-Sync** (<https://github.com/shostwp-byte/nas-sync>) đều được ghi nhận tại tài liệu này theo chuẩn [Keep a Changelog](https://keepachangelog.com/vi/1.1.0/) và [Semantic Versioning](https://semver.org/).
 
+## [1.7.0] - 2026-11-03
+
+### Added & Changed (Kiến trúc Đa Nền tảng NAS — Universal Multi-NAS & Docker Edition)
+- **Bộ Kiểm định Năng lực Phân vùng Tự động (`probeVolumeCapabilities` — `volume-manager.ts`, `src/app/volumes/page.tsx`)**:
+  - Tự động nhận diện loại hệ thống tệp thực tế (`ZFS`, `Btrfs`, `Ext4`, `XFS`, `fuse.shfs`, `SMB/NFS`, `NTFS`) qua `/proc/mounts` / `df -PT` và kiểm tra nguyên tử khả năng tạo POSIX Hard-Link, Symlink cùng quyền ghi của `PUID/PGID` trên từng phân vùng lưu trữ.
+  - Hiển thị huy hiệu trực quan (`FS`, `Hard-Link OK`, `Ghi/Đọc OK`) và cảnh báo hướng dẫn tối ưu trên trang **Phân vùng Lưu trữ** cũng như nhật ký Pre-Flight trước mỗi ca sao lưu.
+- **Engine Khóa Bất biến Đa Nhà cung cấp (`triggerImmutableWormSnapshot` — `worm-snapshot.ts`, `/api/volumes/snapshot`, `src/app/settings/page.tsx`)**:
+  - Nâng cấp cơ chế khóa Snapshot chống Ransomware cấp hệ điều hành sang kiến trúc đa chế độ (`worm_provider`):
+    1. `NONE`: Khóa GFS Pinning nội bộ kết hợp tầng Offsite 3-2-1 Zero-Knowledge (tương thích mặc định 100% thiết bị NAS & Docker).
+    2. `TRUENAS_ZFS`: Tích hợp **TrueNAS SCALE REST API v2.0** (`POST /api/v2.0/zfs/snapshot` + `POST /api/v2.0/zfs/snapshot/hold`) kèm tự động giải phóng các bản chụp hết hạn `retentionDays`.
+    3. `NAS_WEBAPI`: Tích hợp chuẩn **Btrfs Share Snapshot WebAPI** (`is_locked=true`) qua giao diện cấu hình trung lập.
+    4. `WEBHOOK`: Tích hợp **Universal Host Snapshot Webhook** ký số `HMAC-SHA256` (`X-NasSync-Signature`) cho QNAP QuTS hero, Unraid, OpenMediaVault và máy chủ Linux ZFS/Btrfs/LVM.
+- **Chuẩn hóa Thương hiệu Trung lập Đa Hãng NAS & Di chuyển Cấu hình Tự động (`db.ts`, Giao diện Web, PWA, CLI & CI/CD)**:
+  - Gỡ bỏ toàn bộ định danh giới hạn một hãng đơn lẻ trên giao diện Web, PWA Manifest, thông báo hệ thống, nhãn OCI Docker và gói phát hành; tự động chuyển đổi không gián đoạn nhãn phân vùng mặc định sang `NAS Volume X` và ánh xạ cấu hình cũ sang bộ khóa chuẩn `worm_*` khi nâng cấp từ các phiên bản trước.
+  - Bổ sung trình cài đặt & cập nhật tự động đa nền tảng **`install.sh`** và **`update.sh`** (tự nhận diện TrueNAS SCALE, QNAP Container Station, UGREEN UGOS Pro, TerraMaster TOS, Asustor ADM, Unraid, OpenMediaVault, Linux Docker và xác minh mã băm `SHA-256` của gói `nas-sync-bundle.tar.gz`).
+  - Viết lại toàn diện **`README.md`** và cẩm nang **`HUONG-DAN-CAI-DAT-NAS.md`** kèm ma trận tương thích chi tiết cho đa dòng thiết bị NAS.
+
 ## [1.6.0] - 2026-11-03
 
 ### Security & Reliability Hardening (Xử lý Toàn diện Bản Đánh giá An ninh & Độ tin cậy)

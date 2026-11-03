@@ -2,6 +2,8 @@
 
 import React, { useCallback, useEffect, useState } from 'react';
 import {
+  AlertTriangle,
+  CheckCircle2,
   HardDrive,
   Lock,
   Plus,
@@ -21,7 +23,7 @@ export default function VolumesPage() {
   const [wormMsg, setWormMsg] = useState('');
 
   const [form, setForm] = useState({
-    name: 'Synology Volume 3',
+    name: 'NAS Volume 3',
     mount_path: '/mnt/vol3',
     max_usage_percent: 85,
     min_free_gb: 10,
@@ -105,16 +107,32 @@ export default function VolumesPage() {
     setWormLoading(true);
     setWormMsg('');
     try {
-      const resp = await fetch('/api/volumes/btrfs', {
+      const resp = await fetch('/api/volumes/snapshot', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ retentionDays: 7 }),
+        body: JSON.stringify({}),
       });
       const data = await resp.json();
-      setWormMsg(data.message || 'Đã gửi yêu cầu Btrfs Immutable Snapshot.');
+      setWormMsg(
+        data.message || 'Đã gửi yêu cầu chụp OS-Level Immutable WORM Snapshot.'
+      );
     } finally {
       setWormLoading(false);
     }
+  };
+
+  const openAddModal = () => {
+    const nextIdx = volumes.length + 1;
+    setForm({
+      name: `NAS Volume ${nextIdx}`,
+      mount_path: `/mnt/vol${nextIdx}`,
+      max_usage_percent: 85,
+      min_free_gb: 10,
+      priority: nextIdx,
+      btrfs_immutable_enabled: true,
+      btrfs_retention_days: 7,
+    });
+    setShowAdd(true);
   };
 
   return (
@@ -123,10 +141,10 @@ export default function VolumesPage() {
         <div className="min-w-0">
           <h2 className="text-base sm:text-lg font-bold text-white flex items-center gap-2">
             <HardDrive className="w-5 h-5 text-blue-400 shrink-0" />
-            <span>Quản lý Đa Phân vùng Thông minh & Btrfs WORM</span>
+            <span>Quản lý Đa Phân vùng Thông minh &amp; Khóa Bất biến (WORM)</span>
           </h2>
           <p className="text-xs text-slate-400 mt-0.5">
-            Tự động kiểm tra df / statfs trước mỗi phiên chạy, chuyển Volume khi đầy ≥ 85% kèm Local Seeding bảo toàn chuỗi Incremental Hard-Link.
+            Tự động kiểm định Filesystem / POSIX Hard-Link, giám sát df / statfs và chuyển Volume khi đầy ≥ 85% kèm Local Seeding bảo toàn chuỗi tăng dần.
           </p>
         </div>
 
@@ -149,12 +167,12 @@ export default function VolumesPage() {
             <span>
               {wormLoading
                 ? 'Đang tạo WORM Snapshot...'
-                : 'Tạo Btrfs WORM Snapshot Ngay'}
+                : 'Chụp WORM Snapshot Ngay'}
             </span>
           </button>
           <button
             type="button"
-            onClick={() => setShowAdd(true)}
+            onClick={openAddModal}
             className="flex-1 sm:flex-initial justify-center min-h-[40px] whitespace-nowrap inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold bg-blue-600 hover:bg-blue-500 text-white transition-colors"
           >
             <Plus className="w-4 h-4 shrink-0" />
@@ -207,6 +225,38 @@ export default function VolumesPage() {
                     <div className="text-xs font-mono text-cyan-400 mt-0.5 break-all">
                       Mount Path: {vol.mount_path}
                     </div>
+                    {vol.capabilities && (
+                      <div className="flex flex-wrap items-center gap-1.5 mt-2">
+                        <span className="px-2 py-0.5 rounded bg-slate-800 text-slate-200 border border-slate-700 text-[11px] font-mono">
+                          FS: {vol.capabilities.fs_type.toUpperCase()}
+                        </span>
+                        <span
+                          className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] border ${
+                            vol.capabilities.hardlink_supported
+                              ? 'bg-emerald-500/10 text-emerald-300 border-emerald-500/30'
+                              : 'bg-rose-500/15 text-rose-300 border-rose-500/35'
+                          }`}
+                        >
+                          {vol.capabilities.hardlink_supported ? (
+                            <CheckCircle2 className="w-3 h-3 shrink-0" />
+                          ) : (
+                            <AlertTriangle className="w-3 h-3 shrink-0" />
+                          )}
+                          {vol.capabilities.hardlink_supported
+                            ? 'Hard-Link OK'
+                            : 'Không hỗ trợ Hard-Link'}
+                        </span>
+                        <span
+                          className={`px-2 py-0.5 rounded text-[11px] border ${
+                            vol.capabilities.writable
+                              ? 'bg-blue-500/10 text-blue-300 border-blue-500/25'
+                              : 'bg-amber-500/15 text-amber-300 border-amber-500/35'
+                          }`}
+                        >
+                          {vol.capabilities.writable ? 'Ghi/Đọc OK' : 'Chỉ đọc'}
+                        </span>
+                      </div>
+                    )}
                   </div>
 
                   <div className="flex items-center gap-2 shrink-0">
@@ -256,7 +306,13 @@ export default function VolumesPage() {
                   </div>
                   {hasQuotaOrReserve && (
                     <div className="text-[11px] text-slate-500 break-words">
-                      Lưu ý: Khoảng {formatBytes(reservedBytes)} trên ổ cứng đang bị giới hạn bởi Hạn ngạch (Shared Folder Quota), LUN hoặc phân vùng hệ thống DSM nên không tính vào dung lượng trống khả dụng.
+                      Lưu ý: Khoảng {formatBytes(reservedBytes)} trên ổ cứng đang được giữ bởi Hạn ngạch (Quota / ZFS Reservation), LUN hoặc phân vùng hệ thống NAS nên không tính vào dung lượng trống khả dụng.
+                    </div>
+                  )}
+                  {vol.capabilities?.warning && (
+                    <div className="p-2.5 rounded-lg bg-amber-500/10 border border-amber-500/30 text-[11px] text-amber-200 flex items-start gap-2 break-words">
+                      <AlertTriangle className="w-3.5 h-3.5 text-amber-400 shrink-0 mt-0.5" />
+                      <span>{vol.capabilities.warning}</span>
                     </div>
                   )}
                   {vol.status === 'FULL' && (
@@ -367,7 +423,7 @@ export default function VolumesPage() {
           <div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-md w-full p-4 sm:p-6 space-y-4 max-h-[calc(100dvh-2rem)] overflow-y-auto">
             <div className="flex items-center justify-between gap-3">
               <h3 className="text-base font-bold text-white">
-                Thêm Phân vùng Synology NAS Mới
+                Thêm Phân vùng Lưu trữ NAS Mới
               </h3>
               <button
                 type="button"

@@ -17,7 +17,7 @@ import {
   requestCancelJob,
   RetryableNetworkError,
 } from './backup-worker';
-import { triggerSynologyBtrfsImmutableSnapshot } from './btrfs-worm';
+import { triggerImmutableWormSnapshot } from './worm-snapshot';
 import {
   captureDailyStorageSnapshot,
   sendDailyMorningDigest,
@@ -297,9 +297,9 @@ function completeScheduleBtrfsBatchTracking(
   pendingSet.delete(jobId);
   if (pendingSet.size === 0) {
     batches.delete(batchId);
-    void triggerSynologyBtrfsImmutableSnapshot(7).catch((err) => {
+    void triggerImmutableWormSnapshot().catch((err) => {
       console.warn(
-        `[Btrfs WORM Post-Schedule] Cảnh báo chụp Snapshot sau lịch sao lưu:`,
+        `[WORM Post-Schedule] Cảnh báo chụp Immutable Snapshot sau lịch sao lưu:`,
         (err as Error).message
       );
     });
@@ -1006,15 +1006,19 @@ export function reloadCronSchedules() {
     state.cronTasks.set(`schedule-${sched.id}`, task);
   }
 
-  // Lịch chụp Btrfs WORM cố định lúc 06:00 sáng (Mục 9.1) nếu bật tự động
-  const btrfsAuto = getSetting('btrfs_auto_enabled', 'false') === 'true';
-  const btrfsCron = getSetting('btrfs_cron_time', '0 6 * * *');
-  if (btrfsAuto && cron.validate(btrfsCron)) {
-    const wormTask = cron.schedule(btrfsCron, () => {
+  // Lịch chụp OS-Level Immutable WORM Snapshot cố định lúc 06:00 sáng (Mục 9.1) nếu bật tự động
+  const wormAuto =
+    getSetting('worm_auto_enabled', '') === 'true' ||
+    getSetting('btrfs_auto_enabled', 'false') === 'true';
+  const wormCron =
+    getSetting('worm_cron_time', '') ||
+    getSetting('btrfs_cron_time', '0 6 * * *');
+  if (wormAuto && cron.validate(wormCron)) {
+    const wormTask = cron.schedule(wormCron, () => {
       if (globalThis.__nasSyncUpdating) return;
-      void triggerSynologyBtrfsImmutableSnapshot(7);
+      void triggerImmutableWormSnapshot();
     });
-    state.cronTasks.set('btrfs-worm-daily', wormTask);
+    state.cronTasks.set('worm-snapshot-daily', wormTask);
   }
 
   // Lịch chụp thống kê dung lượng ngày cố định lúc 23:55 hằng đêm (v1.4.0 30-Day Storage Trend)

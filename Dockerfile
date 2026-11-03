@@ -13,7 +13,7 @@ RUN npm run build && npm prune --omit=dev
 FROM node:24-alpine AS runner
 
 LABEL org.opencontainers.image.title="NAS-Sync" \
-      org.opencontainers.image.description="Open-Source Agentless Multi-Panel VPS Backup & Cross-Panel Migration Platform for Synology NAS" \
+      org.opencontainers.image.description="Open-Source Agentless Multi-Panel VPS Backup & Cross-Panel Migration Platform for Multi-NAS & Docker" \
       org.opencontainers.image.source="https://github.com/shostwp-byte/nas-sync" \
       org.opencontainers.image.licenses="MIT"
 

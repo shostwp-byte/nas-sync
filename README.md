@@ -1,220 +1,174 @@
-# 🛡️ NAS-Sync — Open-Source Agentless Multi-Panel Backup Platform for Synology NAS
+# 🛡️ NAS-Sync — Open-Source Universal Multi-NAS & Docker Backup/Migration Platform
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-emerald.svg)](https://github.com/shostwp-byte/nas-sync/blob/main/LICENSE)
-[![Version](https://img.shields.io/badge/version-1.6.0-blue.svg)](https://github.com/shostwp-byte/nas-sync/releases)
-[![Node.js](https://img.shields.io/badge/Node.js-24%20Alpine-339933.svg)](https://nodejs.org/)
-[![Docker](https://img.shields.io/badge/Synology-Container%20Manager-2496ED.svg)](https://www.synology.com/)
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/shostwp-byte/nas-sync/pulls)
+[![Version](https://img.shields.io/badge/version-1.7.0-blue.svg)](https://github.com/shostwp-byte/nas-sync/releases)
+[![Multi-Arch](https://img.shields.io/badge/Docker-amd64%20%7C%20arm64-2496ED.svg)](https://github.com/shostwp-byte/nas-sync/pkgs/container/nas-sync)
+[![Filesystems](https://img.shields.io/badge/Storage-ZFS%20%7C%20Btrfs%20%7C%20Ext4%20%7C%20XFS-0ea5e9.svg)](https://github.com/shostwp-byte/nas-sync)
+[![Signed Releases](https://img.shields.io/badge/Updater-Ed25519%20Signed-10b981.svg)](https://github.com/shostwp-byte/nas-sync/releases)
 
-**NAS-Sync** (<https://github.com/shostwp-byte/nas-sync>) là nền tảng mã nguồn mở **hoàn toàn miễn phí (MIT License)** giúp tự động sao lưu tập trung, kiểm định toàn vẹn Database và khôi phục chéo (Cross-Panel Migration) hàng chục máy chủ Hosting/VPS về thiết bị **Synology NAS** mà không cần cài đặt bất kỳ Agent nào lên VPS.
+**NAS-Sync** (<https://github.com/shostwp-byte/nas-sync>) là nền tảng mã nguồn mở **hoàn toàn miễn phí (MIT License)** giúp tự động sao lưu tập trung, kiểm định toàn vẹn cơ sở dữ liệu và khôi phục chéo (Cross-Panel Migration) hàng chục máy chủ Hosting/VPS về **mọi thiết bị NAS và máy chủ Linux có hỗ trợ Docker** (**TrueNAS SCALE, QNAP, UGREEN NASync, TerraMaster, Asustor, Unraid, OpenMediaVault, Proxmox / Ubuntu / Debian Server...**) mà **không cần cài đặt bất kỳ Agent nào lên VPS**.
 
 ---
 
 ## ✨ Tính năng Cốt lõi (Key Features)
 
-- **🔌 Kiến trúc Agentless Pull & Zero-Impact trên VPS**:
-  - NAS chủ động kết nối một chiều qua SSH Key (`Ed25519` / `RSA`) về VPS — nếu VPS bị tấn công hoặc nhiễm mã độc, hacker **tuyệt đối không có quyền ngược lại** để xóa bản sao lưu trên NAS.
-  - Mọi tiến trình đọc file/dump SQL trên VPS đều tự động bọc trong `ionice -c 2 -n 7 nice -n 19` và giới hạn băng thông `--bwlimit`, không gây nghẽn CPU hay Disk I/O của website đang chạy.
+- **🔌 Kiến trúc Agentless Pull Một Chiều & Zero-Impact trên VPS**:
+  - Thiết bị NAS chủ động kết nối một chiều qua SSH Key (`Ed25519` / `RSA`) kèm khóa cứng vân tay SSH (`StrictHostKeyChecking=yes` + Multiplexing) về VPS. Nếu VPS bị xâm nhập hoặc nhiễm mã độc, kẻ tấn công **tuyệt đối không có quyền kết nối ngược** để xóa bản sao lưu trên NAS.
+  - Mọi tiến trình đọc dữ liệu và xuất SQL trên VPS đều tự động bọc trong `ionice -c 2 -n 7 nice -n 19` và giới hạn băng thông `--bwlimit`, không gây nghẽn CPU hay Disk I/O của website đang vận hành.
+- **🗄️ Vận hành Đa Nền tảng NAS & Tự động Kiểm định Hệ thống Tệp**:
+  - Chạy nguyên bản trên cả kiến trúc **`linux/amd64`** (Intel/AMD) và **`linux/arm64`** (ARMv8) không cần gắn `/var/run/docker.sock` hay chế độ `privileged`.
+  - **POSIX Filesystem & Hard-Link Probe**: Tự động nhận diện loại hệ thống tệp thực tế (`ZFS`, `Btrfs`, `Ext4`, `XFS`, `FUSE`, `SMB/NFS`) và kiểm tra nguyên tử khả năng tạo POSIX Hard-Link / Symlink / quyền ghi ngay trên từng phân vùng trước khi sao lưu.
+  - **Smart Multi-Volume Overflow**: Tự động chuyển hướng sang phân vùng lưu trữ kế tiếp khi chạm ngưỡng đầy (`85%`) kèm **Local Seeding** nội bộ bảo toàn chuỗi liên kết cứng.
 - **🌐 Tự động Quét 7 Control Panel & Đa Hệ Quản trị CSDL (`MySQL/MariaDB` + `PostgreSQL`)**:
-  - **DirectAdmin**, **cPanel / WHM**, **Plesk Obsidian**, **aaPanel / BT Panel**, **CyberPanel (OpenLiteSpeed)**, **HestiaCP**, **CloudPanel**: Tự động khám phá toàn bộ Domain chính, Addon Domain, Subdomain, System User, PHP Version và ánh xạ chính xác cả cơ sở dữ liệu **MySQL/MariaDB** lẫn **PostgreSQL (`pg_dump` / `psql`)**.
-  - **Sao lưu Mở rộng Hệ thống Hosting**: Tùy chọn sao lưu tăng dần Hard-Link **Hộp thư Email (`Maildir/IMAP`)**, **Lịch Crontab của User** và **Cấu hình Webserver Vhost & SSL** vào phân vùng `system_extras/` của từng Snapshot.
+  - Hỗ trợ **DirectAdmin**, **cPanel / WHM**, **Plesk Obsidian**, **aaPanel / BT Panel**, **CyberPanel (OpenLiteSpeed)**, **HestiaCP** và **CloudPanel**: tự động khám phá toàn bộ Domain chính, Addon Domain, Subdomain, System User, PHP Version và ánh xạ chính xác cơ sở dữ liệu **MySQL/MariaDB** lẫn **PostgreSQL (`pg_dump` / `psql`)**.
+  - **Sao lưu Mở rộng Hosting**: Tùy chọn sao lưu tăng dần **Hộp thư Email (`Maildir/IMAP`)**, **Lịch Crontab của User** và **Cấu hình Webserver Vhost & SSL** vào phân vùng `system_extras/` của từng Snapshot.
   - **Chống sao lưu trùng lặp (Nested Webroot Deduplication)**: Tự động tách riêng các Subdomain nằm lồng bên trong `public_html` của domain cha và bảo vệ thư mục Subdomain khi chạy Restore domain cha.
-- **☁️ Sao lưu Đám mây Offsite Chuẩn `3-2-1` Mã hóa Đầu-Cuối (`AES-256-GCM`)**:
-  - Nén và mã hóa luồng `NASSYNC2` (`PBKDF2-SHA256` 600.000 vòng bất đồng bộ + `AES-256-GCM` xác thực Header AAD & chống cắt cụt, tương thích ngược `NASSYNC1`) trực tiếp không tốn ổ cứng tạm trên NAS, đẩy tự động hoặc 1-Click lên **Google Drive** (hỗ trợ cả `OAuth2` 1-Click cho Gmail cá nhân / Google One / Workspace lẫn `Service Account JSON` qua `Resumable Upload API v3`), **Cloudflare R2**, **Backblaze B2**, **AWS S3** hoặc **MinIO**, kèm công cụ giải mã khẩn cấp độc lập `scripts/decrypt-offsite-backup.mjs`.
 - **💾 Sao lưu Tăng dần Hard-Link (`rsync --link-dest`) & Zero-Temp-Disk SQL Stream**:
-  - Tiết kiệm **85% – 95% dung lượng ổ cứng NAS**: các file không thay đổi giữa các ngày dùng chung Inode vật lý nhưng mỗi ngày vẫn là một cây thư mục hoàn chỉnh độc lập.
-  - Stream trực tiếp `mysqldump --single-transaction --quick | zstd -3` qua ống dẫn SSH về thẳng NAS — **không tạo bất kỳ file `.tar.gz`/`.sql` tạm nào trên ổ cứng VPS**.
-- **🧪 Tự động Kiểm định SQL trên MariaDB Sandbox (`Verified ✅`)**:
-  - Sau khi sao lưu, hệ thống nạp thử các bản dump SQL vào container `nas_sync_sandbox` (chạy trên RAM `tmpfs`) để xác nhận 100% file SQL không bị hỏng trước khi đóng dấu `Verified ✅`.
-- **🛡️ Phòng chống Ransomware Chủ động (Anomaly Detection + Synology Btrfs WORM)**:
-  - Tự động phát hiện tỷ lệ file thay đổi đột biến bất thường, gửi cảnh báo khẩn cấp qua **Telegram / Email SMTP** và **tự động ghim khóa (Auto-Pin)** toàn bộ các bản sao lưu sạch trước đó.
-  - Tích hợp Synology DSM WebAPI chụp **Btrfs Immutable Snapshot (WORM)** khóa cứng ở cấp độ File System.
-- **🔄 Khôi phục 1-Click & Di chuyển Chéo Control Panel (Cross-Panel Migration)**:
-  - Khôi phục riêng lẻ Mã nguồn (`Files Only`), Cơ sở dữ liệu (`DB Only`) hoặc toàn bộ (`Full`), hỗ trợ chuyển trực tiếp website từ **DirectAdmin ➔ Plesk / cPanel / aaPanel** (và ngược lại) kèm tự động chuẩn hóa `chown` quyền chủ sở hữu.
-- **🔄 Cập nhật Trực tiếp 1-Click từ GitHub (`Self-Update`)**:
-  - Kiểm tra phiên bản mới, xem Changelog, tự động sao lưu CSDL quản trị và nâng cấp trực tiếp từ `https://github.com/shostwp-byte/nas-sync` ngay trên giao diện Web mà không mất dữ liệu.
+  - Tiết kiệm **85% – 95% dung lượng ổ cứng NAS**: các tệp không thay đổi giữa các ngày dùng chung Inode vật lý nhưng mỗi ngày vẫn là một cây thư mục hoàn chỉnh độc lập.
+  - Luồng nén trực tiếp `mysqldump --single-transaction --quick | zstd -3` qua ống dẫn SSH về thẳng NAS — **không tạo bất kỳ tệp `.tar.gz`/`.sql` tạm nào trên ổ cứng VPS**.
+- **🧪 Tự động Thẩm định SQL trên MariaDB RAM Sandbox (`Verified ✅`)**:
+  - Sau mỗi ca sao lưu, hệ thống nạp thử các bản dump SQL vào container `nas_sync_sandbox` cô lập trên RAM (`tmpfs`, chế độ `--binary-mode` dưới tài khoản giới hạn đặc quyền) để xác nhận 100% tệp SQL nguyên vẹn trước khi đóng dấu `Verified ✅`.
+- **🛡️ Phòng chống Ransomware Đa Tầng (Anomaly Detection + Universal OS-Level WORM)**:
+  - Phát hiện sớm tỷ lệ tệp thay đổi hoặc dung lượng tăng đột biến bất thường, gửi cảnh báo khẩn cấp qua **Telegram / Email SMTP** và **tự động ghim khóa (Auto-Pin)** toàn bộ các bản sao lưu sạch trước đó.
+  - Tích hợp **Engine OS-Level WORM Snapshot đa nhà cung cấp**: hỗ trợ **TrueNAS SCALE ZFS Snapshot & Kernel Hold API v2.0**, **NAS Btrfs Share Snapshot WebAPI (`is_locked=true`)**, và **Custom Host Webhook ký số `HMAC-SHA256`** cho QNAP QuTS hero / Unraid / OpenMediaVault / Linux ZFS-LVM.
+- **☁️ Sao lưu Đám mây Offsite Chuẩn `3-2-1` Zero-Knowledge (`NASSYNC2` — `AES-256-GCM`)**:
+  - Nén và mã hóa luồng đầu-cuối (`PBKDF2-HMAC-SHA256` 600.000 vòng + `AES-256-GCM` xác thực Header AAD) đẩy thẳng lên **Cloudflare R2**, **AWS S3**, **Backblaze B2**, **Wasabi**, **MinIO** hoặc **Google Drive (`OAuth2` / `Service Account`)** không tốn ổ cứng tạm, kèm công cụ giải mã độc lập `scripts/decrypt-offsite-backup.mjs`.
+- **🔄 Khôi phục 1-Click, Di chuyển Chéo Control Panel & Cập nhật Ký số `Ed25519`**:
+  - Khôi phục riêng lẻ Mã nguồn (`Files Only`), Cơ sở dữ liệu (`DB Only`) hoặc toàn bộ (`Full`), tự động viết lại thông tin DB trong `wp-config.php` / `.env` / `env.php` / `configuration.php` an toàn dưới quyền user sở hữu website.
+  - Tính năng **1-Click Self-Update** xác thực bắt buộc chữ ký số mật mã **`Ed25519`** và mã băm **`SHA-256`** trước khi áp dụng bản cập nhật.
 
 ---
 
-## 🏗️ Kiến trúc Hệ thống
+## 🏗️ Kiến trúc Hệ thống Đa Nền tảng
 
 ```mermaid
 flowchart LR
-    subgraph Cluster["Cụm VPS Hosting (Linux)"]
-        V1["DirectAdmin\n(Domain + Subdomain)"]
-        V2["cPanel / WHM\n(Domain + Subdomain)"]
-        V3["Plesk Obsidian\n(Domain + Subdomain)"]
-        V4["aaPanel\n(Sites + Subdir Binding)"]
+    subgraph Cluster["Cụm Máy chủ Hosting / VPS (Linux)"]
+        P1["DirectAdmin • cPanel • Plesk"]
+        P2["aaPanel • CyberPanel • HestiaCP • CloudPanel"]
     end
 
-    subgraph NAS["Synology NAS (Container Manager / Docker)"]
+    subgraph Stack["Cụm Docker NAS-Sync (amd64 / arm64)"]
         CORE["nas_sync_core\n(Next.js 15 + BullMQ + Socket.IO)"]
-        REDIS["nas_sync_redis\n(Queue & Retry Backoff)"]
+        REDIS["nas_sync_redis\n(Persistent Queue)"]
         SANDBOX["nas_sync_sandbox\n(MariaDB RAM Verifier)"]
-        VOL1[("Synology Volume 1\nBtrfs + Hard-Link")]
-        VOL2[("Synology Volume 2\nAuto Overflow + Seed")]
     end
 
-    GH["GitHub Repository\nshostwp-byte/nas-sync"]
+    subgraph Storage["Hệ sinh thái NAS & Hệ thống Tệp"]
+        VOL1[("NAS Volume 1\nZFS • Btrfs • Ext4 • XFS")]
+        VOL2[("NAS Volume 2\nSmart Overflow + Local Seed")]
+        WORM["OS-Level WORM Adapter\n(TrueNAS ZFS Hold • Btrfs WebAPI • Webhook)"]
+    end
 
-    V1 & V2 & V3 & V4 <-->|"SSH Key + Rsync + Zstd Pipe"| CORE
+    subgraph Offsite["Đám mây Offsite 3-2-1 (Zero-Knowledge)"]
+        CLOUD["R2 • S3 • B2 • MinIO • Google Drive\n(NASSYNC2 AES-256-GCM)"]
+    end
+
+    P1 & P2 <-->|"SSH Ed25519 + Jailed Rsync + Zstd Stream"| CORE
     CORE <--> REDIS
     CORE --> SANDBOX
     CORE --> VOL1 & VOL2
-    GH <-->|"1-Click Self-Update"| CORE
+    CORE --> WORM
+    CORE --> CLOUD
 ```
 
 ---
 
-## ⚙️ Cấu hình Quan trọng Trước khi Chạy Docker (`.env` & `docker-compose.yml`)
+## 🗄️ Ma trận Tương thích & Đường dẫn Chuẩn Theo Dòng NAS
 
-Trước khi khởi chạy container lần đầu (hoặc sau khi `git clone`), hãy tạo file `.env` từ file mẫu (`cp .env.example .env` — nếu dùng gói `nas-sync-synology.zip` thì file `.env` đã được tạo sẵn) và kiểm tra **4 nhóm thông số** dưới đây:
+Tất cả các hệ thống dưới đây đều hỗ trợ đầy đủ **POSIX Hard-Link (`rsync --link-dest`)**, **MariaDB RAM Sandbox**, **Offsite 3-2-1** và **1-Click Signed Update**:
 
-### 1. Thiết lập Username & Password cho lần đăng nhập đầu tiên
+| Nền tảng NAS / Hệ điều hành | Công cụ Quản lý Docker | Đường dẫn `NAS_VOL1_PATH` Khuyến nghị | Hệ thống Tệp Tối ưu | Cơ chế Khóa WORM Khuyến nghị |
+| :--- | :--- | :--- | :--- | :--- |
+| **TrueNAS SCALE** | Apps -> Custom App (YAML) / Dockge | `/mnt/<ten-pool>/vps_backups` | `ZFS` | `TRUENAS_ZFS` (ZFS Snapshot + Hold API) |
+| **QNAP (QTS / QuTS hero)** | Container Station -> Application | `/share/CACHEDEV1_DATA/VPS_Backups` hoặc `/share/ZFS1_DATA/VPS_Backups` | `Ext4` / `ZFS` | `NONE` (GFS Pin + Offsite) hoặc `WEBHOOK` |
+| **UGREEN NASync (UGOS Pro)** | Docker -> Project (Compose) | `/volume1/VPS_Backups` | `Btrfs` / `Ext4` | `NONE` (GFS Pin + Offsite) hoặc `WEBHOOK` |
+| **TerraMaster (TOS 5 / 6)** | Docker Manager -> Project | `/Volume1/VPS_Backups` | `Btrfs` / `Ext4` | `NONE` (GFS Pin + Offsite) |
+| **Asustor (ADM)** | Portainer CE / Docker Engine | `/volume1/VPS_Backups` | `Btrfs` / `Ext4` | `NONE` (GFS Pin + Offsite) |
+| **Unraid OS** | Compose Manager / Dockerman | `/mnt/cache/vps_backups` hoặc `/mnt/disk1/vps_backups` *(ưu tiên hơn `/mnt/user`)* | `ZFS` / `Btrfs` / `XFS` | `NONE` hoặc `WEBHOOK` |
+| **OpenMediaVault (OMV)** | omv-extras Compose / Portainer | `/srv/dev-disk-by-uuid-.../vps_backups` | `Ext4` / `Btrfs` / `XFS` / `ZFS` | `NONE` hoặc `WEBHOOK` |
+| **NAS Btrfs / DSM-compatible** | Container GUI / Docker Compose | `/volume1/VPS_Backups` | `Btrfs` / `Ext4` | `NAS_WEBAPI` (Immutable Share Lock) |
+| **Ubuntu / Debian / Proxmox** | Docker Compose / Portainer / Dockge | `/opt/nas-sync/backups` hoặc `/mnt/storage/backups` | `Ext4` / `XFS` / `ZFS` / `Btrfs` | `NONE` hoặc `WEBHOOK` |
 
-Mở file `.env` và chỉnh sửa thông tin tài khoản quản trị khởi tạo ban đầu:
-
-```env
-ADMIN_USERNAME=admin
-ADMIN_PASSWORD=MatKhauManhCuaBan@2026
-FORCE_RESET_ADMIN_PASSWORD=false
-```
-
-- **`ADMIN_USERNAME`**: Tên tài khoản quản trị (từ 3–32 ký tự không dấu, ví dụ: `sysadmin`).
-- **`ADMIN_PASSWORD`**: Mật khẩu đăng nhập lần đầu (tối thiểu 6 ký tự — **bắt buộc đổi** trước khi mở truy cập qua Internet).
-- **Lưu ý quan trọng**:
-  - Hai biến trên chỉ tự động nạp ở **lần khởi tạo CSDL đầu tiên**. Sau khi hệ thống đã chạy, bạn có thể đổi cả **Username** lẫn **Password** trực tiếp trên giao diện Web tại mục **Cấu hình & Cập nhật (`/settings`)**.
-  - Nếu quên tài khoản/mật khẩu đã đổi, hãy đặt `FORCE_RESET_ADMIN_PASSWORD=true` kèm `ADMIN_USERNAME` / `ADMIN_PASSWORD` mới trong `.env`, khởi động lại container `nas_sync_core`, sau đó trả lại `FORCE_RESET_ADMIN_PASSWORD=false`.
-
-### 2. Thiết lập Đường dẫn Lưu trữ File Sao lưu trên NAS
-
-Hệ thống ánh xạ thư mục thực tế ngoài **Synology NAS** vào bên trong **Container** để dữ liệu sao lưu nằm trực tiếp trên phân vùng ổ cứng Btrfs/EXT4 của bạn:
-
-1. **Tạo sẵn thư mục trên NAS trước khi chạy Docker**:
-   - Mở **File Station** (hoặc **Control Panel -> Shared Folder**) trên DSM, tạo thư mục lưu trữ (ví dụ: `/volume1/VPS_Backups`).
-   - *Lưu ý:* Nếu thư mục đích trên NAS chưa tồn tại, Synology Container Manager sẽ báo lỗi `Bind mount folder does not exist`.
-2. **Khai báo đường dẫn trong file `.env`**:
-   ```env
-   # Đường dẫn thực tế ngoài Synology NAS
-   NAS_VOL1_PATH=/volume1/VPS_Backups
-
-   # Đường dẫn tương ứng bên trong Container (mặc định ánh xạ vào /mnt/vol1)
-   STORAGE_VOLUMES=/mnt/vol1
-   ```
-3. **Khi mở rộng từ 2 ổ cứng / Volume trở lên (Tự động chuyển ổ khi đầy)**:
-   - Tạo thêm thư mục trên phân vùng thứ 2 (VD: `/volume2/VPS_Backups`).
-   - Trong `.env`, cập nhật:
-     ```env
-     NAS_VOL1_PATH=/volume1/VPS_Backups
-     NAS_VOL2_PATH=/volume2/VPS_Backups
-     STORAGE_VOLUMES=/mnt/vol1,/mnt/vol2
-     ```
-   - Mở file `docker-compose.yml`, tìm mục `services.app.volumes` và **bỏ dấu `#`** ở dòng phân vùng thứ 2:
-     ```yaml
-     volumes:
-       - ./app_data:/app/data
-       - ./ssh_keys:/root/.ssh
-       - ${NAS_VOL1_PATH:-/volume1/VPS_Backups}:/mnt/vol1
-       - ${NAS_VOL2_PATH:-/volume2/VPS_Backups}:/mnt/vol2
-     ```
-   - **Không xóa 2 dòng `./app_data` và `./ssh_keys`**: đây là nơi lưu bền vững CSDL cấu hình và cặp khóa SSH kết nối VPS qua các lần nâng cấp container.
-
-### 3. Thiết lập Thông tin Kết nối Dữ liệu & Hàng đợi Nội bộ
-
-NAS-Sync vận hành khép kín với 3 tầng dữ liệu đã được cấu hình sẵn trong mạng nội bộ Docker (`docker-compose.yml`):
-
-```env
-# 1. Hàng đợi tiến trình & cơ chế tự động thử lại (BullMQ + Redis nội bộ)
-REDIS_URL=redis://redis:6379
-
-# 2. Máy chủ MariaDB Sandbox độc lập (chạy trên RAM tmpfs để kiểm tra file SQL sau khi sao lưu)
-SANDBOX_DB_HOST=db_sandbox
-SANDBOX_DB_PORT=3306
-SANDBOX_DB_USER=root
-SANDBOX_DB_PASSWORD=sandbox_secret_pass
-```
-
-- **CSDL Quản trị (`SQLite WAL`)**: Tự động khởi tạo và lưu trữ tại `./app_data/nas-sync.db` (ánh xạ vào `DATA_DIR=/app/data`), không cần cài đặt thêm hệ quản trị CSDL bên ngoài.
-- **MariaDB Sandbox (`SANDBOX_DB_*`)**: Giữ nguyên `SANDBOX_DB_HOST=db_sandbox` và `SANDBOX_DB_PORT=3306` để kết nối qua mạng nội bộ Docker. Khuyến nghị đổi `SANDBOX_DB_PASSWORD` sang một chuỗi mật khẩu riêng bất kỳ (cả 2 container `nas_sync_core` và `nas_sync_sandbox` sẽ tự động đồng bộ theo biến này).
-- **Redis Queue (`REDIS_URL`)**: Giữ nguyên `redis://redis:6379` (dữ liệu Redis sử dụng Docker Named Volume `nas_sync_redis_data` để không bị xung đột quyền Windows ACL trên Synology Btrfs).
-- *(Lưu ý: Cơ sở dữ liệu MySQL/MariaDB của các website trên VPS **không cấu hình tại `.env`**, mà hệ thống sẽ tự động quét qua SSH từ DirectAdmin / cPanel / Plesk / aaPanel sau khi bạn thêm máy chủ trên giao diện Web).*
-
-### 4. Các Tham số Quan trọng Khác Trước khi Chạy Docker
-
-| Tham số / Cấu hình | Vị trí | Giá trị mặc định | Ý nghĩa & Lưu ý vận hành |
-| :--- | :--- | :--- | :--- |
-| `APP_HOST_PORT` | `.env` | `3080` | Cổng truy cập giao diện Web trên IP của NAS (`http://<IP_NAS>:3080`). Đổi sang cổng khác (VD: `3088`) nếu cổng `3080` đang được dùng. |
-| `APP_URL` | `.env` | `https://backup.example.com` | Địa chỉ tên miền chính thức của bạn (hiển thị trong mẫu báo cáo Email và liên kết cảnh báo). |
-| `JWT_SECRET` | `.env` | *(Để trống)* | Khóa ký phiên đăng nhập. Để trống để hệ thống **tự động sinh khóa ngẫu nhiên 96 ký tự** lưu tại `app_data/.jwt_secret`, hoặc tự điền chuỗi ngẫu nhiên dài tối thiểu `32` ký tự. |
-| `VOLUME_MAX_USAGE_PERCENT` | `.env` | `85` | Ngưỡng đầy tối đa theo `%` của ổ cứng NAS (vượt ngưỡng sẽ báo `FULL` và tự chuyển sang Volume kế tiếp nếu có). |
-| `VOLUME_MIN_FREE_GB` | `.env` | `10` | Dung lượng trống an toàn tối thiểu tính bằng `GB` (có thể chỉnh thành `0` trên Web nếu dùng Shared Folder Quota dung lượng nhỏ và chỉ muốn tính theo `%`). |
-| `TZ` | `docker-compose.yml` | `Asia/Ho_Chi_Minh` | Múi giờ chuẩn của hệ thống — quyết định giờ chạy lịch Cron tự động hàng đêm và dấu thời gian đặt tên bản Snapshot. |
-| `seccomp:unconfined` | `docker-compose.yml` | Đã bật sẵn | **Bắt buộc giữ nguyên** trên Synology DSM (đặc biệt các dòng NAS dùng Linux Kernel 4.4) để container Alpine/Node 24 đọc chính xác dung lượng ổ cứng (`statfs`) và khởi chạy Redis không lỗi. |
-| `tmpfs: /var/lib/mysql` | `docker-compose.yml` | `size=1g` | Giới hạn RAM cấp cho MariaDB Sandbox để kiểm định file SQL mà không gây hao mòn ổ cứng NAS. Nếu có Database đơn lẻ lớn > 800 MB và NAS dư RAM, có thể tăng lên `size=2g` hoặc `size=4g`. |
-
-*(Các thông số Cảnh báo Telegram Bot, Báo cáo SMTP Email và Tích hợp Synology DSM Btrfs WORM có thể để trống lúc cài đặt và cấu hình trực quan sau trên giao diện Web tại mục **Cấu hình & Cập nhật**).*
+> **Lưu ý quan trọng về hệ thống tệp:** Không đặt `NAS_VOL1_PATH` lên ổ gắn ngoài định dạng **`exFAT` / `FAT32` / `NTFS`** hoặc thư mục mạng **`SMB/CIFS`**, vì chúng không hỗ trợ đầy đủ POSIX Hard-Link và quyền `chmod 0600` cho khóa SSH. Trang **Phân vùng Lưu trữ (`/volumes`)** của NAS-Sync sẽ tự động kiểm tra và hiển thị huy hiệu **`Hard-Link OK`** ngay khi gắn kết thành công.
 
 ---
 
-## 🚀 Cài đặt Nhanh trên Synology NAS (DSM 7.x)
+## 🚀 3 Phương thức Cài đặt Nhanh
 
-### Cách 1: Cài đặt qua Giao diện Container Manager (Không cần lệnh SSH)
+### Cách 1: Cài đặt Tự động 1 Lệnh qua SSH (`install.sh` — Tự dò loại NAS)
 
-1. Tải gói phát hành **`nas-sync-synology.zip`** tại mục [Releases](https://github.com/shostwp-byte/nas-sync/releases) (hoặc tải mã nguồn từ GitHub).
-2. Mở **File Station** trên Synology DSM:
-   - Tạo Shared Folder lưu trữ bản sao lưu khớp với `NAS_VOL1_PATH` (ví dụ: `/volume1/VPS_Backups`).
-   - Upload `nas-sync-synology.zip` vào `/docker` và bấm chuột phải chọn **Extract Here** -> thu được thư mục `/volume1/docker/nas-sync`.
-   - Mở file `/docker/nas-sync/.env` bằng **Text Editor** trên DSM để kiểm tra và cập nhật các thông số ở mục **⚙️ Cấu hình Quan trọng** phía trên (`ADMIN_USERNAME`, `ADMIN_PASSWORD`, `NAS_VOL1_PATH`, `APP_HOST_PORT`...).
-3. Mở **Container Manager** -> **Project** -> **Create**:
-   - **Project Name**: `nas-sync`
-   - **Path**: Chọn `/docker/nas-sync` -> chọn **Use existing docker-compose.yml**.
-   - Bấm **Next** -> **Done** (đợi 1–3 phút ở lần đầu để hệ thống tự build image và khởi chạy 3 container `nas_sync_core`, `nas_sync_redis`, `nas_sync_sandbox`).
-4. Truy cập giao diện quản trị tại: `http://<IP_NAS_CỦA_BẠN>:3080` và đăng nhập bằng `ADMIN_USERNAME` / `ADMIN_PASSWORD` bạn đã thiết lập.
-
-### Cách 2: Cài đặt qua SSH / Git
+Phù hợp cho mọi dòng NAS và máy chủ Linux có mở SSH. Kịch bản `install.sh` tự động nhận diện nền tảng NAS, nạp đường dẫn binary Docker, sinh khóa bảo mật ngẫu nhiên vào `.env` và khởi chạy toàn bộ cụm container:
 
 ```bash
-cd /volume1/docker
 git clone https://github.com/shostwp-byte/nas-sync.git
 cd nas-sync
-cp .env.example .env
-nano .env   # Chỉnh sửa ADMIN_USERNAME, ADMIN_PASSWORD, NAS_VOL1_PATH... trước khi chạy
-sudo bash install-synology.sh
+sudo bash install.sh
 ```
 
-*(Xem thêm hướng dẫn cấu hình tên miền SSL Cloudflare Tunnel & Synology Reverse Proxy chi tiết tại [HUONG-DAN-CAI-DAT-SYNOLOGY.md](./HUONG-DAN-CAI-DAT-SYNOLOGY.md)).*
+### Cách 2: Chạy Trực tiếp Multi-Arch Image từ GHCR (Portainer / Dockge / Container Station / TrueNAS)
+
+Không cần biên dịch mã nguồn trên NAS — kéo trực tiếp Image đa kiến trúc (`amd64` / `arm64`) đã đóng gói sẵn tại `ghcr.io/shostwp-byte/nas-sync:latest`:
+
+1. Tải tệp `docker-compose.yml` và `.env.example` (đổi tên thành `.env`), mở dòng `image: ghcr.io/shostwp-byte/nas-sync:latest` (và đóng dấu `#` dòng `build: .`).
+2. Chỉnh `NAS_VOL1_PATH`, `PUID`, `PGID`, `ADMIN_PASSWORD` phù hợp với thiết bị NAS của bạn.
+3. Tạo sẵn thư mục lưu trữ trên NAS khớp với `NAS_VOL1_PATH`, sau đó nhấn **Deploy / Create Application** trên trình quản lý Docker GUI.
+
+### Cách 3: Cài đặt bằng Gói Nén Giao diện Web (`nas-sync-bundle.zip`)
+
+1. Tải gói **`nas-sync-bundle.zip`** tại mục [GitHub Releases](https://github.com/shostwp-byte/nas-sync/releases).
+2. Dùng trình quản lý tệp trên giao diện Web của NAS để tải lên thư mục chứa ứng dụng Docker và giải nén ra thư mục `nas-sync` (tệp `.env` và các thư mục `app_data`, `ssh_keys` đã được tạo sẵn).
+3. Chỉnh sửa tệp `.env` (`NAS_VOL1_PATH`, `ADMIN_PASSWORD`, `PUID`, `PGID`), tạo sẵn thư mục lưu trữ sao lưu và khởi chạy dự án từ `docker-compose.yml`.
+4. Truy cập giao diện quản trị tại `http://<IP_NAS_CỦA_BẠN>:3080`.
+
+*(Xem hướng dẫn chi tiết từng bước về phân quyền `PUID/PGID`, cấu hình Cloudflare Tunnel / Reverse Proxy hỗ trợ WebSocket tại [HUONG-DAN-CAI-DAT-NAS.md](./HUONG-DAN-CAI-DAT-NAS.md)).*
+
+---
+
+## ⚙️ Tham chiếu Cấu hình Trọng yếu (`.env`)
+
+| Tham số | Giá trị mặc định | Ý nghĩa & Lưu ý vận hành |
+| :--- | :--- | :--- |
+| `APP_HOST_PORT` | `3080` | Cổng truy cập giao diện Web trên IP của NAS (`http://<IP_NAS>:3080`). |
+| `APP_URL` | `https://backup.example.com` | Tên miền truy cập chính thức (dùng cho liên kết cảnh báo và OAuth2 Callback). |
+| `NAS_VOL1_PATH` | `/volume1/VPS_Backups` | Đường dẫn thư mục sao lưu thực tế trên thiết bị NAS ánh xạ vào `/mnt/vol1` trong container. |
+| `STORAGE_VOLUMES` | `/mnt/vol1` | Danh sách đường dẫn phân vùng bên trong container (VD: `/mnt/vol1,/mnt/vol2` khi gắn nhiều ổ cứng). |
+| `PUID` / `PGID` | `1000` / `1000` | UID/GID chạy tiến trình bên trong container non-root — đặt khớp với tài khoản sở hữu thư mục trên NAS. |
+| `ADMIN_USERNAME` / `ADMIN_PASSWORD` | `admin` / `nas-sync@2026` | Tài khoản quản trị khởi tạo lần đầu (khuyến nghị đổi ngay sau khi đăng nhập và bật xác thực 2 lớp **2FA TOTP**). |
+| `JWT_SECRET` / `TOTP_ENCRYPTION_KEY` | *(Tự sinh ngẫu nhiên)* | Để trống để hệ thống tự sinh khóa 256-bit lưu bền vững trong `app_data/`, hoặc điền chuỗi hex tối thiểu 32 ký tự. |
+| `TRUST_PROXY` | `false` | Chỉ bật `true` khi đặt sau Reverse Proxy / Cloudflare Tunnel tin cậy **và** đã khóa cổng nội bộ `3080` với mạng ngoài. |
+| `WORM_PROVIDER` | `NONE` | Cơ chế khóa Snapshot bất biến cấp hệ điều hành (`NONE`, `TRUENAS_ZFS`, `NAS_WEBAPI`, `WEBHOOK` — có thể chọn trực quan trên Web UI). |
 
 ---
 
 ## 🔑 Kết nối Máy chủ VPS trong 60 Giây
 
 1. Trên giao diện Web **NAS-Sync**, vào mục **Máy chủ VPS & SSH (`/servers`)** -> bấm **Quản lý SSH Keys** -> bấm **+ Sinh Khóa SSH Mới (`Ed25519`)**.
-2. Bấm **Copy lệnh gán lên VPS** (hoặc copy khóa công khai `ssh-ed25519 ...`) và chạy trên SSH `root` của VPS cần sao lưu:
+2. Sao chép lệnh gán khóa công khai và chạy trên SSH `root` của VPS cần sao lưu:
    ```bash
    mkdir -p ~/.ssh && chmod 700 ~/.ssh
    echo "ssh-ed25519 AAAAC3... nas-sync" >> ~/.ssh/authorized_keys
    chmod 600 ~/.ssh/authorized_keys
    restorecon -Rv ~/.ssh 2>/dev/null || true
    ```
-3. Bấm **Thêm Máy chủ VPS**, điền IP, SSH Port, chọn loại Control Panel (`DirectAdmin` / `cPanel` / `Plesk` / `aaPanel`) và chọn khóa SSH vừa tạo -> bấm **Quét thử** để kiểm tra toàn bộ danh sách Domain, Subdomain và MySQL Database!
+3. Bấm **Thêm Máy chủ VPS**, điền IP, SSH Port, chọn loại Control Panel (`DirectAdmin` / `cPanel` / `Plesk` / `aaPanel` / `CyberPanel` / `HestiaCP` / `CloudPanel`), xác nhận ghim vân tay SSH Host Key (`TOFU Pinning`) và bấm **Quét thử** để khám phá toàn bộ Domain, Subdomain và Database.
 
 ---
 
-## 🔄 Cập nhật Phiên bản Mới từ GitHub
+## 🔄 Cập nhật Phiên bản Mới An toàn
 
-- **Cách 1 — Cập nhật 1-Click ngay trên Giao diện Web (Khuyên dùng)**:
-  1. Truy cập menu **Cấu hình & Cập nhật (`/settings`)**.
-  2. Tại khung **Cập nhật Hệ thống Trực tiếp từ GitHub**, nhấn **Kiểm tra bản mới**.
-  3. Khi có bản mới, nhấn **Cập nhật ngay** — hệ thống sẽ tự động sao lưu CSDL SQLite, tải mã nguồn mới từ `shostwp-byte/nas-sync`, biên dịch kiểm tra an toàn trong vùng cô lập và tự khởi động lại dịch vụ trong vài giây.
+- **Cách 1 — Cập nhật 1-Click Ký số `Ed25519` ngay trên Giao diện Web (Khuyên dùng)**:
+  1. Vào mục **Cấu hình & Cập nhật (`/settings` -> Tab `Cập nhật`)**.
+  2. Bấm **Kiểm tra bản mới** -> **Cập nhật ngay**. Hệ thống tự động kiểm tra chữ ký số `Ed25519` (`.sig`) và mã băm `SHA-256`, sao lưu CSDL SQLite + `node_modules` để hỗ trợ hoàn tác tức thì nếu xảy ra sự cố, và tự khởi động lại dịch vụ trong vài giây.
 - **Cách 2 — Cập nhật lại toàn bộ Docker Image qua SSH**:
   ```bash
-  cd /volume1/docker/nas-sync
-  sudo bash update-synology.sh
+  cd /duong-dan/nas-sync
+  sudo bash update.sh
   ```
 
 ---
 
-## 💻 Phát triển trên Máy Local (Windows / macOS / Linux)
+## 💻 Phát triển & Kiểm thử Cục bộ (Windows / macOS / Linux)
 
 Dự án tích hợp sẵn chế độ **Dual-Mode** (tự động chuyển sang In-Memory Queue và Mock Panel Adapter khi chạy trên máy cá nhân không có Redis/SSH thật):
 
@@ -222,20 +176,21 @@ Dự án tích hợp sẵn chế độ **Dual-Mode** (tự động chuyển sang
 git clone https://github.com/shostwp-byte/nas-sync.git
 cd nas-sync
 npm install
+npm test
 npm run dev
 ```
 
-Mở trình duyệt tại `http://localhost:3000` để trải nghiệm toàn bộ luồng Backup, Hard-Link Incremental, Diff Viewer và Cross-Panel Restore.
+Mở trình duyệt tại `http://localhost:3000` để trải nghiệm toàn bộ luồng Backup, Hard-Link Incremental, File Explorer & Diff Viewer, Offsite 3-2-1 và Cross-Panel Restore.
 
 ---
 
-## 🤝 Đóng góp & Bảo mật
+## 🤝 Đóng góp & Chính sách Bảo mật
 
-- Mọi đóng góp tính năng, vá lỗi và cải thiện Adapter cho các Control Panel mới đều được hoan nghênh! Vui lòng đọc [CONTRIBUTING.md](./CONTRIBUTING.md) và [CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md).
-- Nếu phát hiện lỗ hổng bảo mật, vui lòng xem hướng dẫn báo cáo tại [SECURITY.md](./SECURITY.md).
+- Hoan nghênh mọi đóng góp mở rộng tính năng, Control Panel Adapter và cơ chế tích hợp NAS mới! Xem chi tiết tại [CONTRIBUTING.md](./CONTRIBUTING.md) và [CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md).
+- Nếu phát hiện lỗ hổng bảo mật, vui lòng gửi báo cáo riêng tư theo hướng dẫn tại [SECURITY.md](./SECURITY.md).
 
 ---
 
 ## 📄 Giấy phép (License)
 
-Phát hành hoàn toàn miễn phí dưới giấy phép mã nguồn mở **[MIT License](./LICENSE)** — tự do sử dụng, tùy biến và triển khai cho cả mục đích cá nhân lẫn doanh nghiệp thương mại.
+Phát hành hoàn toàn miễn phí dưới giấy phép mã nguồn mở **[MIT License](./LICENSE)** — tự do sử dụng, tùy biến và triển khai cho cả mục đích cá nhân lẫn doanh nghiệp.

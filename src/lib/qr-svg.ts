@@ -1,7 +1,7 @@
 /**
  * Zero-dependency ISO/IEC 18004 QR Code Matrix & SVG Encoder (UTF-8 Byte Mode, Versions 1–40).
  * Eliminates external native/npm dependencies during TOTP 2FA setup so 1-Click Self-Update
- * stays completely dependency-stable on Synology NAS containers.
+ * stays completely dependency-stable on multi-NAS Docker containers.
  */
 
 export type QrErrorCorrectionLevel = 'L' | 'M' | 'Q' | 'H';

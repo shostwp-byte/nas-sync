@@ -41,7 +41,7 @@ const CATEGORY_OPTIONS: Array<{
   { value: 'RESTORE', label: 'RESTORE — Khôi phục' },
   { value: 'ANOMALY', label: 'ANOMALY — Phát hiện bất thường' },
   { value: 'VOLUME', label: 'VOLUME — Ổ cứng & Phân vùng' },
-  { value: 'BTRFS', label: 'BTRFS — Snapshot WORM' },
+  { value: 'WORM', label: 'WORM — Snapshot Bất biến' },
   { value: 'SYSTEM', label: 'SYSTEM — Hệ thống & Cập nhật' },
 ];
 
@@ -86,6 +86,7 @@ function getCategoryBadgeClass(category: SystemAlert['category']): string {
       return 'bg-violet-500/15 text-violet-300 border-violet-500/30';
     case 'VOLUME':
       return 'bg-amber-500/15 text-amber-300 border-amber-500/30';
+    case 'WORM':
     case 'BTRFS':
       return 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30';
     default:

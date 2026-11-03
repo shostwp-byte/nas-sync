@@ -11,6 +11,8 @@ export type DatabaseEngine = 'MYSQL' | 'POSTGRESQL';
 
 export type OffsiteProviderType = 'NONE' | 'S3_COMPATIBLE' | 'GOOGLE_DRIVE';
 
+export type WormProviderType = 'NONE' | 'TRUENAS_ZFS' | 'NAS_WEBAPI' | 'WEBHOOK';
+
 export type OffsiteSyncStatus = 'QUEUED' | 'UPLOADING' | 'COMPLETED' | 'FAILED';
 
 export type UserRole = 'ADMIN' | 'OPERATOR' | 'VIEWER';
@@ -35,6 +37,14 @@ export type VerificationStatus = 'UNTESTED' | 'PASSED' | 'CORRUPTED';
 
 export type RestoreMode = 'FILES_ONLY' | 'DB_ONLY' | 'FULL';
 
+export interface VolumeCapabilities {
+  fs_type: string;
+  hardlink_supported: boolean;
+  symlink_supported: boolean;
+  writable: boolean;
+  warning?: string;
+}
+
 export interface StorageVolume {
   id: number;
   name: string;
@@ -50,6 +60,7 @@ export interface StorageVolume {
   free_bytes: number;
   last_checked_at: string | null;
   created_at: string;
+  capabilities?: VolumeCapabilities;
 }
 
 export interface SSHKeyRecord {
@@ -277,7 +288,7 @@ export interface RestoreRequestPayload {
 export interface SystemAlert {
   id: number;
   severity: 'INFO' | 'WARNING' | 'CRITICAL';
-  category: 'VOLUME' | 'ANOMALY' | 'BACKUP' | 'RESTORE' | 'BTRFS' | 'SYSTEM';
+  category: 'VOLUME' | 'ANOMALY' | 'BACKUP' | 'RESTORE' | 'BTRFS' | 'WORM' | 'SYSTEM';
   title: string;
   message: string;
   server_id: number | null;

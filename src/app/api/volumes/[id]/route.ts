@@ -78,7 +78,7 @@ export async function PATCH(
     );
     if (!Number.isInteger(nextBtrfsDays) || nextBtrfsDays < 1 || nextBtrfsDays > 3650) {
       return NextResponse.json(
-        { error: 'Số ngày khóa Btrfs WORM phải là số nguyên từ 1 đến 3650.' },
+        { error: 'Số ngày khóa WORM Snapshot phải là số nguyên từ 1 đến 3650.' },
         { status: 400 }
       );
     }

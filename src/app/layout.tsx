@@ -14,7 +14,7 @@ export const viewport: Viewport = {
 export const metadata: Metadata = {
   title: 'NAS-Sync — Hệ thống Sao lưu & Khôi phục Đa Máy chủ Mã nguồn Mở',
   description:
-    'Nền tảng sao lưu tăng dần (Incremental Hard-Link) & khôi phục chéo Control Panel chạy trên Synology NAS (MIT Open Source)',
+    'Nền tảng sao lưu tăng dần (Incremental Hard-Link) & khôi phục chéo Control Panel đa nền tảng NAS & Docker (MIT Open Source)',
   manifest: '/manifest.webmanifest',
   appleWebApp: {
     capable: true,

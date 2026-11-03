@@ -23,7 +23,7 @@ export const MOCK_HOST_KEY_FINGERPRINT =
  */
 export function wrapZeroImpact(remoteCommand: string): string {
   const quoted = shellSingleQuote(remoteCommand);
-  return `if command -v ionice >/dev/null 2>&1 && ionice -c 2 -n 7 true 2>/dev/null; then ionice -c 2 -n 7 nice -n 19 sh -c ${quoted}; else nice -n 19 sh -c ${quoted}; fi`;
+  return `if command -v ionice >/dev/null 2>&1 && command -v nice >/dev/null 2>&1 && ionice -c 2 -n 7 true 2>/dev/null; then ionice -c 2 -n 7 nice -n 19 sh -c ${quoted}; elif command -v nice >/dev/null 2>&1; then nice -n 19 sh -c ${quoted}; else sh -c ${quoted}; fi`;
 }
 
 export function shellSingleQuote(str: string): string {
@@ -156,7 +156,7 @@ export function getKnownHostsDir(): string {
     try {
       fs.chmodSync(dir, 0o700);
     } catch {
-      // Bỏ qua trên mount chỉ đọc hoặc có Synology RichACL
+      // Bỏ qua trên mount chỉ đọc hoặc có NFSv4 / RichACL trên NAS
     }
   }
   return dir;
@@ -334,7 +334,7 @@ export function materializeServerKnownHostsFile(
     }
   }
 
-  // Nếu thư mục bind-mount trên Synology Btrfs dính Windows ACL (0777 hoặc UID khác),
+  // Nếu thư mục bind-mount trên NAS dính Windows/SMB ACL (0777 hoặc UID khác),
   // tạo bản sao chuẩn quyền 0600 trong tmpfs nội bộ container
   const safeTmpDir = path.join(os.tmpdir(), '.nas_sync_known_hosts');
   fs.mkdirSync(safeTmpDir, { recursive: true, mode: 0o700 });
@@ -663,7 +663,7 @@ function resolveServerKeyPath(server: ServerRecord): string | null {
   try {
     fs.chmodSync(candidate, 0o600);
   } catch {
-    // Bỏ qua trên mount chỉ đọc hoặc có Synology RichACL
+    // Bỏ qua trên mount chỉ đọc hoặc có NFSv4 / RichACL trên NAS
   }
 
   try {
@@ -673,7 +673,7 @@ function resolveServerKeyPath(server: ServerRecord): string | null {
       return candidate;
     }
 
-    // Nếu thư mục bind-mount trên Synology Btrfs dính Windows ACL (0777 hoặc UID 1026),
+    // Nếu thư mục bind-mount trên NAS dính Windows/SMB ACL (0777 hoặc UID host),
     // sao chép sang tmpfs nội bộ container với chuẩn quyền 0600 để OpenSSH không từ chối key
     const safeDir = path.join(os.tmpdir(), '.nas_sync_ssh_keys');
     fs.mkdirSync(safeDir, { recursive: true, mode: 0o700 });

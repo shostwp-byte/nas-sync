@@ -5,7 +5,7 @@ import type { SystemAlert } from '@/types';
 
 export interface CreateAlertInput {
   severity: 'INFO' | 'WARNING' | 'CRITICAL';
-  category: 'VOLUME' | 'ANOMALY' | 'BACKUP' | 'RESTORE' | 'BTRFS' | 'SYSTEM';
+  category: 'VOLUME' | 'ANOMALY' | 'BACKUP' | 'RESTORE' | 'BTRFS' | 'WORM' | 'SYSTEM';
   title: string;
   message: string;
   serverId?: number | null;

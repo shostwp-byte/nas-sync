@@ -14,12 +14,25 @@ echo "================================================================"
 echo "  NAS-SYNC — CẬP NHẬT HỆ THỐNG TỪ GITHUB RELEASES ($REPO_URL)"
 echo "================================================================"
 
+EXTRA_DOCKER_PATHS=(
+  "/usr/local/bin"
+  "/share/CACHEDEV1_DATA/.qpkg/container-station/bin"
+  "/share/CACHEDEV2_DATA/.qpkg/container-station/bin"
+  "/usr/local/AppCentral/docker-ce/bin"
+  "/opt/bin"
+)
+for p in "${EXTRA_DOCKER_PATHS[@]}"; do
+  if [ -d "$p" ]; then
+    export PATH="$p:$PATH"
+  fi
+done
+
 if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
   COMPOSE_CMD="docker compose"
 elif command -v docker-compose >/dev/null 2>&1; then
   COMPOSE_CMD="docker-compose"
 else
-  echo "[LỖI] Không tìm thấy Docker Compose. Vui lòng bật Container Manager trên Synology DSM."
+  echo "[LỖI] Không tìm thấy Docker Compose trên thiết bị NAS/Linux."
   exit 1
 fi
 
@@ -33,8 +46,7 @@ for dbf in ./app_data/*.db; do
   fi
 done
 
-# R2 Fix: Mặc định chỉ cập nhật theo tag Release chính thức (trừ khi truyền --dev-main tường minh)
-# và KHÔNG BAO GIỜ ghi đè docker-compose.yml / .env người dùng đã tùy chỉnh.
+# 2. Mặc định chỉ cập nhật theo tag Release chính thức và kiểm tra mã băm SHA-256
 TMP_UPDATE=$(mktemp -d)
 trap 'rm -rf "${TMP_UPDATE:-}"' EXIT
 
@@ -50,11 +62,27 @@ else
     echo "[LỖI] Không tìm thấy bản phát hành (Release tag) hợp lệ trên GitHub."
     exit 1
   fi
+
   echo "📦 Đang tải gói phát hành chính thức ${LATEST_TAG}..."
-  RELEASE_ASSET_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${LATEST_TAG}/nas-sync-synology.tar.gz"
-  if curl -fsSL "$RELEASE_ASSET_URL" -o "$TMP_UPDATE/bundle.tar.gz" 2>/dev/null; then
+  BUNDLE_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${LATEST_TAG}/nas-sync-bundle.tar.gz"
+  BUNDLE_SHA_URL="${BUNDLE_URL}.sha256"
+
+  if curl -fsSL "$BUNDLE_URL" -o "$TMP_UPDATE/bundle.tar.gz" 2>/dev/null; then
+    if curl -fsSL "$BUNDLE_SHA_URL" -o "$TMP_UPDATE/bundle.tar.gz.sha256" 2>/dev/null; then
+      EXPECTED_SHA=$(awk '{print tolower($1)}' "$TMP_UPDATE/bundle.tar.gz.sha256")
+      if command -v sha256sum >/dev/null 2>&1; then
+        ACTUAL_SHA=$(sha256sum "$TMP_UPDATE/bundle.tar.gz" | awk '{print tolower($1)}')
+      else
+        ACTUAL_SHA=$(openssl dgst -sha256 "$TMP_UPDATE/bundle.tar.gz" | awk '{print tolower($NF)}')
+      fi
+      if [ -n "$EXPECTED_SHA" ] && [ "$EXPECTED_SHA" != "$ACTUAL_SHA" ]; then
+        echo "[LỖI] Kiểm tra toàn vẹn SHA-256 gói cập nhật thất bại! Đã hủy cập nhật."
+        exit 1
+      fi
+      echo "🔐 Đã xác minh mã băm SHA-256 hợp lệ (${ACTUAL_SHA})."
+    fi
     tar -xzf "$TMP_UPDATE/bundle.tar.gz" --strip-components=1 -C "$TMP_UPDATE"
-    rm -f "$TMP_UPDATE/bundle.tar.gz"
+    rm -f "$TMP_UPDATE/bundle.tar.gz" "$TMP_UPDATE/bundle.tar.gz.sha256"
   else
     curl -fsSL "https://codeload.github.com/${REPO_OWNER}/${REPO_NAME}/tar.gz/refs/tags/${LATEST_TAG}" | tar -xz --strip-components=1 -C "$TMP_UPDATE"
   fi

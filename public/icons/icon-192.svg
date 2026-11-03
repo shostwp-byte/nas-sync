@@ -28,13 +28,13 @@
     stroke-linejoin="round"
   />
 
-  <!-- Synology NAS Server Rack Bay 1 -->
+  <!-- NAS Storage Rack Bay 1 -->
   <rect x="64" y="62" width="64" height="22" rx="5.5" fill="#0f172a" stroke="#38bdf8" stroke-width="2.4" />
   <circle cx="74" cy="73" r="3" fill="#10b981" />
   <circle cx="84" cy="73" r="3" fill="#22d3ee" />
   <rect x="96" y="71" width="22" height="4" rx="2" fill="#334155" />
 
-  <!-- Synology NAS Server Rack Bay 2 -->
+  <!-- NAS Storage Rack Bay 2 -->
   <rect x="64" y="90" width="64" height="22" rx="5.5" fill="#0f172a" stroke="#10b981" stroke-width="2.4" />
   <circle cx="74" cy="101" r="3" fill="#10b981" />
   <circle cx="84" cy="101" r="3" fill="#10b981" />

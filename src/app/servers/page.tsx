@@ -1097,7 +1097,7 @@ export default function ServersPage() {
 
               <div>
                 <label className="block text-slate-300 mb-1 font-medium">
-                  Phân vùng Synology NAS chỉ định
+                  Phân vùng lưu trữ NAS chỉ định
                 </label>
                 <select
                   value={form.assigned_volume_id}

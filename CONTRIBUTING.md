@@ -7,7 +7,7 @@ Cảm ơn bạn đã quan tâm và đóng góp cho dự án mã nguồn mở **N
 - **Node.js**: `>= 22.5` (Khuyến nghị `Node.js 24 LTS` để sử dụng module `node:sqlite` tích hợp sẵn không cần biên dịch C++).
 - **Hệ điều hành**:
   - Phát triển giao diện & kiểm thử mô phỏng (Mock Mode): Chạy trực tiếp trên Windows / macOS / Linux.
-  - Kiểm thử luồng SSH/Rsync/Zstd thực tế: Chạy qua Docker Compose hoặc Synology Container Manager.
+  - Kiểm thử luồng SSH/Rsync/Zstd thực tế: Chạy qua Docker Compose trên thiết bị NAS hoặc máy chủ Linux.
 
 ```bash
 git clone https://github.com/shostwp-byte/nas-sync.git

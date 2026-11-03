@@ -19,7 +19,9 @@ const SECRET_MASK = '••••••••';
 
 const SECRET_SETTING_KEYS = new Set([
   'smtp_pass',
-  'dsm_password',
+  'worm_password',
+  'worm_api_key',
+  'worm_webhook_secret',
   'telegram_bot_token',
   'github_token',
   'offsite_encryption_passphrase',
@@ -43,16 +45,19 @@ const ALLOWED_SETTING_KEYS = new Set([
   'anomaly_max_delta_gb',
   'anomaly_change_ratio_percent',
   'anomaly_size_spike_gb',
-  'dsm_api_url',
-  'dsm_username',
-  'dsm_password',
-  'dsm_backup_shares',
-  'dsm_btrfs_shares',
+  'worm_provider',
+  'worm_api_url',
+  'worm_api_key',
+  'worm_username',
+  'worm_password',
+  'worm_target_shares',
+  'worm_tls_insecure',
+  'worm_webhook_secret',
+  'worm_cron_time',
+  'worm_auto_enabled',
+  'worm_retention_days',
   'btrfs_cron_time',
   'btrfs_auto_enabled',
-  'dsm_worm_enabled',
-  'dsm_worm_lock_days',
-  'dsm_tls_insecure',
   'github_token',
   'global_exclude_patterns',
   'digest_enabled',
@@ -79,6 +84,8 @@ const ALLOWED_SETTING_KEYS = new Set([
 const CRON_TRIGGER_KEYS = new Set([
   'digest_enabled',
   'digest_cron_time',
+  'worm_auto_enabled',
+  'worm_cron_time',
   'btrfs_auto_enabled',
   'btrfs_cron_time',
 ]);
@@ -109,7 +116,12 @@ function applySettingsDictionary(
       sanitized[k] = check.normalized;
       continue;
     }
-    if ((k === 'digest_cron_time' || k === 'btrfs_cron_time') && strVal.trim()) {
+    if (
+      (k === 'digest_cron_time' ||
+        k === 'worm_cron_time' ||
+        k === 'btrfs_cron_time') &&
+      strVal.trim()
+    ) {
       if (!cron.validate(strVal.trim())) {
         return NextResponse.json(
           {
@@ -119,6 +131,24 @@ function applySettingsDictionary(
         );
       }
       sanitized[k] = strVal.trim();
+      continue;
+    }
+    if (k === 'worm_provider') {
+      const upper = strVal.trim().toUpperCase();
+      if (!['NONE', 'TRUENAS_ZFS', 'NAS_WEBAPI', 'WEBHOOK'].includes(upper)) {
+        return NextResponse.json(
+          { error: 'Cơ chế OS-Level WORM Snapshot không hợp lệ.' },
+          { status: 400 }
+        );
+      }
+      sanitized[k] = upper;
+      continue;
+    }
+    if (k === 'worm_retention_days') {
+      const num = parseInt(strVal.trim(), 10);
+      sanitized[k] = String(
+        Number.isFinite(num) && num >= 1 ? Math.min(num, 3650) : 7
+      );
       continue;
     }
     if (k === 'offsite_provider') {
@@ -276,7 +306,7 @@ export async function POST(req: NextRequest) {
         category: 'SYSTEM',
         title: 'Kiểm tra kết nối cảnh báo NAS-Sync',
         message:
-          'Đây là tin nhắn kiểm tra thành công từ hệ thống Sao lưu Tập trung NAS-Sync đang chạy trên Synology NAS của bạn.',
+          'Đây là tin nhắn kiểm tra thành công từ hệ thống Sao lưu Tập trung NAS-Sync đang chạy trên hệ thống NAS của bạn.',
       });
       return NextResponse.json({ ok: true, ...res });
     }
