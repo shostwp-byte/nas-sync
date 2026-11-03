@@ -33,6 +33,7 @@ const INCLUDE_FILES = [
   'package.json',
   'package-lock.json',
   'tsconfig.json',
+  'eslint.config.mjs',
   'next.config.mjs',
   'postcss.config.mjs',
   'tailwind.config.ts',

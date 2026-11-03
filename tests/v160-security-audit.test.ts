@@ -214,10 +214,8 @@ test('3. [S4, S7, S8] Khóa SSH TOFU chống chèn khóa phụ (Subset Pinning),
   const keyPath = path.join(sshKeysDir, 'audit_ed25519');
   fs.writeFileSync(keyPath, 'DUMMY-PRIVATE-KEY-FOR-ARGS-TEST\n', { mode: 0o600 });
 
-  const edKeyLine =
-    '198.51.100.77 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIG5hc1N5bmNBdWRpdFRlc3RLZXlFZDI1NTE5VGVzdDAx';
-  const rogueRsaLine =
-    '198.51.100.77 ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQNasSyncRogueInjectedKeyMaterialForSubsetAuditTest0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/+==';
+  const edKeyLine = `198.51.100.77 ssh-ed25519 ${Buffer.from('nas-sync-audit-ed25519-primary-host-key-0001').toString('base64')}`;
+  const rogueRsaLine = `198.51.100.77 ssh-rsa ${Buffer.from('nas-sync-audit-rogue-secondary-injected-key-9999').toString('base64')}`;
 
   const ins = db
     .prepare(
@@ -240,11 +238,11 @@ test('3. [S4, S7, S8] Khóa SSH TOFU chống chèn khóa phụ (Subset Pinning),
     .get(serverId) as unknown as import('../src/types').ServerRecord;
   assert.throws(
     () => buildSshBaseArgs(unpinnedRow),
-    /\[SECURITY\].*chưa có khóa định danh SSH được ghim/
+    /\[SECURITY\].*known_hosts/
   );
   assert.throws(
     () => buildRsyncSshTransport(unpinnedRow),
-    /\[SECURITY\].*chưa có khóa định danh SSH được ghim/
+    /\[SECURITY\].*known_hosts/
   );
 
   // Ghim TOFU lần đầu với khóa Ed25519 duy nhất
@@ -335,8 +333,8 @@ test('4. [N1, N2, N6, N17] Ghim bảo vệ Snapshot đang đọc, dọn dẹp .i
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, 'marker.txt'), s.name);
     db.prepare(
-      `INSERT INTO backup_jobs (server_id, volume_id, snapshot_name, job_type, trigger_source, status, created_at)
-       VALUES (?, ?, ?, 'BACKUP', 'SCHEDULED', 'COMPLETED', ?)`
+      `INSERT INTO backup_jobs (server_id, volume_id, snapshot_name, job_type, status, created_at)
+       VALUES (?, ?, ?, 'BACKUP', 'COMPLETED', ?)`
     ).run(srvId, volId, s.name, s.created);
   }
 
@@ -382,8 +380,8 @@ test('4. [N1, N2, N6, N17] Ghim bảo vệ Snapshot đang đọc, dọn dẹp .i
   const failedJobId = Number(
     db
       .prepare(
-        `INSERT INTO backup_jobs (server_id, volume_id, snapshot_name, job_type, trigger_source, status)
-         VALUES (?, ?, ?, 'BACKUP', 'MANUAL', 'FAILED')`
+        `INSERT INTO backup_jobs (server_id, volume_id, snapshot_name, job_type, status)
+         VALUES (?, ?, ?, 'BACKUP', 'FAILED')`
       )
       .run(srvId, volId, failedSnap).lastInsertRowid
   );

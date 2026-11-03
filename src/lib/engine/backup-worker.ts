@@ -856,8 +856,3 @@ export async function executeBackupJob(
     clearCancelledJob(jobId);
   }
 }
-throw err;
-  } finally {
-  clearCancelledJob(jobId);
-}
-}

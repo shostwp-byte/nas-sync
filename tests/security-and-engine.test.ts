@@ -1383,10 +1383,7 @@ describe('8. v1.5.6 POSIX sh -n syntax validation across all 7 live Panel Adapte
               return { code: 0, stdout: '/home/cpuser/public_html\n', stderr: '' };
 
             case 'PLESK':
-              if (
-                remoteCommand.includes('/etc/psa/.psa.shadow') &&
-                !remoteCommand.includes('SET SESSION group_concat_max_len')
-              ) {
+              if (remoteCommand.includes('then echo OK; else exit 1')) {
                 return { code: 0, stdout: 'OK\n', stderr: '' };
               }
               if (remoteCommand.includes('SET SESSION group_concat_max_len')) {
