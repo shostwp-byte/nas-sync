@@ -96,42 +96,31 @@ export function getDirectorySizeAndCount(dirPath: string): {
   return { totalBytes, fileCount };
 }
 
-/**
- * Mục 5.2: Thực thi rsync Incremental (--link-dest) kéo mã nguồn từ VPS về NAS
- * kèm bắt luồng --info=progress2 thời gian thực.
- */
-export function runRsyncPullDomain(params: {
-  jobId: number;
+export function buildRsyncPullArgs(params: {
   server: ServerRecord;
   remoteWebroot: string;
+  systemUser?: string;
   destPublicHtmlDir: string;
-  linkDestPublicHtmlDir: string | null;
+  linkDestPublicHtmlDir?: string | null;
   excludedSubpaths?: string[];
   customExcludes?: string[];
-  onProgress: (pct: number, speedBps: number, etaSec: number) => void;
-  onLog: (msg: string) => void;
-}): Promise<{
-  filesTotal: number;
-  filesChanged: number;
-  totalBytes: number;
-  deltaBytes: number;
-}> {
+}): string[] {
   const {
-    jobId,
     server,
     remoteWebroot,
+    systemUser,
     destPublicHtmlDir,
     linkDestPublicHtmlDir,
     excludedSubpaths,
     customExcludes,
-    onProgress,
-    onLog,
   } = params;
-
-  fs.mkdirSync(destPublicHtmlDir, { recursive: true });
 
   const args: string[] = [
     '-az',
+    '--no-owner',
+    '--no-group',
+    '--chmod=ugo-s',
+    '--no-keep-dirlinks',
     '--delete',
     '--no-devices',
     '--no-specials',
@@ -169,12 +158,66 @@ export function runRsyncPullDomain(params: {
   }
 
   args.push('-e', buildRsyncSshTransport(server));
-  // S3 Security Fix: Xác minh realpath + cd -P + pwd -P ngay trong cùng phiên thực thi rsync trên VPS và đồng bộ từ `.`
-  args.push(`--rsync-path=${buildJailedRsyncPath(remoteWebroot)}`);
+  // S3 Security Fix: Xác minh realpath + cd -P + pwd -P ngay trong cùng phiên thực thi rsync trên VPS và hạ quyền xuống user của site
+  args.push(
+    `--rsync-path=${buildJailedRsyncPath(remoteWebroot, {
+      runAsUser: systemUser,
+      mode: 'pull',
+    })}`
+  );
   args.push(
     `${server.ssh_user || 'root'}@${server.ip_address}:./`,
     `${destPublicHtmlDir.replace(/\/+$/, '')}/`
   );
+
+  return args;
+}
+
+/**
+ * Mục 5.2: Thực thi rsync Incremental (--link-dest) kéo mã nguồn từ VPS về NAS
+ * kèm bắt luồng --info=progress2 thời gian thực.
+ */
+export function runRsyncPullDomain(params: {
+  jobId: number;
+  server: ServerRecord;
+  remoteWebroot: string;
+  systemUser?: string;
+  destPublicHtmlDir: string;
+  linkDestPublicHtmlDir: string | null;
+  excludedSubpaths?: string[];
+  customExcludes?: string[];
+  onProgress: (pct: number, speedBps: number, etaSec: number) => void;
+  onLog: (msg: string) => void;
+}): Promise<{
+  filesTotal: number;
+  filesChanged: number;
+  totalBytes: number;
+  deltaBytes: number;
+}> {
+  const {
+    jobId,
+    server,
+    remoteWebroot,
+    systemUser,
+    destPublicHtmlDir,
+    linkDestPublicHtmlDir,
+    excludedSubpaths,
+    customExcludes,
+    onProgress,
+    onLog,
+  } = params;
+
+  fs.mkdirSync(destPublicHtmlDir, { recursive: true });
+
+  const args = buildRsyncPullArgs({
+    server,
+    remoteWebroot,
+    systemUser,
+    destPublicHtmlDir,
+    linkDestPublicHtmlDir,
+    excludedSubpaths,
+    customExcludes,
+  });
 
   return new Promise((resolve, reject) => {
     const child = spawn('rsync', args, {

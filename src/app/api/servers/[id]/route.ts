@@ -1,11 +1,16 @@
 import fs from 'node:fs';
+import path from 'node:path';
 import { NextRequest, NextResponse } from 'next/server';
 import { safeErrorJson, sanitizeErrorMessage } from '@/lib/api-error';
 import { recordAuditLog } from '@/lib/audit';
 import { requireRole } from '@/lib/auth';
 import { getDb } from '@/lib/db';
 import { validateExcludePatternsInput } from '@/lib/engine/exclude-rules';
-import { validateServerConnectionFields } from '@/lib/engine/safe-names';
+import {
+  isSafeServerLabel,
+  validateServerConnectionFields,
+} from '@/lib/engine/safe-names';
+import { removeDirectoryTreeNonBlocking } from '@/lib/engine/worker-state';
 import {
   MOCK_HOST_KEY_FINGERPRINT,
   removeServerKnownHostsCache,
@@ -241,21 +246,78 @@ export async function DELETE(
       .prepare('SELECT hostname, ip_address FROM servers WHERE id = ?')
       .get(serverId);
 
+    if (!curr) {
+      return NextResponse.json(
+        { error: 'Không tìm thấy máy chủ VPS.' },
+        { status: 404 }
+      );
+    }
+
+    // N25 Fix: Chặn xóa máy chủ khi đang có tiến trình Sao lưu / Khôi phục / Đồng bộ Offsite hoạt động (tránh lỗi FOREIGN KEY crash worker)
+    const activeJobCnt = Number(
+      db
+        .prepare(
+          `SELECT COUNT(*) AS cnt FROM backup_jobs
+           WHERE (server_id = ? OR target_server_id = ?)
+             AND status IN ('QUEUED', 'RUNNING', 'RESUMING', 'VERIFYING', 'INTERRUPTED')`
+        )
+        .get(serverId, serverId)?.cnt || 0
+    );
+    const activeOffsiteCnt = Number(
+      db
+        .prepare(
+          `SELECT COUNT(*) AS cnt FROM offsite_sync_jobs
+           WHERE server_id = ? AND status IN ('QUEUED', 'UPLOADING')`
+        )
+        .get(serverId)?.cnt || 0
+    );
+    if (activeJobCnt > 0 || activeOffsiteCnt > 0) {
+      return NextResponse.json(
+        {
+          error:
+            'Máy chủ đang có tiến trình Sao lưu, Khôi phục hoặc Đẩy Offsite hoạt động. Vui lòng hủy hoặc đợi hoàn tất trước khi xóa.',
+        },
+        { status: 409 }
+      );
+    }
+
+    const purgeSnapshots =
+      req.nextUrl.searchParams.get('purgeSnapshots') === 'true' ||
+      req.nextUrl.searchParams.get('purgeSnapshots') === '1';
+
     db.prepare('DELETE FROM servers WHERE id = ?').run(serverId);
     removeServerKnownHostsCache(serverId);
 
-    if (curr) {
-      recordAuditLog({
-        session: guard.session,
-        action: 'SERVER_DELETE',
-        resourceType: 'SERVER',
-        resourceId: String(serverId),
-        detail: `Xóa máy chủ VPS "${curr.hostname}" (${curr.ip_address})`,
-        req,
-      });
+    let purgedDirs = 0;
+    const serverHostname = String(curr.hostname || '').trim();
+    if (purgeSnapshots && isSafeServerLabel(serverHostname)) {
+      const volumes = db
+        .prepare('SELECT mount_path FROM storage_volumes')
+        .all();
+      for (const vol of volumes) {
+        const mountRoot = path.resolve(String(vol.mount_path || ''));
+        const hostDir = path.resolve(mountRoot, serverHostname);
+        if (path.dirname(hostDir) === mountRoot && fs.existsSync(hostDir)) {
+          await removeDirectoryTreeNonBlocking(hostDir);
+          purgedDirs += 1;
+        }
+      }
     }
 
-    return NextResponse.json({ ok: true });
+    recordAuditLog({
+      session: guard.session,
+      action: 'SERVER_DELETE',
+      resourceType: 'SERVER',
+      resourceId: String(serverId),
+      detail: `Xóa máy chủ VPS "${curr.hostname}" (${curr.ip_address})${
+        purgedDirs > 0
+          ? ` kèm dọn dẹp dữ liệu trên ${purgedDirs} phân vùng NAS`
+          : ' (giữ nguyên dữ liệu Snapshot cũ trên đĩa NAS)'
+      }`,
+      req,
+    });
+
+    return NextResponse.json({ ok: true, purgedVolumeDirs: purgedDirs });
   } catch (err) {
     return safeErrorJson(err, 'Không thể xóa máy chủ VPS.');
   }

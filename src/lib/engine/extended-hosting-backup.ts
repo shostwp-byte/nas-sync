@@ -121,6 +121,7 @@ function runRsyncPullMailbox(params: {
   jobId: number;
   server: ServerRecord;
   remoteMailboxDir: string;
+  systemUser?: string;
   destMailboxDir: string;
   linkDestMailboxDir: string | null;
 }): Promise<{ totalBytes: number; deltaBytes: number }> {
@@ -128,6 +129,7 @@ function runRsyncPullMailbox(params: {
     jobId,
     server,
     remoteMailboxDir,
+    systemUser,
     destMailboxDir,
     linkDestMailboxDir,
   } = params;
@@ -136,6 +138,10 @@ function runRsyncPullMailbox(params: {
 
   const args: string[] = [
     '-az',
+    '--no-owner',
+    '--no-group',
+    '--chmod=ugo-s',
+    '--no-keep-dirlinks',
     '--delete',
     '--no-devices',
     '--no-specials',
@@ -156,7 +162,12 @@ function runRsyncPullMailbox(params: {
 
   args.push('-e', buildRsyncSshTransport(server));
   // S3 Security Fix: Ghim inode thư mục Mailbox từ xa trong cùng phiên thực thi rsync
-  args.push(`--rsync-path=${buildJailedRsyncPath(remoteMailboxDir)}`);
+  args.push(
+    `--rsync-path=${buildJailedRsyncPath(remoteMailboxDir, {
+      runAsUser: systemUser,
+      mode: 'pull',
+    })}`
+  );
   args.push(
     `${server.ssh_user || 'root'}@${server.ip_address}:./`,
     `${destMailboxDir.replace(/\/+$/, '')}/`
@@ -609,7 +620,9 @@ export async function syncExtendedHostingExtras(params: {
       const probeRes = await execRemoteSSH(server, probeScript, {
         zeroImpact: true,
         timeoutMs: 20000,
+        jobId,
       });
+      throwIfCancelled(jobId);
       if (probeRes.code === 255) {
         throw new RetryableNetworkError(
           `Mất kết nối SSH khi kiểm tra hộp thư của ${dom.domain}`,
@@ -640,6 +653,7 @@ export async function syncExtendedHostingExtras(params: {
         jobId,
         server,
         remoteMailboxDir,
+        systemUser: dom.systemUser,
         destMailboxDir,
         linkDestMailboxDir,
       });
@@ -667,8 +681,9 @@ export async function syncExtendedHostingExtras(params: {
       const cronRes = await execRemoteSSH(
         server,
         `crontab -u ${shellSingleQuote(sysUser)} -l 2>/dev/null || true`,
-        { zeroImpact: true, timeoutMs: 15000 }
+        { zeroImpact: true, timeoutMs: 15000, jobId }
       );
+      throwIfCancelled(jobId);
       if (cronRes.code === 255) {
         throw new RetryableNetworkError(
           `Mất kết nối SSH khi trích xuất crontab của user ${sysUser}`,

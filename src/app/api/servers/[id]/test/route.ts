@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { safeErrorJson, sanitizeErrorMessage } from '@/lib/api-error';
+import { recordAuditLog } from '@/lib/audit';
 import { requireRole } from '@/lib/auth';
 import { getDb } from '@/lib/db';
 import { getPanelAdapter } from '@/lib/engine/adapters';
@@ -7,7 +8,7 @@ import { testSshConnection } from '@/lib/ssh';
 import type { ServerRecord } from '@/types';
 
 export async function POST(
-  _req: NextRequest,
+  req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
@@ -64,6 +65,15 @@ export async function POST(
     db.prepare(
       `UPDATE servers SET status = 'ONLINE', last_connected_at = datetime('now') WHERE id = ?`
     ).run(server.id);
+
+    recordAuditLog({
+      session: guard.session,
+      action: 'SERVER_SSH_TEST',
+      resourceType: 'SERVER',
+      resourceId: String(server.id),
+      detail: `Kiểm tra kết nối SSH & dò tìm ${domains.length} domain trên "${server.hostname}"`,
+      req,
+    });
 
     return NextResponse.json({
       ok: true,

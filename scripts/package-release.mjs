@@ -142,11 +142,8 @@ fs.writeFileSync(
   'utf8'
 );
 
-// Tạo sẵn file .env mặc định từ .env.example để trình quản lý Docker GUI trên mọi NAS dùng được ngay sau khi giải nén
-copyFileNormalizedLf(
-  path.join(projectRoot, '.env.example'),
-  path.join(stageDir, '.env')
-);
+// U11 Security Fix: Không đóng gói sẵn file .env vào bundle để install.sh luôn tự động sinh khóa mật mã ngẫu nhiên
+// (JWT_SECRET, TOTP_ENCRYPTION_KEY, SANDBOX_DB_PASSWORD) và nhận diện đúng đường dẫn lưu trữ theo từng hãng NAS.
 
 // Sao chép toàn bộ thư mục mã nguồn src/, tài nguyên PWA public/ và công cụ giải mã khẩn cấp
 copyDirectoryRecursive(

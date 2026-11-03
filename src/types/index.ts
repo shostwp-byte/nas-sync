@@ -326,6 +326,8 @@ export interface SystemUpdateInfo {
   canUpdateNow: boolean;
   blockingReason: string | null;
   prebuiltAvailable?: boolean;
+  imageRebuildRecommended?: boolean;
+  imageRebuildHint?: string | null;
   canRollback?: boolean;
   rollbackVersion?: string | null;
   rollbackUpdatedAt?: string | null;

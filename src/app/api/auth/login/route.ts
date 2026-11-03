@@ -7,7 +7,7 @@ import {
   normalizeUserRole,
   sessionCookieOptions,
   signSessionToken,
-  verifyPassword,
+  verifyPasswordAsync,
 } from '@/lib/auth';
 import { getDb } from '@/lib/db';
 import {
@@ -67,11 +67,14 @@ export async function POST(req: NextRequest) {
       .prepare('SELECT * FROM users WHERE username = ?')
       .get(username);
 
-    // Luôn chạy scrypt kể cả khi username không tồn tại để chống dò tên tài khoản qua thời gian phản hồi (Timing Attack)
+    // A13 Fix: Chạy scrypt bất đồng bộ trên libuv threadpool để không khóa Event Loop
     const passwordHashToVerify = user
       ? String(user.password_hash)
       : DUMMY_TIMING_PASSWORD_HASH;
-    const passwordMatches = verifyPassword(password, passwordHashToVerify);
+    const passwordMatches = await verifyPasswordAsync(
+      password,
+      passwordHashToVerify
+    );
 
     if (!user || !passwordMatches) {
       recordLoginFailure(throttleKey);

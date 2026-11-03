@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { getDataDir, getDb } from './db';
+import { getDataDir, getDb, type SqliteDatabase } from './db';
 import { ensureJwtSecret } from './jwt-secret';
 import { renderQrSvg } from './qr-svg';
 
@@ -13,9 +13,15 @@ const TOTP_DIGITS = 6;
 let cachedDedicatedTotpKey: { dir: string; envVal: string; key: Buffer } | null =
   null;
 
+export function resetTotpKeyCacheForTests(): void {
+  cachedDedicatedTotpKey = null;
+}
+
 /**
  * Khóa mã hóa riêng cho 2FA TOTP & Recovery Codes (`v2:`), tách biệt hoàn toàn với `JWT_SECRET`
  * để khi xoay vòng `JWT_SECRET` (đăng xuất toàn bộ phiên) không làm hỏng khóa 2FA của quản trị viên.
+ * A14 Security Fix: Nếu tệp `.totp_secret` đã tồn tại nhưng không đọc được hoặc bị hỏng (< 32 ký tự),
+ * BẮT BUỘC fail-closed (throw Error) — tuyệt đối không tự ghi đè khóa mới hay sinh khóa ngẫu nhiên trong RAM.
  */
 function getDedicatedTotpKey(): Buffer {
   const envVal = (process.env.TOTP_ENCRYPTION_KEY || '').trim();
@@ -28,18 +34,19 @@ function getDedicatedTotpKey(): Buffer {
     return cachedDedicatedTotpKey.key;
   }
 
-  let rawSecret = envVal;
-  if (!rawSecret) {
-    const secretFile = path.join(dataDir, '.totp_secret');
-    try {
-      if (fs.existsSync(secretFile)) {
-        rawSecret = fs.readFileSync(secretFile, 'utf8').trim();
-      }
-    } catch {
-      rawSecret = '';
+  let rawSecret = '';
+  if (envVal) {
+    if (envVal.length < 32) {
+      throw new Error(
+        '[SECURITY] Biến môi trường TOTP_ENCRYPTION_KEY phải có độ dài tối thiểu 32 ký tự.'
+      );
     }
+    rawSecret = envVal;
+  } else {
+    const secretFile = path.join(dataDir, '.totp_secret');
+    let createdNew = false;
 
-    if (!rawSecret || rawSecret.length < 32) {
+    if (!fs.existsSync(secretFile)) {
       const generated = crypto.randomBytes(32).toString('hex');
       try {
         fs.writeFileSync(secretFile, `${generated}\n`, {
@@ -48,28 +55,43 @@ function getDedicatedTotpKey(): Buffer {
           flag: 'wx',
         });
         rawSecret = generated;
-      } catch {
-        try {
-          const existing = fs.readFileSync(secretFile, 'utf8').trim();
-          if (existing.length >= 32) {
-            rawSecret = existing;
-          } else {
-            fs.writeFileSync(secretFile, `${generated}\n`, {
-              encoding: 'utf8',
-              mode: 0o600,
-            });
-            rawSecret = generated;
-          }
-        } catch {
-          rawSecret = generated;
+        createdNew = true;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'EEXIST') {
+          throw new Error(
+            `[SECURITY] Không thể khởi tạo tệp khóa bảo mật 2FA (${secretFile}): ${
+              (err as Error).message
+            }`,
+            { cause: err }
+          );
         }
       }
-      if (process.platform !== 'win32') {
-        try {
-          fs.chmodSync(secretFile, 0o600);
-        } catch {
-          // Ignore RichACL warning
-        }
+    }
+
+    if (!createdNew) {
+      let existing: string;
+      try {
+        existing = fs.readFileSync(secretFile, 'utf8').trim();
+      } catch (err) {
+        throw new Error(
+          `[SECURITY] Không thể đọc tệp khóa bảo mật 2FA hiện có (${secretFile}) — từ chối sinh khóa tạm thời để bảo vệ dữ liệu 2FA: ${
+            (err as Error).message
+          }`,
+          { cause: err }
+        );
+      }
+
+      if (existing.length < 32) {
+        throw new Error(
+          `[SECURITY] Tệp khóa bảo mật 2FA (${secretFile}) bị hỏng hoặc ngắn hơn 32 ký tự — từ chối ghi đè tự động (fail-closed).`
+        );
+      }
+      rawSecret = existing;
+    } else if (process.platform !== 'win32') {
+      try {
+        fs.chmodSync(secretFile, 0o600);
+      } catch {
+        // Ignore RichACL warning on NAS mounts
       }
     }
   }
@@ -184,6 +206,64 @@ export function decryptTotpSecret(encryptedPayload: string): string {
     decipher.update(ciphertext),
     decipher.final(),
   ]).toString('utf8');
+}
+
+/**
+ * A5 Fix: Tự động nâng cấp toàn bộ khóa 2FA thế hệ cũ (`v1:` phụ thuộc `JWT_SECRET`) sang `v2:` (khóa `.totp_secret` độc lập)
+ * ngay khi CSDL khởi động, giúp việc xoay vòng `JWT_SECRET` về sau không làm khóa tài khoản quản trị viên chưa kịp đăng nhập.
+ */
+export function migrateLegacyV1TotpSecrets(db: SqliteDatabase): number {
+  let migrated = 0;
+  let rows: Record<string, unknown>[];
+  try {
+    rows = db
+      .prepare(
+        `SELECT id, totp_secret, totp_pending_secret
+         FROM users
+         WHERE totp_secret LIKE 'v1:%' OR totp_pending_secret LIKE 'v1:%'`
+      )
+      .all();
+  } catch {
+    return 0;
+  }
+
+  for (const row of rows) {
+    const userId = Number(row.id);
+    const curSecret =
+      typeof row.totp_secret === 'string' ? row.totp_secret : null;
+    const curPending =
+      typeof row.totp_pending_secret === 'string'
+        ? row.totp_pending_secret
+        : null;
+
+    let nextSecret = curSecret;
+    let nextPending = curPending;
+    let changed = false;
+
+    try {
+      if (curSecret && curSecret.startsWith('v1:')) {
+        nextSecret = encryptTotpSecret(decryptTotpSecret(curSecret));
+        changed = true;
+      }
+      if (curPending && curPending.startsWith('v1:')) {
+        nextPending = encryptTotpSecret(decryptTotpSecret(curPending));
+        changed = true;
+      }
+      if (changed) {
+        db.prepare(
+          'UPDATE users SET totp_secret = ?, totp_pending_secret = ? WHERE id = ?'
+        ).run(nextSecret, nextPending, userId);
+        migrated += 1;
+      }
+    } catch (err) {
+      console.warn(
+        `[TOTP Migration] Không thể chuyển đổi khóa 2FA v1 cho user #${userId}: ${
+          (err as Error).message
+        }`
+      );
+    }
+  }
+  return migrated;
 }
 
 function computeHotp(

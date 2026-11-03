@@ -136,8 +136,55 @@ export function throwIfCancelled(
 }
 
 /**
- * N6 Fix: Xóa thư mục tạm `.in_progress_<snapshot>` khi Job chuyển sang trạng thái kết thúc lỗi/hủy
- * (FAILED / CANCELLED) để không rò rỉ dung lượng ổ đĩa NAS qua nhiều đêm.
+ * N23 Fix: Đổi tên nguyên tử thư mục sang `.deleting_<name>_<ts>_<rand>` ngay lập tức (không có `await` xen giữa
+ * bước kiểm tra Snapshot Read Pin) rồi xóa bất đồng bộ qua `fs.promises.rm` để không bao giờ chặn Event Loop
+ * hàng chục giây trên mảng đĩa HDD nhiều triệu hard-link (ngăn lỗi BullMQ Missing Lock).
+ */
+export async function removeDirectoryTreeNonBlocking(
+  targetPath: string
+): Promise<void> {
+  const lst = fs.lstatSync(targetPath, { throwIfNoEntry: false });
+  if (!lst) return;
+  if (lst.isSymbolicLink()) {
+    try {
+      fs.unlinkSync(targetPath);
+    } catch {
+      // Ignore already unlinked
+    }
+    return;
+  }
+  if (!lst.isDirectory()) {
+    await fs.promises.rm(targetPath, { force: true });
+    return;
+  }
+
+  const parentDir = path.dirname(targetPath);
+  const baseName = path.basename(targetPath);
+  const trashPath = path.join(
+    parentDir,
+    `.deleting_${baseName}_${Date.now()}_${Math.random()
+      .toString(36)
+      .slice(2, 8)}`
+  );
+
+  let movedToTrash: boolean;
+  try {
+    fs.renameSync(targetPath, trashPath);
+    movedToTrash = true;
+  } catch {
+    movedToTrash = false;
+  }
+
+  await fs.promises.rm(movedToTrash ? trashPath : targetPath, {
+    recursive: true,
+    force: true,
+  });
+}
+
+/**
+ * N6 & N23 Fix: Xóa thư mục tạm `.in_progress_<snapshot>` khi Job chuyển sang trạng thái kết thúc lỗi/hủy
+ * (FAILED / CANCELLED) bằng cách đổi tên nguyên tử sang `.deleting_*` rồi dọn nền bất đồng bộ,
+ * không rò rỉ dung lượng ổ đĩa NAS và không chặn Event Loop.
  */
 export function cleanupInProgressSnapshotDirsForJob(jobId: number): void {
   try {
@@ -193,7 +240,12 @@ export function cleanupInProgressSnapshotDirsForJob(jobId: number): void {
       }
       const lst = fs.lstatSync(targetDir, { throwIfNoEntry: false });
       if (lst && !lst.isSymbolicLink() && lst.isDirectory()) {
-        fs.rmSync(targetDir, { recursive: true, force: true });
+        void removeDirectoryTreeNonBlocking(targetDir).catch((rmErr) => {
+          console.warn(
+            `[NAS-Sync Cleanup] Lỗi xóa nền thư mục .in_progress cho Job #${jobId}:`,
+            (rmErr as Error).message
+          );
+        });
       }
     }
   } catch (err) {
@@ -205,8 +257,7 @@ export function cleanupInProgressSnapshotDirsForJob(jobId: number): void {
 }
 
 /**
- * N6 Fix: Quét dọn các thư mục `.in_progress_*` mồ côi lúc khởi động nếu không còn bất kỳ Job
- * QUEUED/RUNNING/RESUMING/VERIFYING/INTERRUPTED nào tham chiếu tới.
+ * N6 & N23 Fix: Quét dọn các thư mục `.in_progress_*` mồ côi và `.deleting_*` dở dang lúc khởi động.
  */
 export function sweepOrphanedInProgressDirsOnStartup(): number {
   let removed = 0;
@@ -242,6 +293,19 @@ export function sweepOrphanedInProgressDirsOnStartup(): number {
         }
 
         for (const entry of entries) {
+          if (entry.name.startsWith('.deleting_')) {
+            const fullTrash = path.resolve(hostDir, entry.name);
+            if (path.dirname(fullTrash) !== hostDir) continue;
+            const lst = fs.lstatSync(fullTrash, { throwIfNoEntry: false });
+            if (lst && !lst.isSymbolicLink() && lst.isDirectory()) {
+              void fs.promises
+                .rm(fullTrash, { recursive: true, force: true })
+                .catch(() => {});
+              removed++;
+            }
+            continue;
+          }
+
           if (!entry.name.startsWith('.in_progress_')) continue;
           const snapName = entry.name.slice('.in_progress_'.length);
           if (!snapName || !isSafeSnapshotName(snapName)) continue;
@@ -253,7 +317,7 @@ export function sweepOrphanedInProgressDirsOnStartup(): number {
           if (path.dirname(fullDir) !== hostDir) continue;
           const lst = fs.lstatSync(fullDir, { throwIfNoEntry: false });
           if (lst && !lst.isSymbolicLink() && lst.isDirectory()) {
-            fs.rmSync(fullDir, { recursive: true, force: true });
+            void removeDirectoryTreeNonBlocking(fullDir).catch(() => {});
             removed++;
           }
         }

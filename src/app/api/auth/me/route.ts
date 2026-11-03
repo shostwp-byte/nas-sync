@@ -4,13 +4,18 @@ import { recordAuditLog } from '@/lib/audit';
 import {
   SESSION_COOKIE_NAME,
   getCurrentSession,
-  hashPassword,
+  hashPasswordAsync,
   normalizeUserRole,
   sessionCookieOptions,
   signSessionToken,
-  verifyPassword,
+  verifyPasswordAsync,
 } from '@/lib/auth';
 import { getDb } from '@/lib/db';
+import {
+  clearLoginFailures,
+  getLoginLockSeconds,
+  recordLoginFailure,
+} from '@/lib/login-throttle';
 
 export async function GET() {
   const session = await getCurrentSession();
@@ -64,6 +69,19 @@ export async function PATCH(req: NextRequest) {
       );
     }
 
+    const reauthKey = `reauth:${session.userId}`;
+    const lockSeconds = getLoginLockSeconds(reauthKey);
+    if (lockSeconds > 0) {
+      return NextResponse.json(
+        {
+          error: `Xác thực mật khẩu sai quá nhiều lần. Vui lòng thử lại sau ${Math.ceil(
+            lockSeconds / 60
+          )} phút.`,
+        },
+        { status: 429, headers: { 'Retry-After': String(lockSeconds) } }
+      );
+    }
+
     const db = getDb();
     const user = db
       .prepare('SELECT * FROM users WHERE id = ?')
@@ -80,9 +98,10 @@ export async function PATCH(req: NextRequest) {
     }
 
     const storedHash = String(user.password_hash);
-    const isMatch = verifyPassword(rawCurrentPassword, storedHash);
+    const isMatch = await verifyPasswordAsync(rawCurrentPassword, storedHash);
 
     if (!isMatch) {
+      recordLoginFailure(reauthKey);
       return NextResponse.json(
         {
           error: 'Mật khẩu hiện tại không đúng. Vui lòng kiểm tra lại.',
@@ -90,6 +109,7 @@ export async function PATCH(req: NextRequest) {
         { status: 400 }
       );
     }
+    clearLoginFailures(reauthKey);
 
     const userId = Number(user.id);
     const currentUsername = String(user.username);
@@ -124,7 +144,7 @@ export async function PATCH(req: NextRequest) {
         );
       }
       const duplicate = db
-        .prepare('SELECT id FROM users WHERE username = ? AND id != ?')
+        .prepare('SELECT id FROM users WHERE LOWER(username) = LOWER(?) AND id != ?')
         .get(targetUsername, userId);
       if (duplicate) {
         return NextResponse.json(
@@ -149,7 +169,7 @@ export async function PATCH(req: NextRequest) {
       ? currentTokenVersion + 1
       : currentTokenVersion;
     const nextHash = isChangingPassword
-      ? hashPassword(rawNewPassword)
+      ? await hashPasswordAsync(rawNewPassword)
       : storedHash;
     const userRole = normalizeUserRole(user.role || 'ADMIN');
 

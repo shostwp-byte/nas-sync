@@ -2,6 +2,22 @@
 
 Mọi thay đổi đáng chú ý của dự án **NAS-Sync** (<https://github.com/shostwp-byte/nas-sync>) đều được ghi nhận tại tài liệu này theo chuẩn [Keep a Changelog](https://keepachangelog.com/vi/1.1.0/) và [Semantic Versioning](https://semver.org/).
 
+## [1.7.1] - 2026-11-03
+
+### Security & Reliability Hardening (Xử lý Triệt để Bản Đánh giá An ninh & Độ tin cậy Lần 3)
+- **Khôi phục MySQL Restore trên cPanel/DirectAdmin & Sửa cú pháp `find -P` trên aaPanel (`S13`, `S9` — `restore-worker.ts`, `aapanel.ts`)**:
+  - Đổi thứ tự tham số truyền cho client `mariadb`/`mysql` để `--defaults-extra-file=...` luôn đứng đầu tiên trước `--binary-mode`, khắc phục lỗi `unknown variable 'defaults-extra-file=...'` khi khôi phục MySQL/MariaDB.
+  - Chuẩn hóa cú pháp `find -P . ! -type l` đúng chuẩn POSIX/GNU/BusyBox trong lệnh phân quyền webroot của `AaPanelAdapter`.
+- **Gia cố Tuyệt đối Luồng PostgreSQL Backup/Restore & Bộ lọc SQL (`S12`, `S6`, `N29` — `postgres-streamer.ts`, `sql-stream-guard.ts`, `sandbox-verifier.ts`, `backup-worker.ts`)**:
+  - Chuyển định dạng sao lưu PostgreSQL mới sang **`pg_dump -Fc` (Custom Archive `PGDMP`)** kết hợp `pg_restore --no-owner --no-privileges --no-ACL`, loại bỏ hoàn toàn bề mặt thực thi meta-command của `psql`.
+  - Đối với các bản sao lưu plain-SQL cũ: bắt buộc `psql` trên máy chủ đích phải hỗ trợ cờ `\restrict` (PostgreSQL ≥ 17.6 / 16.10 / 15.14, nếu không sẽ từ chối an toàn fail-closed), kết nối trực tiếp bằng role của user sở hữu database qua `PGPASSWORD_FILE` (tuyệt đối không chạy dưới quyền superuser `postgres`), nâng cấp máy trạng thái từ vựng SQL khóa toàn bộ 6 ngả lách (`"..."` identifier, `-- \r` comment, dollar-quote lỗi cú pháp, `standard_conforming_strings = off`, `client_encoding` đa byte không phải UTF-8, `ident$E'...'`) và cho phép truyền dòng dữ liệu `COPY ... FROM stdin` lớn hơn `64 MiB` không giới hạn kích thước dòng.
+- **Thống nhất Chu kỳ Retry BullMQ, Bảo vệ Điểm Commit Snapshot & Cô lập Sandbox (`N18`–`N27`, `S14`, `S2`, `S3` — `queue.ts`, `backup-worker.ts`, `restore-worker.ts`, `sandbox-verifier.ts`, `rsync-runner.ts`, `config-rewriter.ts`, `worker-state.ts`)**:
+  - Đồng bộ `attempts: MAX_BACKUP_RETRIES + 1` trên BullMQ kèm sự kiện dự phòng `bullWorker.on('failed')` và báo cáo Morning Digest, đảm bảo lần thử cuối cùng luôn chuyển trạng thái `FAILED` và phát cảnh báo `CRITICAL`.
+  - Tước bỏ cờ `setuid`/`setgid` và UID/GID số từ bản sao lưu khi chạy `rsync` (`--no-owner --no-group --chmod=ugo-s`), hạ quyền `rsync --server` xuống user của website qua `runuser`, cấm fallback chạy `root` trong `config-rewriter.ts`, bảo vệ Snapshot đã commit ở pha `VERIFYING`, kiểm tra `!isJobCancelled` trước khi ném `RetryableNetworkError`, tách tài khoản MariaDB Sandbox riêng cho từng `jobId`, và xóa cây thư mục Snapshot bất đồng bộ không chặn Event Loop.
+- **Khóa Chuỗi Cung ứng Phát hành, Chữ ký `Ed25519` cho `update.sh` & Quản trị RBAC/Offsite (`U6`–`U16`, `A5`, `A9`–`A18`, `O7`, `C1`, `S10`, `S17`, `E2`)**:
+  - Áp dụng `environment: release-signing`, kiểm tra commit thuộc nhánh `main`, `npm ci --ignore-scripts`, chứng thực nguồn gốc `actions/attest-build-provenance`, gom khóa công khai `Ed25519` về một module duy nhất `release-public-key.mjs`, ký số cả gói `nas-sync-bundle.tar.gz.sig` và bắt buộc `update.sh` xác thực chữ ký fail-closed, kiểm tra mã băm `package-lock.json` và chặn hạ cấp phiên bản trái phép.
+  - Dọn sạch các khóa cấu hình thế hệ cũ khỏi bảng `system_settings` + lọc `GET /api/settings` theo danh sách cho phép, bỏ đóng gói sẵn `.env` trong bundle, bắt buộc quản trị viên xác thực lại mật khẩu (+ mã 2FA nếu đang bật) khi đặt lại mật khẩu/2FA cho tài khoản khác, chặn `OPERATOR` chạy lại tác vụ `RESTORE`, ghim cứng IP đã kiểm duyệt cho S3 Endpoint chống DNS Rebinding (`O7`), nâng độ dài tối thiểu mật khẩu mã hóa Offsite lên `12` ký tự (`C1`), bắt buộc HTTPS mặc định cho kết nối WORM qua mạng (`S10`) kèm khóa `zfs hold` đệ quy cho child dataset (`S17`), và gia cố `login-throttle.ts` / `.totp_secret` fail-closed.
+
 ## [1.7.0] - 2026-11-03
 
 ### Added & Changed (Kiến trúc Đa Nền tảng NAS — Universal Multi-NAS & Docker Edition)

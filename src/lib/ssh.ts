@@ -6,6 +6,12 @@ import path from 'node:path';
 import type { HostKeyStatus, ServerRecord } from '@/types';
 import { getDataDir, getDb, getSshKeysDir } from './db';
 import { isSafeHostAddress } from './engine/safe-names';
+import {
+  DETACHED_PROCESS_GROUP,
+  isJobCancelled,
+  registerJobChildProcess,
+  terminateChildGracefully,
+} from './engine/worker-state';
 import { createSystemAlert } from './notifications';
 
 export interface CommandResult {
@@ -575,11 +581,7 @@ export function validateSafeSshKeyName(rawName: string): string {
   if (lower.endsWith('.pub')) {
     throw new Error('Tên định danh khóa SSH không được kết thúc bằng ".pub".');
   }
-  const lowerWithoutPub = lower.endsWith('.pub') ? lower.slice(0, -4) : lower;
-  if (
-    RESERVED_OPENSSH_CONTROL_FILES.has(lower) ||
-    RESERVED_OPENSSH_CONTROL_FILES.has(lowerWithoutPub)
-  ) {
+  if (RESERVED_OPENSSH_CONTROL_FILES.has(lower)) {
     throw new Error(
       `Tên khóa SSH "${trimmed}" trùng với tệp điều khiển hệ thống OpenSSH bị cấm (${Array.from(
         RESERVED_OPENSSH_CONTROL_FILES
@@ -718,6 +720,8 @@ export function buildSshBaseArgs(
     '-o',
     `UserKnownHostsFile=${knownHostsFile}`,
     '-o',
+    'GlobalKnownHostsFile=/dev/null',
+    '-o',
     'IgnoreUnknown=WarnWeakCrypto,ControlMaster,ControlPath,ControlPersist',
     '-o',
     'WarnWeakCrypto=no',
@@ -779,6 +783,7 @@ export function buildRsyncSshTransport(
     '-o BatchMode=yes',
     '-o StrictHostKeyChecking=yes',
     `-o UserKnownHostsFile=${shellSingleQuote(knownHostsFile)}`,
+    '-o GlobalKnownHostsFile=/dev/null',
     '-o IgnoreUnknown=WarnWeakCrypto,ControlMaster,ControlPath,ControlPersist',
     '-o WarnWeakCrypto=no',
     '-o ConnectTimeout=15',
@@ -802,13 +807,20 @@ export function buildRsyncSshTransport(
 export function execLocalCommand(
   cmd: string,
   args: string[],
-  timeoutMs = 120000
+  timeoutMs = 120000,
+  jobId?: number
 ): Promise<CommandResult> {
   return new Promise((resolve, reject) => {
+    const useDetached =
+      typeof jobId === 'number' && jobId > 0 ? DETACHED_PROCESS_GROUP : false;
     const child = spawn(cmd, args, {
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
+      detached: useDetached,
     });
+    if (typeof jobId === 'number' && jobId > 0) {
+      registerJobChildProcess(jobId, child);
+    }
 
     let stdout = '';
     let stderr = '';
@@ -817,7 +829,11 @@ export function execLocalCommand(
     const timer = setTimeout(() => {
       if (!settled) {
         settled = true;
-        child.kill('SIGKILL');
+        if (useDetached) {
+          terminateChildGracefully(child);
+        } else {
+          child.kill('SIGKILL');
+        }
         reject(new Error(`Command timed out after ${timeoutMs}ms: ${cmd}`));
       }
     }, timeoutMs);
@@ -874,6 +890,7 @@ export async function execRemoteSSH(
     timeoutMs?: number;
     maxRetries?: number;
     retryBaseDelayMs?: number;
+    jobId?: number;
   } = {}
 ): Promise<CommandResult> {
   const sshUser = (server.ssh_user || 'root').trim();
@@ -898,6 +915,14 @@ export async function execRemoteSSH(
 
   let lastRes: CommandResult = { code: 1, stdout: '', stderr: '' };
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    if (options.jobId && isJobCancelled(options.jobId)) {
+      return {
+        code: 130,
+        stdout: '',
+        stderr: 'Job đã bị hủy bởi quản trị viên.',
+      };
+    }
+
     if (testSshInterceptor) {
       lastRes = await testSshInterceptor(server, remoteCommand, finalCmd);
     } else {
@@ -910,8 +935,17 @@ export async function execRemoteSSH(
       lastRes = await execLocalCommand(
         'ssh',
         args,
-        options.timeoutMs ?? 60000
+        options.timeoutMs ?? 60000,
+        options.jobId
       );
+    }
+
+    if (options.jobId && isJobCancelled(options.jobId)) {
+      return {
+        code: 130,
+        stdout: lastRes.stdout,
+        stderr: lastRes.stderr || 'Job đã bị hủy bởi quản trị viên.',
+      };
     }
 
     if (lastRes.code === 0) {

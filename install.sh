@@ -83,8 +83,17 @@ mkdir -p ./app_data ./ssh_keys
 chmod 700 ./ssh_keys
 echo "[2/5] Đã khởi tạo thư mục dữ liệu ./app_data và ./ssh_keys"
 
-# 4. Khởi tạo file .env nếu chưa tồn tại (tự điền khóa ngẫu nhiên & đường dẫn Volume tối ưu)
+# 4. Khởi tạo file .env nếu chưa tồn tại hoặc vẫn còn nguyên bản mẫu .env.example chưa cấu hình (U11 Fix)
+NEEDS_ENV_INIT=0
 if [ ! -f ./.env ]; then
+  NEEDS_ENV_INIT=1
+elif [ -f ./.env.example ] && cmp -s ./.env ./.env.example; then
+  NEEDS_ENV_INIT=1
+elif grep -Eq '^SANDBOX_DB_PASSWORD=sandbox_secret_pass\r?$' ./.env 2>/dev/null; then
+  NEEDS_ENV_INIT=1
+fi
+
+if [ "$NEEDS_ENV_INIT" = "1" ]; then
   cp ./.env.example ./.env
   RAND_JWT="$(openssl rand -hex 32 2>/dev/null || head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
   RAND_TOTP="$(openssl rand -hex 32 2>/dev/null || head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
@@ -99,9 +108,9 @@ if [ ! -f ./.env ]; then
     sed -i "s|^PGID=.*|PGID=${SUDO_GID:-1000}|" ./.env
   fi
 
-  echo "[3/5] Đã khởi tạo file .env mới với khóa mật mã ngẫu nhiên."
+  echo "[3/5] Đã khởi tạo file .env với khóa mật mã ngẫu nhiên và phân vùng lưu trữ tối ưu."
 else
-  echo "[3/5] Giữ nguyên file .env hiện có."
+  echo "[3/5] Giữ nguyên file .env đã tùy biến hiện có."
 fi
 
 VOL1_PATH=$(grep -E '^NAS_VOL1_PATH=' ./.env | cut -d= -f2- | tr -d '\r"' || echo "$SUGGESTED_VOL1")

@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import http from 'node:http';
 import https from 'node:https';
+import { sanitizeErrorMessage } from '@/lib/api-error';
 import { getSetting } from '@/lib/db';
 import { createSystemAlert } from '@/lib/notifications';
 import type { WormProviderType } from '@/types';
@@ -18,16 +19,35 @@ export interface WormSnapshotResult {
 
 const SAFE_DATASET_REGEX = /^[A-Za-z0-9_.:-]+(?:\/[A-Za-z0-9_.:-]+)*$/;
 const SAFE_SHARE_REGEX = /^[A-Za-z0-9_.\- ]{1,128}$/;
+const MAX_WORM_RESPONSE_BYTES = 16 * 1024 * 1024; // 16 MiB cho danh sách ZFS snapshot lớn
 
-function validateHttpUrl(rawUrl: string, label: string): URL {
+function isLoopbackHost(rawHostname: string): boolean {
+  const h = rawHostname.replace(/^\[|\]$/g, '').toLowerCase();
+  return h === '127.0.0.1' || h === '::1' || h === 'localhost';
+}
+
+export function validateWormEndpointUrl(rawUrl: string, label: string): URL {
   let parsed: URL;
   try {
     parsed = new URL(rawUrl);
   } catch {
-    throw new Error(`${label} không hợp lệ (phải bắt đầu bằng http:// hoặc https://).`);
+    throw new Error(`${label} không hợp lệ (phải bắt đầu bằng https:// hoặc http://).`);
   }
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-    throw new Error(`${label} chỉ chấp nhận giao thức http: hoặc https:.`);
+    throw new Error(`${label} chỉ chấp nhận giao thức https: hoặc http:.`);
+  }
+  if (parsed.username || parsed.password) {
+    throw new Error(`${label} không được nhúng trực tiếp mật khẩu trong URL.`);
+  }
+  // S10 Security Fix: Bắt buộc HTTPS cho các kết nối mạng tới NAS/TrueNAS/Webhook (trừ loopback hoặc khi bật worm_tls_insecure rõ ràng)
+  if (
+    parsed.protocol === 'http:' &&
+    !isLoopbackHost(parsed.hostname) &&
+    shouldVerifyTls()
+  ) {
+    throw new Error(
+      `[SECURITY] ${label} bắt buộc sử dụng HTTPS để bảo vệ khóa API / mật khẩu quản trị NAS trên mạng LAN (hoặc bật rõ tùy chọn cho phép kết nối không mã hóa TLS trong Cài đặt).`
+    );
   }
   return parsed;
 }
@@ -80,9 +100,9 @@ function sendHttpRequest(
 
       res.on('data', (chunk: Buffer) => {
         totalBytes += chunk.length;
-        if (totalBytes > 2 * 1024 * 1024) {
+        if (totalBytes > MAX_WORM_RESPONSE_BYTES) {
           req.destroy(
-            new Error('Phản hồi từ dịch vụ WORM Snapshot vượt quá kích thước cho phép (2 MB).')
+            new Error('Phản hồi từ dịch vụ WORM Snapshot vượt quá kích thước cho phép (16 MB).')
           );
           return;
         }
@@ -170,7 +190,7 @@ async function executeTrueNasZfsWorm(
     );
   }
 
-  const baseUrl = validateHttpUrl(
+  const baseUrl = validateWormEndpointUrl(
     baseUrlRaw.replace(/\/+$/, ''),
     'URL TrueNAS SCALE API'
   );
@@ -180,6 +200,8 @@ async function executeTrueNasZfsWorm(
   };
   const snapSuffix = formatWormSnapshotSuffix();
   const cutoffMs = Date.now() - retentionDays * 86_400_000;
+  const autoPruneExpired =
+    getSetting('worm_auto_prune_expired', 'true') !== 'false';
   const processed: string[] = [];
   let expiredReleased = 0;
 
@@ -219,15 +241,16 @@ async function executeTrueNasZfsWorm(
       );
     }
 
-    processed.push(dataset);
-
-    // Tự động rà soát & gỡ khóa zfs hold cho các bản chụp NAS-Sync đã quá hạn retentionDays
+    // S17 Fix: Khóa đệ quy `zfs hold` cho cả các child dataset con được tạo bởi `recursive: true`,
+    // đồng thời rà soát thu hồi các bản chụp `nas-sync-worm-*` quá hạn nếu `worm_auto_prune_expired` đang bật.
+    let childHoldFailure: Error | null = null;
     try {
       const listUrl = new URL(`${baseUrl.origin}/api/v2.0/zfs/snapshot`);
       listUrl.searchParams.set('dataset', dataset);
       const listRes = await sendHttpRequest(listUrl, {
         method: 'GET',
         headers: { Authorization: `Bearer ${apiKey}` },
+        timeoutMs: 30_000,
       });
 
       if (listRes.statusCode >= 200 && listRes.statusCode < 300) {
@@ -239,9 +262,34 @@ async function executeTrueNasZfsWorm(
         if (Array.isArray(items)) {
           for (const item of items) {
             const id = String(item.id || item.name || '');
-            if (!id.startsWith(`${dataset}@nas-sync-worm-`)) continue;
-            const suffix =
-              item.snapshot_name || id.slice(dataset.length + 1);
+            const atIdx = id.indexOf('@');
+            if (atIdx <= 0) continue;
+            const snapDataset = id.slice(0, atIdx);
+            const suffix = item.snapshot_name || id.slice(atIdx + 1);
+            const belongsToTree =
+              snapDataset === dataset || snapDataset.startsWith(`${dataset}/`);
+            if (!belongsToTree) continue;
+
+            if (snapDataset !== dataset && suffix === snapSuffix) {
+              const childHoldRes = await sendHttpRequest(holdUrl, {
+                method: 'POST',
+                headers: authHeaders,
+                body: JSON.stringify({ id }),
+              });
+              if (
+                childHoldRes.statusCode < 200 ||
+                childHoldRes.statusCode >= 300
+              ) {
+                childHoldFailure = new Error(
+                  `TrueNAS ZFS khóa bất biến child dataset thất bại cho "${id}" (HTTP ${childHoldRes.statusCode}).`
+                );
+                break;
+              }
+              continue;
+            }
+
+            if (!autoPruneExpired) continue;
+            if (!suffix.startsWith('nas-sync-worm-')) continue;
             const snapDate = parseWormSnapshotSuffixDate(suffix);
             if (!snapDate || snapDate.getTime() >= cutoffMs) continue;
 
@@ -271,10 +319,24 @@ async function executeTrueNasZfsWorm(
             }
           }
         }
+      } else if (listRes.statusCode !== 401 && listRes.statusCode !== 403) {
+        console.warn(
+          `[WORM] Cảnh báo: Không thể liệt kê danh sách ZFS snapshot cho "${dataset}" (HTTP ${listRes.statusCode}).`
+        );
       }
-    } catch {
-      // Không chặn luồng chính nếu tài khoản API Key chỉ được cấp quyền chụp + hold (không cấp quyền xóa)
+    } catch (listErr) {
+      console.warn(
+        `[WORM] Cảnh báo khi liệt kê/dọn ZFS snapshot cho "${dataset}": ${
+          (listErr as Error).message
+        }`
+      );
     }
+
+    if (childHoldFailure) {
+      throw childHoldFailure;
+    }
+
+    processed.push(dataset);
   }
 
   return { processed, expiredReleased };
@@ -320,7 +382,7 @@ async function executeNasBtrfsShareWebApi(
     throw new Error('Chưa khai báo danh sách Shared Folder cần khóa Btrfs WORM.');
   }
 
-  const baseUrl = validateHttpUrl(
+  const baseUrl = validateWormEndpointUrl(
     baseUrlRaw.replace(/\/+$/, ''),
     'URL NAS WebAPI'
   );
@@ -416,7 +478,7 @@ async function executeCustomWormWebhook(
     throw new Error('Chưa cấu hình địa chỉ Endpoint cho Custom WORM Webhook.');
   }
 
-  const targetUrl = validateHttpUrl(webhookUrlRaw, 'URL Custom WORM Webhook');
+  const targetUrl = validateWormEndpointUrl(webhookUrlRaw, 'URL Custom WORM Webhook');
   const timestamp = new Date().toISOString();
   const payloadObj = {
     event: 'worm.snapshot',
@@ -568,9 +630,8 @@ export async function triggerImmutableWormSnapshot(
       message: successMsg,
     };
   } catch (err) {
-    const errMsg = `Lỗi kích hoạt OS-Level WORM Snapshot (${provider}): ${
-      (err as Error).message
-    }`;
+    const safeDetail = sanitizeErrorMessage(err, 'Không thể kết nối tới dịch vụ WORM.');
+    const errMsg = `Lỗi kích hoạt OS-Level WORM Snapshot (${provider}): ${safeDetail}`;
     await createSystemAlert({
       severity: 'WARNING',
       category: 'WORM',

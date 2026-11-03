@@ -181,9 +181,9 @@ print('/www/wwwroot/' + ${JSON.stringify(domain)})
     _domain: string,
     targetWebroot: string
   ): string {
-    // S9 Security Fix: Ghim thư mục thực tại `.` và hạ quyền sang user `www` khi chạy find+chmod để chống TOCTOU symlink race
+    // S9 Security Fix: Ghim thư mục thực tại `.` và đặt `-P` đứng trước đường dẫn `.` theo chuẩn GNU/POSIX find
     const chmodAsWww = shellSingleQuote(
-      'find . -P ! -type l -type d -exec chmod 755 {} + && find . -P ! -type l -type f -exec chmod 644 {} +'
+      'find -P . ! -type l -type d -exec chmod 755 {} + && find -P . ! -type l -type f -exec chmod 644 {} +'
     );
     return buildPinnedCurrentDirPermissionCommand(
       targetWebroot,

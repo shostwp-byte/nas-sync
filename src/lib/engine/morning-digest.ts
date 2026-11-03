@@ -119,7 +119,7 @@ export function captureDailyStorageSnapshot(): StorageDailyStat {
           `SELECT
              date(COALESCE(completed_at, created_at), 'localtime') AS stat_date,
              SUM(CASE WHEN status = 'COMPLETED' THEN 1 ELSE 0 END) AS completed_cnt,
-             SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END) AS failed_cnt
+             SUM(CASE WHEN status = 'FAILED' OR (status = 'INTERRUPTED' AND (retry_count >= 10 OR COALESCE(started_at, created_at) <= datetime('now', '-2 hours'))) THEN 1 ELSE 0 END) AS failed_cnt
            FROM backup_jobs
            WHERE job_type = 'BACKUP'
              AND date(COALESCE(completed_at, created_at), 'localtime') >= date('now', 'localtime', '-30 days')
@@ -187,7 +187,7 @@ export function captureDailyStorageSnapshot(): StorageDailyStat {
     .prepare(
       `SELECT
          IFNULL(SUM(CASE WHEN status = 'COMPLETED' THEN 1 ELSE 0 END), 0) AS completed_cnt,
-         IFNULL(SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END), 0) AS failed_cnt
+         IFNULL(SUM(CASE WHEN status = 'FAILED' OR (status = 'INTERRUPTED' AND (retry_count >= 10 OR COALESCE(started_at, created_at) <= datetime('now', '-2 hours'))) THEN 1 ELSE 0 END), 0) AS failed_cnt
        FROM backup_jobs
        WHERE job_type = 'BACKUP'
          AND date(COALESCE(completed_at, created_at), 'localtime') = ?`
@@ -366,7 +366,7 @@ export function buildMorningDigestSummary(): MorningDigestSummary {
     .prepare(
       `SELECT
          IFNULL(SUM(CASE WHEN status = 'COMPLETED' THEN 1 ELSE 0 END), 0) AS succeeded_24h,
-         IFNULL(SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END), 0) AS failed_24h,
+         IFNULL(SUM(CASE WHEN status = 'FAILED' OR (status = 'INTERRUPTED' AND (retry_count >= 10 OR COALESCE(started_at, created_at) <= datetime('now', '-2 hours'))) THEN 1 ELSE 0 END), 0) AS failed_24h,
          IFNULL(SUM(CASE WHEN status = 'COMPLETED' THEN delta_size_bytes ELSE 0 END), 0) AS delta_24h,
          IFNULL(SUM(CASE WHEN anomaly_detected = 1 THEN 1 ELSE 0 END), 0) AS anomalies_24h
        FROM backup_jobs

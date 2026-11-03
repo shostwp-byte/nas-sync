@@ -1,10 +1,11 @@
 import cron from 'node-cron';
 import { NextRequest, NextResponse } from 'next/server';
 import { safeErrorJson } from '@/lib/api-error';
+import { recordAuditLog } from '@/lib/audit';
 import { requireRole } from '@/lib/auth';
 import { getDb } from '@/lib/db';
 import {
-  enqueueServerBackup,
+  enqueueScheduledServerBatch,
   reloadCronSchedules,
 } from '@/lib/engine/queue';
 
@@ -140,6 +141,14 @@ export async function PATCH(
     );
 
     reloadCronSchedules();
+    recordAuditLog({
+      session: guard.session,
+      action: 'SCHEDULE_UPDATE',
+      resourceType: 'SCHEDULE',
+      resourceId: String(id),
+      detail: `Cập nhật lịch sao lưu "${nextName}" (${nextCron})`,
+      req,
+    });
     return NextResponse.json({ ok: true });
   } catch (err) {
     return safeErrorJson(err, 'Không thể cập nhật lịch sao lưu.', 500);
@@ -147,7 +156,7 @@ export async function PATCH(
 }
 
 export async function POST(
-  _req: NextRequest,
+  req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
@@ -171,29 +180,35 @@ export async function POST(
       String(sched.retention_policy || '{"daily":7,"weekly":4,"monthly":6}')
     );
 
-    const jobIds: number[] = [];
-    for (const sid of serverIds) {
-      const jid = await enqueueServerBackup({
-        serverId: sid,
-        scheduleId: Number(id),
-        verifyDb: Number(sched.verify_db_sandbox) === 1,
-        retentionPolicy: retention,
-      });
-      jobIds.push(jid);
-    }
+    const jobIds = await enqueueScheduledServerBatch({
+      scheduleId: Number(id),
+      serverIds,
+      verifyDb: Number(sched.verify_db_sandbox) === 1,
+      retentionPolicy: retention,
+      btrfsSnapshotAfter: Number(sched.btrfs_snapshot_after) === 1,
+    });
 
     db.prepare(
       `UPDATE backup_schedules SET last_run_at = datetime('now') WHERE id = ?`
     ).run(Number(id));
 
+    recordAuditLog({
+      session: guard.session,
+      action: 'SCHEDULE_RUN_NOW',
+      resourceType: 'SCHEDULE',
+      resourceId: String(id),
+      detail: `Chạy ngay lịch sao lưu "${sched.name}" (${jobIds.length} tiến trình)`,
+      req,
+    });
+
     return NextResponse.json({ ok: true, jobIds });
   } catch (err) {
-    return safeErrorJson(err, 'Không thể cập nhật lịch sao lưu.', 500);
+    return safeErrorJson(err, 'Không thể kích hoạt lịch sao lưu.', 500);
   }
 }
 
 export async function DELETE(
-  _req: NextRequest,
+  req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
@@ -201,8 +216,20 @@ export async function DELETE(
     if (!guard.ok) return guard.response;
 
     const { id } = await params;
-    getDb().prepare('DELETE FROM backup_schedules WHERE id = ?').run(Number(id));
+    const db = getDb();
+    const curr = db
+      .prepare('SELECT name FROM backup_schedules WHERE id = ?')
+      .get(Number(id));
+    db.prepare('DELETE FROM backup_schedules WHERE id = ?').run(Number(id));
     reloadCronSchedules();
+    recordAuditLog({
+      session: guard.session,
+      action: 'SCHEDULE_DELETE',
+      resourceType: 'SCHEDULE',
+      resourceId: String(id),
+      detail: `Xóa lịch sao lưu "${curr?.name || `#${id}`}"`,
+      req,
+    });
     return NextResponse.json({ ok: true });
   } catch (err) {
     return safeErrorJson(err, 'Không thể xóa lịch sao lưu.', 500);

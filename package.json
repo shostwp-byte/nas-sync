@@ -1,6 +1,6 @@
 {
   "name": "nas-sync",
-  "version": "1.7.0",
+  "version": "1.7.1",
   "private": false,
   "license": "MIT",
   "description": "Open-Source Agentless Multi-Panel VPS Backup & Cross-Panel Migration Platform for Multi-NAS & Docker (DirectAdmin, cPanel, Plesk, aaPanel, CyberPanel, HestiaCP, CloudPanel)",
@@ -40,7 +40,7 @@
     "start:prod": "NODE_ENV=production node --import tsx server.ts",
     "lint": "eslint src server.ts scripts tests",
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test tests/security-and-engine.test.ts tests/v160-security-audit.test.ts tests/v170-multi-nas.test.ts",
+    "test": "node --import tsx --test tests/security-and-engine.test.ts tests/v160-security-audit.test.ts tests/v170-multi-nas.test.ts tests/v171-review3-audit.test.ts",
     "pack:release": "node scripts/package-release.mjs",
     "pack:prebuilt": "node scripts/package-prebuilt.mjs"
   },

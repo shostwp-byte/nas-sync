@@ -3,12 +3,12 @@ FROM node:24-alpine AS builder
 WORKDIR /app
 
 COPY package.json package-lock.json* ./
-RUN npm ci --include=dev --no-audit --no-fund && npm cache clean --force
+RUN npm ci --include=dev --ignore-scripts --no-audit --no-fund && npm cache clean --force
 
 COPY . .
 RUN mkdir -p /app/public
 ENV NEXT_TELEMETRY_DISABLED=1
-RUN npm run build && npm prune --omit=dev
+RUN npm run build && npm prune --omit=dev --ignore-scripts
 
 FROM node:24-alpine AS runner
 

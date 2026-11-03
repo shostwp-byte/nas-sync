@@ -4,9 +4,11 @@ set -e
 DATA_ROOT="${DATA_DIR:-/app/data}"
 PERSIST_DIR="$DATA_ROOT/live_release/current"
 
-# E1 Fix: Đồng bộ bản cập nhật bền vững nguyên tử — cài đặt npm ci vào thư mục tạm cô lập TRƯỚC khi chạm vào /app/package.json
+# E1 & U10 Fix: Đồng bộ bản cập nhật bền vững nguyên tử — kiểm tra cả package.json lẫn mã băm SHA-256 của package-lock.json,
+# cài đặt npm ci --ignore-scripts vào thư mục tạm cô lập TRƯỚC khi chạm vào /app/package.json
 if [ -f "$PERSIST_DIR/package.json" ] && [ -d "$PERSIST_DIR/.next" ]; then
   UPDATE_DECISION=$(node -e '
+    const crypto = require("crypto");
     const fs = require("fs");
     const cmp = (a, b) => {
       const pa = String(a || "0.0.0").replace(/^v/i, "").split("-")[0].split(".").map(Number);
@@ -17,25 +19,40 @@ if [ -f "$PERSIST_DIR/package.json" ] && [ -d "$PERSIST_DIR/.next" ]; then
       }
       return 0;
     };
-    const depsDiffer = (a, b) =>
-      JSON.stringify((a && a.dependencies) || {}) !== JSON.stringify((b && b.dependencies) || {});
+    const hashLf = (p) => {
+      if (!fs.existsSync(p)) return "";
+      const norm = fs.readFileSync(p, "utf8").replace(/\r\n/g, "\n");
+      return crypto.createHash("sha256").update(norm, "utf8").digest("hex");
+    };
+    const depsDiffer = (liveDir, livePkg, imgPkg) => {
+      if (JSON.stringify((livePkg && livePkg.dependencies) || {}) !== JSON.stringify((imgPkg && imgPkg.dependencies) || {})) {
+        return true;
+      }
+      const liveLockHash = hashLf(liveDir + "/package-lock.json");
+      const imgLockHash = hashLf("/app/package-lock.json");
+      if ((liveLockHash || imgLockHash) && liveLockHash !== imgLockHash) {
+        return true;
+      }
+      return false;
+    };
     try {
+      const liveDir = process.argv[1];
       const imgPkg = JSON.parse(fs.readFileSync("/app/package.json", "utf8"));
-      const livePkg = JSON.parse(fs.readFileSync(process.argv[1] + "/package.json", "utf8"));
-      const forceSync = fs.existsSync(process.argv[1] + "/.needs_npm_sync");
+      const livePkg = JSON.parse(fs.readFileSync(liveDir + "/package.json", "utf8"));
+      const forceSync = fs.existsSync(liveDir + "/.needs_npm_sync");
       if (forceSync) { console.log("APPLY_WITH_DEPS"); process.exit(0); }
       const c = cmp(livePkg.version, imgPkg.version);
       if (c < 0) { console.log("CLEAN_OLD"); process.exit(0); }
       let shouldApply = c > 0;
       if (!shouldApply) {
         const imgInfo = fs.existsSync("/app/BUILD_INFO.json") ? JSON.parse(fs.readFileSync("/app/BUILD_INFO.json", "utf8")) : {};
-        const liveInfo = fs.existsSync(process.argv[1] + "/BUILD_INFO.json") ? JSON.parse(fs.readFileSync(process.argv[1] + "/BUILD_INFO.json", "utf8")) : {};
+        const liveInfo = fs.existsSync(liveDir + "/BUILD_INFO.json") ? JSON.parse(fs.readFileSync(liveDir + "/BUILD_INFO.json", "utf8")) : {};
         if (liveInfo.commit && liveInfo.commit !== imgInfo.commit) {
           shouldApply = true;
         }
       }
       if (!shouldApply) { console.log("SKIP"); process.exit(0); }
-      console.log(depsDiffer(livePkg, imgPkg) ? "APPLY_WITH_DEPS" : "APPLY");
+      console.log(depsDiffer(liveDir, livePkg, imgPkg) ? "APPLY_WITH_DEPS" : "APPLY");
     } catch {
       console.log("SKIP");
     }
@@ -45,7 +62,7 @@ if [ -f "$PERSIST_DIR/package.json" ] && [ -d "$PERSIST_DIR/.next" ]; then
     echo "[NAS-Sync Entrypoint] Đang nạp bản cập nhật bền vững từ $PERSIST_DIR..."
     APPLY_OK=1
     if [ "$UPDATE_DECISION" = "APPLY_WITH_DEPS" ]; then
-      echo "[NAS-Sync Entrypoint] Phát hiện thay đổi dependencies — đang cài đặt cô lập trong thư mục tạm..."
+      echo "[NAS-Sync Entrypoint] Phát hiện thay đổi dependencies / package-lock.json — đang cài đặt cô lập trong thư mục tạm..."
       DEPS_STAGE=$(mktemp -d /tmp/nas-sync-deps.XXXXXX)
       cp -a "$PERSIST_DIR/package.json" "$DEPS_STAGE/package.json"
       if [ -f "$PERSIST_DIR/package-lock.json" ]; then
@@ -114,8 +131,13 @@ if [ "$(id -u)" = "0" ] && [ "${RUN_AS_ROOT:-false}" != "true" ] && command -v s
     fi
 
     mkdir -p "$DATA_ROOT/known_hosts" "${SSH_KEYS_DIR:-/app/ssh_keys}" /home/nassync/.ssh
-    chown "$TARGET_UID:$TARGET_GID" /mnt/vol1 /mnt/vol2 2>/dev/null || true
-    chown -R "$TARGET_UID:$TARGET_GID" /app "$DATA_ROOT" "${SSH_KEYS_DIR:-/app/ssh_keys}" /home/nassync 2>/dev/null || true
+    chown -h "$TARGET_UID:$TARGET_GID" /mnt/vol1 /mnt/vol2 2>/dev/null || true
+    # E2 Security Fix: Chỉ chown các mục thuộc user 0, không phải symlink và không có hard-link (>1 link), giữ nguyên docker-entrypoint.sh thuộc root
+    for target_root in /app "$DATA_ROOT" "${SSH_KEYS_DIR:-/app/ssh_keys}" /home/nassync; do
+      if [ -e "$target_root" ]; then
+        find -P "$target_root" ! -type l ! -links +1 ! -path /app/docker-entrypoint.sh -user 0 -exec chown -h "$TARGET_UID:$TARGET_GID" {} + 2>/dev/null || true
+      fi
+    done
     chmod 700 "$DATA_ROOT/known_hosts" "${SSH_KEYS_DIR:-/app/ssh_keys}" /home/nassync/.ssh 2>/dev/null || true
     case "${SSH_KEYS_DIR:-}" in
       /root/*) chmod 711 /root 2>/dev/null || true ;;

@@ -9,7 +9,12 @@ import {
   signSessionToken,
   verifySessionToken,
 } from './jwt-edge';
-import { hashPassword, verifyPassword } from './password';
+import {
+  hashPassword,
+  hashPasswordAsync,
+  verifyPassword,
+  verifyPasswordAsync,
+} from './password';
 
 export {
   SESSION_COOKIE_NAME,
@@ -17,7 +22,9 @@ export {
   signSessionToken,
   verifySessionToken,
   hashPassword,
+  hashPasswordAsync,
   verifyPassword,
+  verifyPasswordAsync,
   type SessionPayload,
 };
 

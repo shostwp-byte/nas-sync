@@ -37,7 +37,7 @@ sudo bash install.sh
 ### Cách 2: Cài đặt bằng Giao diện Quản lý Docker trên Web của NAS
 
 1. Tải gói **`nas-sync-bundle.zip`** từ [GitHub Releases](https://github.com/shostwp-byte/nas-sync/releases) và giải nén vào thư mục chứa ứng dụng Docker trên NAS (thu được thư mục `nas-sync`).
-2. Mở tệp `nas-sync/.env`, cập nhật:
+2. Sao chép hoặc đổi tên tệp `nas-sync/.env.example` thành `nas-sync/.env`, sau đó cập nhật:
    * `NAS_VOL1_PATH`: Đường dẫn thư mục sao lưu thực tế bạn vừa tạo ở Phần 1.
    * `ADMIN_PASSWORD`: Mật khẩu quản trị lần đầu.
    * `PUID` / `PGID`: UID và GID có quyền đọc/ghi vào `NAS_VOL1_PATH`.

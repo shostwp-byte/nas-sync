@@ -66,12 +66,33 @@ export function buildRemoteMysqlEnvPrelude(creds: MysqlAdminCredentials): string
   return '';
 }
 
-export function buildJailedRsyncPath(expectedRealPath: string): string {
+export function buildJailedRsyncPath(
+  expectedRealPath: string,
+  options?: { runAsUser?: string; mode?: 'pull' | 'push' }
+): string {
   const clean = normalizePosixWebroot(expectedRealPath);
   assertSafe((v) => isSafeWebroot(v, 2), clean, 'expectedRealPath');
   if (/\s/.test(clean) || clean.includes("'") || clean.includes('"')) {
     throw new Error(`Đường dẫn webroot không hợp lệ để ghim Rsync Jail: ${clean}`);
   }
+  const rawUser = options?.runAsUser?.trim() || '';
+  const safeUser =
+    rawUser && rawUser !== 'root' && rawUser !== 'nobody'
+      ? assertSafe(isSafeSystemUser, rawUser, 'runAsUser')
+      : '';
+  const permFlag = options?.mode === 'push' ? '-w' : '-r';
+
+  const execRsyncStmt = safeUser
+    ? [
+        `RSYNC_USER=${safeUser};`,
+        'IONICE_PREFIX="";',
+        'if command -v ionice >/dev/null 2>&1 && ionice -c2 -n7 true 2>/dev/null; then IONICE_PREFIX="ionice -c2 -n7"; fi;',
+        'NICE_PREFIX="";',
+        'if command -v nice >/dev/null 2>&1; then NICE_PREFIX="nice -n19"; fi;',
+        `if [ "$(id -u)" = "0" ] && command -v runuser >/dev/null 2>&1 && id -u "$RSYNC_USER" >/dev/null 2>&1 && runuser -u "$RSYNC_USER" -- test ${permFlag} . -a -x .; then exec $IONICE_PREFIX $NICE_PREFIX runuser -u "$RSYNC_USER" -- rsync "$@"; else exec $IONICE_PREFIX $NICE_PREFIX rsync "$@"; fi`,
+      ].join(' ')
+    : 'if command -v ionice >/dev/null 2>&1 && ionice -c2 -n7 true 2>/dev/null; then exec ionice -c2 -n7 nice -n19 rsync "$@"; else exec nice -n19 rsync "$@"; fi';
+
   const script = [
     `EXPECTED=${clean};`,
     '[ ! -L "$EXPECTED" ] || exit 91;',
@@ -80,7 +101,7 @@ export function buildJailedRsyncPath(expectedRealPath: string): string {
     'cd -P -- "$EXPECTED" || exit 91;',
     '[ "$(pwd -P)" = "$EXPECTED" ] || exit 91;',
     'case "$EXPECTED/" in /|/etc/*|/root/*|/proc/*|/sys/*|/dev/*|/boot/*|/usr/*|/bin/*|/sbin/*|/lib/*|/lib64/*|/run/*|/var/lib/mysql/*|/var/lib/postgresql/*|/var/cpanel/*|/usr/local/directadmin/*|/usr/local/CyberCP/*|/usr/local/hestia/*|/home/clp/*|/www/server/panel/*) exit 91 ;; esac;',
-    'if command -v ionice >/dev/null 2>&1 && ionice -c2 -n7 true 2>/dev/null; then exec ionice -c2 -n7 nice -n19 rsync "$@"; else exec nice -n19 rsync "$@"; fi',
+    execRsyncStmt,
   ].join(' ');
   return `sh -c '${script}' nas-rsync`;
 }
@@ -121,6 +142,7 @@ export async function verifyRemoteWebrootSafety(
     mustExist: boolean;
     expectedDomain?: string;
     parentDomain?: string;
+    jobId?: number;
   }
 ): Promise<WebrootSafetyCheckResult> {
   const cleanWebroot = normalizePosixWebroot(webroot);
@@ -157,10 +179,6 @@ export async function verifyRemoteWebrootSafety(
         exit 0
       fi
       REAL=$(realpath -e -- "$TARGET" 2>/dev/null || readlink -f -- "$TARGET" 2>/dev/null || true)
-      if [ "$REAL" != "$TARGET" ]; then
-        # Cho phép nếu có thư mục hệ thống chuẩn được symlink hợp lệ (VD /home -> /mnt/home), nhưng kiểm tra không có thành phần con nào bên trong home bị symlink ra ngoài ở bước dưới
-        :
-      fi
     else
       if [ -L "$TARGET" ]; then
         echo "ERR_JAIL|Đường dẫn webroot đích ($TARGET) đang là symlink — bị từ chối"
@@ -323,6 +341,7 @@ export async function verifyRemoteWebrootSafety(
   const res = await execRemoteSSH(server, checkScript, {
     zeroImpact: true,
     timeoutMs: 20000,
+    jobId: options.jobId,
   });
 
   if (res.code === 255) {

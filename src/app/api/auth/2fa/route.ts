@@ -7,9 +7,14 @@ import {
   normalizeUserRole,
   sessionCookieOptions,
   signSessionToken,
-  verifyPassword,
+  verifyPasswordAsync,
 } from '@/lib/auth';
 import { getDb } from '@/lib/db';
+import {
+  clearLoginFailures,
+  getLoginLockSeconds,
+  recordLoginFailure,
+} from '@/lib/login-throttle';
 import {
   buildOtpAuthUrl,
   consumeTotpStepAtomically,
@@ -84,6 +89,18 @@ export async function POST(req: NextRequest) {
 
     const userId = Number(user.id);
     const username = String(user.username);
+    const reauthKey = `reauth:${userId}`;
+    const lockSeconds = getLoginLockSeconds(reauthKey);
+    if (lockSeconds > 0) {
+      return NextResponse.json(
+        {
+          error: `Xác thực sai quá nhiều lần. Vui lòng thử lại sau ${Math.ceil(
+            lockSeconds / 60
+          )} phút.`,
+        },
+        { status: 429, headers: { 'Retry-After': String(lockSeconds) } }
+      );
+    }
 
     if (action === 'setup') {
       if (Number(user.totp_enabled) === 1) {
@@ -99,12 +116,17 @@ export async function POST(req: NextRequest) {
           : typeof body.password === 'string'
           ? body.password
           : '';
-      if (!rawPassword || !verifyPassword(rawPassword, String(user.password_hash))) {
+      if (
+        !rawPassword ||
+        !(await verifyPasswordAsync(rawPassword, String(user.password_hash)))
+      ) {
+        recordLoginFailure(reauthKey);
         return NextResponse.json(
           { error: 'Mật khẩu hiện tại không chính xác. Vui lòng kiểm tra lại.' },
           { status: 400 }
         );
       }
+      clearLoginFailures(reauthKey);
 
       const secret = generateTotpSecret();
       const encryptedPending = encryptTotpSecret(secret);
@@ -136,7 +158,11 @@ export async function POST(req: NextRequest) {
           ? body.password
           : '';
 
-      if (rawPassword && !verifyPassword(rawPassword, String(user.password_hash))) {
+      if (
+        rawPassword &&
+        !(await verifyPasswordAsync(rawPassword, String(user.password_hash)))
+      ) {
+        recordLoginFailure(reauthKey);
         return NextResponse.json(
           { error: 'Mật khẩu hiện tại không chính xác.' },
           { status: 400 }
@@ -165,6 +191,7 @@ export async function POST(req: NextRequest) {
       );
       const stepCheck = verifyTotpCodeWithStep(pendingPlainSecret, code);
       if (!stepCheck.valid || stepCheck.matchedStep === null) {
+        recordLoginFailure(reauthKey);
         return NextResponse.json(
           {
             error:
@@ -173,6 +200,7 @@ export async function POST(req: NextRequest) {
           { status: 400 }
         );
       }
+      clearLoginFailures(reauthKey);
 
       const { plainCodes, hashedJson } = generateRecoveryCodes(8);
       const encryptedActive = encryptTotpSecret(pendingPlainSecret);
@@ -253,7 +281,8 @@ export async function POST(req: NextRequest) {
         );
       }
 
-      if (!verifyPassword(rawPassword, String(user.password_hash))) {
+      if (!(await verifyPasswordAsync(rawPassword, String(user.password_hash)))) {
+        recordLoginFailure(reauthKey);
         return NextResponse.json(
           { error: 'Mật khẩu xác nhận không chính xác.' },
           { status: 400 }
@@ -274,12 +303,14 @@ export async function POST(req: NextRequest) {
             ).matched
           : false;
         if (!validTotp && !validRec) {
+          recordLoginFailure(reauthKey);
           return NextResponse.json(
             { error: 'Mã xác thực 2FA không chính xác hoặc vừa được sử dụng.' },
             { status: 400 }
           );
         }
       }
+      clearLoginFailures(reauthKey);
 
       const nextTokenVersion = Number(user.token_version ?? 1) + 1;
       db.prepare(
@@ -349,7 +380,8 @@ export async function POST(req: NextRequest) {
         );
       }
 
-      if (!verifyPassword(rawPassword, String(user.password_hash))) {
+      if (!(await verifyPasswordAsync(rawPassword, String(user.password_hash)))) {
+        recordLoginFailure(reauthKey);
         return NextResponse.json(
           { error: 'Mật khẩu xác nhận không chính xác.' },
           { status: 400 }
@@ -363,11 +395,13 @@ export async function POST(req: NextRequest) {
         stepCheck.matchedStep === null ||
         !consumeTotpStepAtomically(userId, stepCheck.matchedStep)
       ) {
+        recordLoginFailure(reauthKey);
         return NextResponse.json(
           { error: 'Mã TOTP 6 chữ số không chính xác hoặc vừa được sử dụng.' },
           { status: 400 }
         );
       }
+      clearLoginFailures(reauthKey);
 
       const { plainCodes, hashedJson } = generateRecoveryCodes(8);
       db.prepare('UPDATE users SET recovery_codes_json = ? WHERE id = ?').run(

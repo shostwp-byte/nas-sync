@@ -20,6 +20,15 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+          fetch-depth: 0
+
+      - name: Verify tagged commit belongs to main branch (U6)
+        run: |
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" refs/remotes/origin/main; then
+            echo "::error::Tagged commit ${GITHUB_SHA} is NOT reachable from origin/main! Refusing to build or sign."
+            exit 1
+          fi
 
       - name: Setup Node.js 24
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -27,16 +36,23 @@ jobs:
           node-version: '24'
           cache: 'npm'
 
-      - name: Install dependencies, lint, typecheck, test & build
+      - name: Install dependencies without lifecycle scripts (U7)
+        run: npm ci --ignore-scripts
+
+      - name: Lint, typecheck, security tests & production build
         run: |
-          npm ci
           npm run lint
           npm run typecheck
           npm test
           npm run build
 
-      - name: Package Multi-NAS ZIP, TAR.GZ & Prebuilt SHA-256 bundles
+      - name: Verify clean source tree & package release bundles (U7)
         run: |
+          if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+            echo "::error::Tracked source files were unexpectedly modified during build/test!"
+            git status --short
+            exit 1
+          fi
           sudo apt-get update && sudo apt-get install -y zip
           npm run pack:release
           node scripts/package-prebuilt.mjs
@@ -59,10 +75,31 @@ jobs:
     name: Sign Ed25519 Release & Publish to GitHub Releases
     needs: build
     runs-on: ubuntu-latest
+    environment: release-signing
     permissions:
       contents: write
+      id-token: write
+      attestations: write
 
     steps:
+      - name: Checkout signing script & verify main ancestry (no npm install)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          sparse-checkout: |
+            scripts/sign-release.mjs
+            src/lib/release-public-key.mjs
+          sparse-checkout-cone-mode: false
+
+      - name: Re-verify tagged commit belongs to main branch before accessing signing key (U6)
+        run: |
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" refs/remotes/origin/main; then
+            echo "::error::Tagged commit ${GITHUB_SHA} is NOT on origin/main! Aborting Ed25519 signing."
+            exit 1
+          fi
+
       - name: Setup Node.js 24 (clean runner, no npm install)
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
@@ -74,37 +111,20 @@ jobs:
           name: nas-sync-release-bundle
           path: release
 
-      - name: Verify SHA-256 & Sign Prebuilt Bundle with Ed25519
+      - name: Verify SHA-256 & Sign Prebuilt + Bundle Archives with Ed25519 (U9, U16)
         env:
           RELEASE_SIGNING_PRIVATE_KEY: ${{ secrets.RELEASE_SIGNING_PRIVATE_KEY }}
           GITHUB_REF_NAME: ${{ github.ref_name }}
-        run: |
-          node -e '
-            const crypto = require("node:crypto");
-            const fs = require("node:fs");
-            const expectedPubPem = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEApSztKo5UUyVAV5hfAmATSIyCR6Teo3PDUEkE4HXi30Q=\n-----END PUBLIC KEY-----";
-            const cleanTag = String(process.env.GITHUB_REF_NAME || "").trim().replace(/^refs\/tags\//i, "").replace(/^v/i, "");
-            if (!/^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$/.test(cleanTag)) {
-              throw new Error("Invalid release tag: " + process.env.GITHUB_REF_NAME);
-            }
-            const tarBytes = fs.readFileSync("release/nas-sync-prebuilt.tar.gz");
-            const actualSha = crypto.createHash("sha256").update(tarBytes).digest("hex").toLowerCase();
-            const recordedSha = fs.readFileSync("release/nas-sync-prebuilt.tar.gz.sha256", "utf8").trim().split(/\s+/)[0].toLowerCase();
-            if (actualSha !== recordedSha) {
-              throw new Error("SHA-256 mismatch between prebuilt archive and .sha256 file!");
-            }
-            const rawPriv = String(process.env.RELEASE_SIGNING_PRIVATE_KEY || "").replace(/\\n/g, "\n").trim();
-            if (!rawPriv) {
-              throw new Error("Missing RELEASE_SIGNING_PRIVATE_KEY secret in GitHub Repository Settings -> Secrets and variables -> Actions.");
-            }
-            const payload = Buffer.from("nas-sync-release-v1|" + cleanTag + "|" + actualSha, "utf8");
-            const sig = crypto.sign(null, payload, crypto.createPrivateKey(rawPriv));
-            if (!crypto.verify(null, payload, crypto.createPublicKey(expectedPubPem), sig)) {
-              throw new Error("Generated Ed25519 signature does not match embedded public key!");
-            }
-            fs.writeFileSync("release/nas-sync-prebuilt.tar.gz.sig", sig.toString("base64") + "\n", "utf8");
-            console.log("Signed Ed25519 release payload for v" + cleanTag + " (" + actualSha + ")");
-          '
+          CI: 'true'
+        run: node scripts/sign-release.mjs --tag "${GITHUB_REF_NAME}"
+
+      - name: Generate SLSA Build Provenance Attestation (U7)
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: |
+            release/nas-sync-prebuilt.tar.gz
+            release/nas-sync-bundle.tar.gz
+            release/nas-sync-bundle.zip
 
       - name: Publish Signed GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
@@ -115,6 +135,7 @@ jobs:
             release/nas-sync-bundle.zip.sha256
             release/nas-sync-bundle.tar.gz
             release/nas-sync-bundle.tar.gz.sha256
+            release/nas-sync-bundle.tar.gz.sig
             release/nas-sync-prebuilt.tar.gz
             release/nas-sync-prebuilt.tar.gz.sha256
             release/nas-sync-prebuilt.tar.gz.sig

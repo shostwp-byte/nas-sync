@@ -17,6 +17,10 @@ import {
   isSnapshotReadPinned,
 } from '@/lib/engine/snapshot-pins';
 import { resolveLatestSnapshotDir } from '@/lib/engine/volume-manager';
+import {
+  clearCancelledJob,
+  removeDirectoryTreeNonBlocking,
+} from '@/lib/engine/worker-state';
 
 const ACTIVE_JOB_STATUSES = new Set([
   'QUEUED',
@@ -145,6 +149,16 @@ export async function PATCH(
     }
 
     if (action === 'pin' || action === 'unpin') {
+      // A18 Fix: Chỉ ADMIN được phép gỡ khóa (unpin) bản sao lưu để bảo vệ chống xóa nhầm theo GFS
+      if (action === 'unpin' && guard.session.role !== 'ADMIN') {
+        return NextResponse.json(
+          {
+            error:
+              'Chỉ Quản trị viên (ADMIN) mới có quyền gỡ khóa bảo vệ (Unpin) bản sao lưu.',
+          },
+          { status: 403 }
+        );
+      }
       const pinVal = action === 'pin' ? 1 : 0;
       db.prepare('UPDATE backup_jobs SET is_pinned = ? WHERE id = ?').run(
         pinVal,
@@ -154,15 +168,63 @@ export async function PATCH(
         pinVal,
         jobId
       );
+      recordAuditLog({
+        session: guard.session,
+        action: action === 'pin' ? 'JOB_PIN' : 'JOB_UNPIN',
+        resourceType: 'JOB',
+        resourceId: String(jobId),
+        detail: `${
+          action === 'pin' ? 'Khóa bảo vệ (Pin)' : 'Gỡ khóa (Unpin)'
+        } Snapshot Job #${jobId} (${job.snapshot_name || ''})`,
+        req,
+      });
       return NextResponse.json({ ok: true, is_pinned: pinVal });
     }
 
     if (action === 'cancel') {
-      cancelRunningOrQueuedJob(jobId);
+      const currentStatus = String(job.status);
+      if (['COMPLETED', 'FAILED', 'CANCELLED'].includes(currentStatus)) {
+        return NextResponse.json(
+          {
+            error: `Tiến trình đã ở trạng thái kết thúc (${currentStatus}), không thể hủy.`,
+          },
+          { status: 409 }
+        );
+      }
+      const cancelled = cancelRunningOrQueuedJob(jobId);
+      if (!cancelled) {
+        return NextResponse.json(
+          { error: 'Không thể hủy tiến trình ở trạng thái hiện tại.' },
+          { status: 409 }
+        );
+      }
+      recordAuditLog({
+        session: guard.session,
+        action: 'JOB_CANCEL',
+        resourceType: 'JOB',
+        resourceId: String(jobId),
+        detail: `Hủy tiến trình ${job.job_type} #${jobId} (${
+          job.snapshot_name || ''
+        })`,
+        req,
+      });
       return NextResponse.json({ ok: true });
     }
 
     if (action === 'retry') {
+      // A10 Security Fix: OPERATOR không được phép mượn hành động `retry` để kích hoạt lại lệnh Khôi phục (RESTORE) ghi đè VPS!
+      if (
+        String(job.job_type) === 'RESTORE' &&
+        guard.session.role !== 'ADMIN'
+      ) {
+        return NextResponse.json(
+          {
+            error:
+              'Thao tác thử lại tiến trình Khôi phục (RESTORE) yêu cầu quyền Quản trị viên (ADMIN).',
+          },
+          { status: 403 }
+        );
+      }
       const currentStatus = String(job.status);
       if (ACTIVE_JOB_STATUSES.has(currentStatus)) {
         return NextResponse.json(
@@ -212,11 +274,29 @@ export async function PATCH(
           { status: 409 }
         );
       }
-      db.prepare(
-        `UPDATE backup_jobs
-         SET status = 'QUEUED', retry_count = 0, current_phase = 'Đang xếp hàng thử lại...', error_log = NULL
-         WHERE id = ? AND status IN ('FAILED', 'CANCELLED')`
-      ).run(jobId);
+      const upd = db
+        .prepare(
+          `UPDATE backup_jobs
+           SET status = 'QUEUED', retry_count = 0, current_phase = 'Đang xếp hàng thử lại...', error_log = NULL
+           WHERE id = ? AND status IN ('FAILED', 'CANCELLED')`
+        )
+        .run(jobId);
+      if (Number(upd.changes) === 0) {
+        return NextResponse.json(
+          { error: 'Trạng thái tiến trình đã thay đổi, không thể thử lại.' },
+          { status: 409 }
+        );
+      }
+      recordAuditLog({
+        session: guard.session,
+        action: 'JOB_RETRY',
+        resourceType: 'JOB',
+        resourceId: String(jobId),
+        detail: `Thử lại tiến trình ${job.job_type} #${jobId} (${
+          job.snapshot_name || ''
+        })`,
+        req,
+      });
       await dispatchExistingJob(
         jobId,
         String(job.job_type) === 'RESTORE' ? 'RESTORE' : 'BACKUP'
@@ -234,11 +314,20 @@ export async function PATCH(
           { status: 409 }
         );
       }
+      clearCancelledJob(jobId);
       const { snapshotRoot } = resolveSafeSnapshotRoot(jobId);
       const releasePin = acquireSnapshotReadPin(
         Number(job.server_id),
         String(job.snapshot_name || '')
       );
+      recordAuditLog({
+        session: guard.session,
+        action: 'JOB_VERIFY_SANDBOX',
+        resourceType: 'JOB',
+        resourceId: String(jobId),
+        detail: `Chạy thẩm định Sandbox SQL thủ công cho Job #${jobId}`,
+        req,
+      });
       try {
         const summary = await verifyJobDatabasesInSandbox(
           jobId,
@@ -345,7 +434,7 @@ export async function DELETE(
         path.dirname(snapDir) === hostDir &&
         fs.existsSync(snapDir)
       ) {
-        fs.rmSync(snapDir, { recursive: true, force: true });
+        await removeDirectoryTreeNonBlocking(snapDir);
       }
     }
 

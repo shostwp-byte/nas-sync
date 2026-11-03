@@ -54,8 +54,13 @@ services:
       - VOLUME_MIN_FREE_GB=${VOLUME_MIN_FREE_GB:-10}
       - ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
       - ADMIN_PASSWORD=${ADMIN_PASSWORD:-nas-sync@2026}
-      # Để trống: tự sinh khóa ngẫu nhiên lưu tại /app/data/.jwt_secret
+      - FORCE_RESET_ADMIN_PASSWORD=${FORCE_RESET_ADMIN_PASSWORD:-false}
+      - FORCE_RESET_ADMIN_2FA=${FORCE_RESET_ADMIN_2FA:-false}
+      # Để trống: tự sinh khóa ngẫu nhiên lưu tại /app/data/.jwt_secret & /app/data/.totp_secret
       - JWT_SECRET=${JWT_SECRET:-}
+      - TOTP_ENCRYPTION_KEY=${TOTP_ENCRYPTION_KEY:-}
+      - TRUST_PROXY=${TRUST_PROXY:-false}
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
       - GITHUB_REPO_OWNER=${GITHUB_REPO_OWNER:-shostwp-byte}
       - GITHUB_REPO_NAME=${GITHUB_REPO_NAME:-nas-sync}
       - GITHUB_REPO_BRANCH=${GITHUB_REPO_BRANCH:-main}

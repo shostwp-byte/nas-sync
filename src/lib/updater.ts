@@ -87,6 +87,64 @@ export function compareSemver(a: string, b: string): number {
   return 0;
 }
 
+/**
+ * U13 Security Fix: Chống tấn công hạ cấp phiên bản (Anti-Downgrade) kể cả khi bật `force: true`.
+ * Nếu bản phát hành trên GitHub có số hiệu nhỏ hơn phiên bản đang chạy (hoặc phiên bản cao nhất từng cài),
+ * từ chối tự động cài đặt (chỉ cho phép quay lui chủ động bằng nút Rollback nội bộ).
+ */
+export function assertNotDowngradeRelease(
+  releaseVersion: string,
+  currentLocalVersion: string,
+  highestInstalledVersion?: string | null
+): void {
+  const cleanRel = String(releaseVersion || '').replace(/^v/i, '').trim();
+  const cleanLocal = String(currentLocalVersion || '').replace(/^v/i, '').trim();
+  if (compareSemver(cleanRel, cleanLocal) < 0) {
+    throw new Error(
+      `[SECURITY] Từ chối hạ cấp tự động: gói phát hành v${cleanRel} cũ hơn phiên bản đang chạy (v${cleanLocal}). Nếu muốn quay lại phiên bản trước, vui lòng dùng nút Rollback nội bộ.`
+    );
+  }
+  const cleanHighest = String(highestInstalledVersion || '')
+    .replace(/^v/i, '')
+    .trim();
+  if (cleanHighest && compareSemver(cleanRel, cleanHighest) < 0) {
+    throw new Error(
+      `[SECURITY] Từ chối hạ cấp tự động: gói phát hành v${cleanRel} cũ hơn mốc phiên bản cao nhất đã cài đặt (v${cleanHighest}).`
+    );
+  }
+}
+
+function computeNormalizedLfSha256Sync(filePath: string): string | null {
+  try {
+    if (!fs.existsSync(filePath)) return null;
+    const norm = fs.readFileSync(filePath, 'utf8').replace(/\r\n/g, '\n');
+    return crypto.createHash('sha256').update(norm, 'utf8').digest('hex');
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * U8 Security Fix: Phát hiện khi bản cập nhật Prebuilt chứa `docker-entrypoint.sh` mới hơn
+ * so với Docker Base Image đang chạy để nhắc quản trị viên pull/rebuild lại image.
+ */
+export function isBaseImageRebuildRecommended(
+  appRoot = process.cwd(),
+  dataDir = getDataDir()
+): boolean {
+  const liveEntrypoint = path.join(
+    dataDir,
+    'live_release',
+    'current',
+    'docker-entrypoint.sh'
+  );
+  const imgEntrypoint = path.join(appRoot, 'docker-entrypoint.sh');
+  const liveHash = computeNormalizedLfSha256Sync(liveEntrypoint);
+  const imgHash = computeNormalizedLfSha256Sync(imgEntrypoint);
+  if (!liveHash || !imgHash) return false;
+  return liveHash !== imgHash;
+}
+
 export function getLocalBuildMetadata(): {
   version: string;
   commit: string | null;
@@ -457,6 +515,7 @@ export async function checkGitHubUpdate(): Promise<SystemUpdateInfo> {
       canUpdateNow,
       blockingReason,
       prebuiltAvailable,
+      imageRebuildRecommended: isBaseImageRebuildRecommended(),
       canRollback: rollbackMeta.canRollback,
       rollbackVersion: rollbackMeta.rollbackVersion,
       rollbackUpdatedAt: rollbackMeta.rollbackUpdatedAt,
@@ -506,6 +565,7 @@ export async function checkGitHubUpdate(): Promise<SystemUpdateInfo> {
     canUpdateNow: unsignedReleaseWarning ? false : canUpdateNow,
     blockingReason: blockingReason || unsignedReleaseWarning || null,
     prebuiltAvailable,
+    imageRebuildRecommended: isBaseImageRebuildRecommended(),
     canRollback: rollbackMeta.canRollback,
     rollbackVersion: rollbackMeta.rollbackVersion,
     rollbackUpdatedAt: rollbackMeta.rollbackUpdatedAt,
@@ -638,7 +698,11 @@ function backupSqliteBeforeUpdate(): string {
   return dest;
 }
 
-function haveDependenciesChanged(
+/**
+ * U10 Fix: So khớp cả `package.json` (`dependencies` / `devDependencies`) LẪN mã băm SHA-256 của `package-lock.json`
+ * để mọi bản vá bảo mật bắc cầu (transitive dependency) hoặc nâng cấp bản vá trong cùng dải `^` đều được cài đặt đầy đủ.
+ */
+export function haveDependenciesChanged(
   oldPkgPath: string,
   newPkgPath: string,
   includeDev = false
@@ -658,12 +722,24 @@ function haveDependenciesChanged(
     ) {
       return true;
     }
-    if (includeDev) {
-      return (
-        JSON.stringify(oldPkg.devDependencies || {}) !==
+    if (
+      includeDev &&
+      JSON.stringify(oldPkg.devDependencies || {}) !==
         JSON.stringify(newPkg.devDependencies || {})
-      );
+    ) {
+      return true;
     }
+
+    const oldLockHash = computeNormalizedLfSha256Sync(
+      path.join(path.dirname(oldPkgPath), 'package-lock.json')
+    );
+    const newLockHash = computeNormalizedLfSha256Sync(
+      path.join(path.dirname(newPkgPath), 'package-lock.json')
+    );
+    if ((oldLockHash || newLockHash) && oldLockHash !== newLockHash) {
+      return true;
+    }
+
     return false;
   } catch {
     return true;
@@ -1130,7 +1206,11 @@ export async function performGitHubUpdate(
   const allowDevMain = isUnverifiedDevMainAllowed();
 
   let nmDeltaBackup: NodeModulesDeltaBackup | null = null;
-  let snapshotRotated = false;
+  let currentSwapped = false;
+  let appRootTouched = false;
+  const hadPriorLiveCurrent = fs.existsSync(
+    path.join(currentPersistDir, 'package.json')
+  );
 
   try {
     broadcastStep(
@@ -1172,7 +1252,6 @@ export async function performGitHubUpdate(
     let usedPrebuiltFastPath = false;
     let resolvedCommitSha = '';
     let stagedDepsReadyToActivate = false;
-    let stagedSymlinkCreated = false;
 
     // 2A. Luồng chuẩn mặc định (U1 & U2): BẮT BUỘC tải từ GitHub Release đã ký chữ ký số Ed25519 + SHA-256
     // Kể cả khi `options.force === true`, chỉ cài đặt lại bản phát hành đã xác thực chữ ký (KHÔNG rơi về main HEAD).
@@ -1199,6 +1278,12 @@ export async function performGitHubUpdate(
           '[SECURITY] Bản phát hành GitHub không có tag phiên bản hợp lệ.'
         );
       }
+      // U13 Security Fix: Ngăn chặn hạ cấp ngay cả khi force = true
+      assertNotDowngradeRelease(
+        relVer,
+        checkInfo.currentVersion,
+        getSetting('highest_installed_version', '')
+      );
       targetVer = relVer;
 
       const matchedAssets = findPrebuiltAssets(relJson.assets);
@@ -1463,39 +1548,32 @@ export async function performGitHubUpdate(
       const stagingNodeModules = path.join(stagingDir, 'node_modules');
       fs.rmSync(stagingNodeModules, { recursive: true, force: true });
 
-      if (depsChanged) {
-        broadcastStep(
-          'INSTALLING',
-          45,
-          '[DEV MODE] Đang cài đặt dependencies cô lập tại Staging...',
-          'Chạy npm ci --include=dev --ignore-scripts trong vùng Staging...'
+      // U15 Fix: Trong kênh Dev, luôn chạy `npm ci --include=dev --ignore-scripts` tại Staging để có đầy đủ devDependencies cho `next build`
+      // (không symlink sang `/app/node_modules` đã bị `npm prune --omit=dev`).
+      broadcastStep(
+        'INSTALLING',
+        45,
+        '[DEV MODE] Đang cài đặt đầy đủ dependencies (bao gồm dev) cô lập tại Staging...',
+        'Chạy npm ci --include=dev --ignore-scripts trong vùng Staging...'
+      );
+      const npmCode = await runStreamingCommand(
+        npmBin,
+        buildNpmInstallArgs(stagingDir, true),
+        stagingDir,
+        (line) =>
+          broadcastStep(
+            'INSTALLING',
+            52,
+            'Đang cài đặt thư viện biên dịch...',
+            line
+          )
+      );
+      if (npmCode !== 0) {
+        throw new Error(
+          'Cài đặt gói phụ thuộc npm trong vùng Staging thất bại. Phiên bản đang chạy vẫn an toàn 100%.'
         );
-        const npmCode = await runStreamingCommand(
-          npmBin,
-          buildNpmInstallArgs(stagingDir, true),
-          stagingDir,
-          (line) =>
-            broadcastStep(
-              'INSTALLING',
-              52,
-              'Đang cài đặt thư viện mới...',
-              line
-            )
-        );
-        if (npmCode !== 0) {
-          throw new Error(
-            'Cài đặt gói phụ thuộc npm trong vùng Staging thất bại. Phiên bản đang chạy vẫn an toàn 100%.'
-          );
-        }
-        stagedDepsReadyToActivate = true;
-      } else {
-        fs.symlinkSync(
-          path.join(appRoot, 'node_modules'),
-          stagingNodeModules,
-          process.platform === 'win32' ? 'junction' : 'dir'
-        );
-        stagedSymlinkCreated = true;
       }
+      stagedDepsReadyToActivate = depsChanged;
 
       broadcastStep(
         'BUILDING',
@@ -1542,13 +1620,12 @@ export async function performGitHubUpdate(
         );
       }
 
-      if (stagedSymlinkCreated) {
-        fs.unlinkSync(stagingNodeModules);
-        stagedSymlinkCreated = false;
+      if (!stagedDepsReadyToActivate) {
+        fs.rmSync(stagingNodeModules, { recursive: true, force: true });
       }
     }
 
-    // 3. Ghi BUILD_INFO.json, lưu bản previous cho Rollback 1-Click, rồi hoán đổi nguyên tử node_modules + appRoot ở bước cuối cùng (U3)
+    // 3. Ghi BUILD_INFO.json, lưu bản previous cho Rollback 1-Click, rồi hoán đổi nguyên tử node_modules + appRoot ở bước cuối cùng (U3 & U14)
     broadcastStep(
       'INSTALLING',
       90,
@@ -1576,7 +1653,6 @@ export async function performGitHubUpdate(
       currentPersistDir,
       previousPersistDir
     );
-    snapshotRotated = true;
 
     const stagingNodeModules = path.join(stagingDir, 'node_modules');
     if (stagedDepsReadyToActivate && fs.existsSync(stagingNodeModules)) {
@@ -1601,8 +1677,10 @@ export async function performGitHubUpdate(
 
     fs.rmSync(currentPersistDir, { recursive: true, force: true });
     fs.renameSync(stagingDir, currentPersistDir);
+    currentSwapped = true;
 
     if (shouldSyncAppRoot) {
+      appRootTouched = true;
       syncReleaseDirToAppRoot(currentPersistDir, appRoot);
     }
 
@@ -1611,21 +1689,33 @@ export async function performGitHubUpdate(
       nmDeltaBackup = null;
     }
 
+    const prevHighest = getSetting('highest_installed_version', '');
+    const nextHighest =
+      !prevHighest || compareSemver(targetVer, prevHighest) >= 0
+        ? targetVer
+        : prevHighest;
+
     setSettings({
       installed_version: targetVer,
+      highest_installed_version: nextHighest,
       installed_commit_sha: resolvedCommitSha,
       last_github_update_at: new Date().toISOString(),
     });
 
+    const entrypointNeedsRebuild = isBaseImageRebuildRecommended(appRoot);
+    const rebuildNote = entrypointNeedsRebuild
+      ? ' Lưu ý: Gói cập nhật có thay đổi docker-entrypoint.sh — khuyến nghị chạy ./update.sh hoặc pull lại Docker Image khi thuận tiện.'
+      : '';
+
     await createSystemAlert({
-      severity: 'INFO',
+      severity: entrypointNeedsRebuild ? 'WARNING' : 'INFO',
       category: 'SYSTEM',
       title: `Cập nhật NAS-Sync v${targetVer} thành công`,
       message: usedPrebuiltFastPath
-        ? `Hệ thống đã nâng cấp an toàn lên v${targetVer} qua gói Prebuilt xác thực chữ ký số Ed25519 & SHA-256 (có sẵn điểm Rollback 1-Click).`
+        ? `Hệ thống đã nâng cấp an toàn lên v${targetVer} qua gói Prebuilt xác thực chữ ký số Ed25519 & SHA-256 (có sẵn điểm Rollback 1-Click).${rebuildNote}`
         : `[DEV MODE] Hệ thống đã tải và biên dịch bản v${targetVer} (${
             resolvedCommitSha ? resolvedCommitSha.slice(0, 7) : targetVer
-          }) từ ${GITHUB_REPO_URL}.`,
+          }) từ ${GITHUB_REPO_URL}.${rebuildNote}`,
     });
 
     if (process.platform !== 'win32') {
@@ -1650,7 +1740,7 @@ export async function performGitHubUpdate(
       );
     }
   } catch (err) {
-    // U3 Rollback: Khôi phục nguyên trạng node_modules và appRoot nếu sự cố xảy ra giữa bước kích hoạt cuối cùng
+    // U3 & U14 Rollback: Chỉ khôi phục các vùng thực sự đã chạm tới và hoàn trả live_release/current về trạng thái sạch
     try {
       if (nmDeltaBackup && shouldSyncAppRoot) {
         restoreNodeModulesDeltaBackup(
@@ -1659,8 +1749,20 @@ export async function performGitHubUpdate(
         );
         fs.rmSync(nmDeltaBackup.backupDir, { recursive: true, force: true });
       }
+      if (currentSwapped) {
+        fs.rmSync(currentPersistDir, { recursive: true, force: true });
+        if (
+          hadPriorLiveCurrent &&
+          fs.existsSync(path.join(previousPersistDir, 'package.json'))
+        ) {
+          fs.cpSync(previousPersistDir, currentPersistDir, {
+            recursive: true,
+            force: true,
+          });
+        }
+      }
       if (
-        snapshotRotated &&
+        appRootTouched &&
         shouldSyncAppRoot &&
         fs.existsSync(path.join(previousPersistDir, 'package.json'))
       ) {
@@ -1844,6 +1946,7 @@ export async function performRollbackRelease(): Promise<{
 
     setSettings({
       installed_version: restoredVersion,
+      highest_installed_version: restoredVersion,
       installed_commit_sha: restoredCommit,
       last_github_update_at: new Date().toISOString(),
     });

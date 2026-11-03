@@ -2,6 +2,8 @@ import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import dns from 'node:dns';
 import fs from 'node:fs';
+import http from 'node:http';
+import https from 'node:https';
 import net from 'node:net';
 import path from 'node:path';
 import { getAllSettings, getDb } from '@/lib/db';
@@ -17,6 +19,8 @@ import {
 import { acquireSnapshotReadPin } from './snapshot-pins';
 
 const SECRET_MASK = '••••••••';
+export const MIN_OFFSITE_PASSPHRASE_LENGTH = 12;
+const MAX_S3_CONTROL_RESPONSE_BYTES = 32 * 1024 * 1024; // 32 MiB cho XML phản hồi S3 ListObjects/Multipart
 const MIN_MULTIPART_CHUNK_BYTES = 8 * 1024 * 1024; // 8 MiB (>= 5 MiB S3 min AND 32 * 256 KiB Google Drive multiple)
 const MAX_MULTIPART_CHUNK_BYTES = 512 * 1024 * 1024; // 512 MiB * 10.000 = 5 TiB (giới hạn tối đa S3)
 const MAX_S3_PARTS = 10_000;
@@ -188,7 +192,15 @@ export function isBlockedPrivateOrMetadataIp(rawIp: string): boolean {
   return true;
 }
 
-export async function assertSafeS3EndpointUrl(targetUrl: URL): Promise<void> {
+export interface ValidatedS3EndpointAddress {
+  address: string;
+  family: 4 | 6;
+}
+
+export async function assertSafeS3EndpointUrl(
+  targetUrl: URL,
+  customLookup?: (host: string) => Promise<Array<{ address: string }>>
+): Promise<ValidatedS3EndpointAddress | null> {
   if (targetUrl.protocol !== 'https:' && targetUrl.protocol !== 'http:') {
     throw new Error(
       `[SECURITY] Giao thức S3 Endpoint không hợp lệ (${targetUrl.protocol}). Chỉ chấp nhận HTTPS/HTTP.`
@@ -201,7 +213,7 @@ export async function assertSafeS3EndpointUrl(targetUrl: URL): Promise<void> {
   }
 
   if (process.env.ALLOW_PRIVATE_S3_ENDPOINT === 'true') {
-    return;
+    return null;
   }
 
   const host = targetUrl.hostname.replace(/^\[|\]$/g, '').toLowerCase();
@@ -217,18 +229,24 @@ export async function assertSafeS3EndpointUrl(targetUrl: URL): Promise<void> {
     );
   }
 
-  if (net.isIP(host)) {
+  const literalFamily = net.isIP(host);
+  if (literalFamily) {
     if (isBlockedPrivateOrMetadataIp(host)) {
       throw new Error(
         `[SECURITY] S3 Endpoint trỏ tới dải IP nội bộ hoặc Cloud Metadata bị cấm (${host}). Đặt ALLOW_PRIVATE_S3_ENDPOINT=true nếu chủ đích dùng kho S3 nội bộ.`
       );
     }
-    return;
+    return {
+      address: host,
+      family: literalFamily === 6 ? 6 : 4,
+    };
   }
 
   let records: Array<{ address: string }>;
   try {
-    records = await dns.promises.lookup(host, { all: true, verbatim: true });
+    records = customLookup
+      ? await customLookup(host)
+      : await dns.promises.lookup(host, { all: true, verbatim: true });
   } catch {
     throw new Error(`Không thể phân giải tên miền S3 Endpoint "${host}".`);
   }
@@ -244,6 +262,12 @@ export async function assertSafeS3EndpointUrl(targetUrl: URL): Promise<void> {
       );
     }
   }
+
+  const pinnedAddr = records[0].address;
+  return {
+    address: pinnedAddr,
+    family: net.isIP(pinnedAddr) === 6 ? 6 : 4,
+  };
 }
 
 function summarizeS3ErrorResponse(status: number, rawBody: string): string {
@@ -518,6 +542,166 @@ function validateS3Config(cfg: S3OffsiteConfig): void {
   }
 }
 
+/**
+ * O7 Security Fix: Gửi truy vấn HTTP/HTTPS tới S3 Endpoint với custom `lookup` ghim cứng
+ * địa chỉ IP đã qua kiểm duyệt `assertSafeS3EndpointUrl`, giữ nguyên TLS SNI (`servername`)
+ * và cấm mọi phản hồi HTTP 3xx Redirect để triệt tiêu hoàn toàn tấn công DNS Rebinding SSRF.
+ */
+function executePinnedS3HttpRequest(
+  targetUrl: URL,
+  options: {
+    method: string;
+    headers: Record<string, string>;
+    body?: Buffer;
+    timeoutMs: number;
+    pinnedEndpoint: ValidatedS3EndpointAddress | null;
+  }
+): Promise<Response> {
+  return new Promise((resolve, reject) => {
+    const isHttps = targetUrl.protocol === 'https:';
+    const cleanHost = targetUrl.hostname.replace(/^\[|\]$/g, '');
+    const pinned = options.pinnedEndpoint;
+
+    const pinnedLookup: net.LookupFunction | undefined = pinned
+      ? (_hostname, lookupOpts, cb) => {
+          const wantAll =
+            typeof lookupOpts === 'object' &&
+            lookupOpts !== null &&
+            Boolean((lookupOpts as dns.LookupOptions).all);
+          if (wantAll) {
+            (
+              cb as (
+                err: NodeJS.ErrnoException | null,
+                addresses: dns.LookupAddress[]
+              ) => void
+            )(null, [{ address: pinned.address, family: pinned.family }]);
+          } else {
+            (
+              cb as (
+                err: NodeJS.ErrnoException | null,
+                address: string,
+                family: number
+              ) => void
+            )(null, pinned.address, pinned.family);
+          }
+        }
+      : undefined;
+
+    const reqHeaders: Record<string, string> = { ...options.headers };
+    if (
+      options.body !== undefined &&
+      !Object.keys(reqHeaders).some((k) => k.toLowerCase() === 'content-length')
+    ) {
+      reqHeaders['content-length'] = String(options.body.byteLength);
+    }
+
+    const reqOpts: https.RequestOptions = {
+      protocol: targetUrl.protocol,
+      hostname: cleanHost,
+      port: targetUrl.port || (isHttps ? 443 : 80),
+      path: `${targetUrl.pathname}${targetUrl.search}`,
+      method: options.method,
+      headers: reqHeaders,
+      agent: false,
+      ...(pinnedLookup ? { lookup: pinnedLookup } : {}),
+      ...(isHttps && !net.isIP(cleanHost) ? { servername: cleanHost } : {}),
+    };
+
+    const transport = isHttps ? https : http;
+    let settled = false;
+    const req = transport.request(reqOpts, (res) => {
+      const statusCode = res.statusCode ?? 0;
+      if (statusCode >= 300 && statusCode < 400) {
+        settled = true;
+        res.resume();
+        req.destroy();
+        reject(
+          new Error(
+            `[SECURITY] S3 Endpoint trả về HTTP Redirect (${statusCode}) bị từ chối để ngăn SSRF.`
+          )
+        );
+        return;
+      }
+
+      const chunks: Buffer[] = [];
+      let totalBytes = 0;
+
+      res.on('data', (chunk: Buffer) => {
+        totalBytes += chunk.length;
+        if (totalBytes > MAX_S3_CONTROL_RESPONSE_BYTES) {
+          settled = true;
+          req.destroy(
+            new Error(
+              'Phản hồi điều khiển từ S3 Endpoint vượt quá giới hạn an toàn (32 MiB).'
+            )
+          );
+          return;
+        }
+        chunks.push(chunk);
+      });
+
+      res.on('error', (err) => {
+        if (!settled) {
+          settled = true;
+          reject(err);
+        }
+      });
+
+      res.on('end', () => {
+        if (settled) return;
+        settled = true;
+        const respHeaders = new Headers();
+        for (const [k, v] of Object.entries(res.headers)) {
+          if (Array.isArray(v)) {
+            for (const item of v) {
+              respHeaders.append(k, item);
+            }
+          } else if (typeof v === 'string') {
+            respHeaders.set(k, v);
+          }
+        }
+        const effectiveStatus = statusCode || 502;
+        const isNullBodyStatus =
+          effectiveStatus === 204 ||
+          effectiveStatus === 205 ||
+          effectiveStatus === 304;
+        const rawBody = Buffer.concat(chunks, totalBytes);
+        resolve(
+          new Response(isNullBodyStatus ? null : new Uint8Array(rawBody), {
+            status: effectiveStatus,
+            headers: respHeaders,
+          })
+        );
+      });
+    });
+
+    req.setTimeout(options.timeoutMs, () => {
+      if (!settled) {
+        settled = true;
+        req.destroy(
+          new Error(
+            `Quá thời gian chờ phản hồi từ S3 Endpoint (${Math.round(
+              options.timeoutMs / 1000
+            )}s).`
+          )
+        );
+      }
+    });
+
+    req.on('error', (err) => {
+      if (!settled) {
+        settled = true;
+        reject(err);
+      }
+    });
+
+    if (options.body && options.body.byteLength > 0) {
+      req.write(options.body);
+    }
+    req.end();
+  });
+}
+
 async function s3SignedFetch(
   cfg: S3OffsiteConfig,
   method: string,
@@ -530,8 +714,8 @@ async function s3SignedFetch(
   } = {}
 ): Promise<Response> {
   const targetUrl = buildS3TargetUrl(cfg, objectKey, options.queryParams);
-  // O5 Security Fix: Kiểm tra chống SSRF (chặn IP nội bộ / metadata + cấm HTTP redirect sang host khác)
-  await assertSafeS3EndpointUrl(targetUrl);
+  // O5 + O7 Security Fix: Kiểm tra chống SSRF và ghim cứng IP đã xác thực cho socket TCP/TLS (chống DNS Rebinding)
+  const pinnedEndpoint = await assertSafeS3EndpointUrl(targetUrl);
 
   const bodyBuf =
     options.body === undefined
@@ -551,13 +735,12 @@ async function s3SignedFetch(
     body: bodyBuf ?? '',
   });
 
-  return fetch(targetUrl.toString(), {
+  return executePinnedS3HttpRequest(targetUrl, {
     method,
     headers: signed.headers,
-    body: bodyBuf ? new Uint8Array(bodyBuf) : undefined,
-    redirect: 'error',
-    cache: 'no-store',
-    signal: AbortSignal.timeout(options.timeoutMs ?? 120_000),
+    body: bodyBuf,
+    timeoutMs: options.timeoutMs ?? 120_000,
+    pinnedEndpoint,
   });
 }
 
@@ -1599,9 +1782,9 @@ export function startSnapshotOffsitePush(
       'Chưa bật cấu hình Offsite Cloud Backup trong phần Cài đặt Hệ thống.'
     );
   }
-  if (cfg.passphrase.length < 8) {
+  if (cfg.passphrase.length < MIN_OFFSITE_PASSPHRASE_LENGTH) {
     throw new Error(
-      'Mật khẩu mã hóa Offsite (AES-256-GCM) phải có tối thiểu 8 ký tự.'
+      `Mật khẩu mã hóa Offsite (AES-256-GCM) phải có tối thiểu ${MIN_OFFSITE_PASSPHRASE_LENGTH} ký tự.`
     );
   }
 

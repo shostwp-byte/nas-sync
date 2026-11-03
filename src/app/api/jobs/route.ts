@@ -6,56 +6,66 @@ import { getDb } from '@/lib/db';
 import { enqueueServerBackup } from '@/lib/engine/queue';
 
 export async function GET(req: NextRequest) {
-  const guard = await requireRole(['ADMIN', 'OPERATOR', 'VIEWER']);
-  if (!guard.ok) return guard.response;
+  try {
+    const guard = await requireRole(['ADMIN', 'OPERATOR', 'VIEWER']);
+    if (!guard.ok) return guard.response;
 
-  const sp = req.nextUrl.searchParams;
-  const serverId = sp.get('serverId');
-  const status = sp.get('status');
-  const jobType = sp.get('jobType');
-  const limit = Math.min(200, Number(sp.get('limit') || 60));
+    const sp = req.nextUrl.searchParams;
+    const serverId = sp.get('serverId');
+    const status = sp.get('status');
+    const jobType = sp.get('jobType');
+    const parsedLimit = Number(sp.get('limit') ?? 60);
+    const limit = Number.isFinite(parsedLimit)
+      ? Math.max(1, Math.min(200, Math.floor(parsedLimit)))
+      : 60;
 
-  const conditions: string[] = [];
-  const params: unknown[] = [];
+    const conditions: string[] = [];
+    const params: unknown[] = [];
 
-  if (serverId) {
-    conditions.push('j.server_id = ?');
-    params.push(Number(serverId));
+    if (serverId) {
+      const parsedSid = Number(serverId);
+      if (Number.isInteger(parsedSid) && parsedSid > 0) {
+        conditions.push('j.server_id = ?');
+        params.push(parsedSid);
+      }
+    }
+    if (status) {
+      conditions.push('j.status = ?');
+      params.push(status);
+    }
+    if (jobType) {
+      conditions.push('j.job_type = ?');
+      params.push(jobType);
+    }
+
+    const whereSql =
+      conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+
+    const jobs = getDb()
+      .prepare(
+        `SELECT
+           j.*,
+           s.hostname AS server_hostname,
+           s.panel_type AS server_panel,
+           ts.hostname AS target_server_hostname,
+           v.name AS volume_name,
+           v.mount_path AS volume_mount_path,
+           (SELECT COUNT(*) FROM backup_items bi WHERE bi.job_id = j.id) AS domains_count,
+           (SELECT COUNT(*) FROM backup_items bi WHERE bi.job_id = j.id AND bi.verification_status = 'PASSED') AS verified_domains_count
+         FROM backup_jobs j
+         LEFT JOIN servers s ON s.id = j.server_id
+         LEFT JOIN servers ts ON ts.id = j.target_server_id
+         LEFT JOIN storage_volumes v ON v.id = j.volume_id
+         ${whereSql}
+         ORDER BY j.id DESC
+         LIMIT ?`
+      )
+      .all(...params, limit);
+
+    return NextResponse.json({ jobs });
+  } catch (err) {
+    return safeErrorJson(err, 'Không thể tải danh sách tiến trình.', 500);
   }
-  if (status) {
-    conditions.push('j.status = ?');
-    params.push(status);
-  }
-  if (jobType) {
-    conditions.push('j.job_type = ?');
-    params.push(jobType);
-  }
-
-  const whereSql =
-    conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
-
-  const jobs = getDb()
-    .prepare(
-      `SELECT
-         j.*,
-         s.hostname AS server_hostname,
-         s.panel_type AS server_panel,
-         ts.hostname AS target_server_hostname,
-         v.name AS volume_name,
-         v.mount_path AS volume_mount_path,
-         (SELECT COUNT(*) FROM backup_items bi WHERE bi.job_id = j.id) AS domains_count,
-         (SELECT COUNT(*) FROM backup_items bi WHERE bi.job_id = j.id AND bi.verification_status = 'PASSED') AS verified_domains_count
-       FROM backup_jobs j
-       LEFT JOIN servers s ON s.id = j.server_id
-       LEFT JOIN servers ts ON ts.id = j.target_server_id
-       LEFT JOIN storage_volumes v ON v.id = j.volume_id
-       ${whereSql}
-       ORDER BY j.id DESC
-       LIMIT ?`
-    )
-    .all(...params, limit);
-
-  return NextResponse.json({ jobs });
 }
 
 export async function POST(req: NextRequest) {

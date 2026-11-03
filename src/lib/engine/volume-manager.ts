@@ -487,7 +487,8 @@ export async function refreshAllVolumes(): Promise<StorageVolume[]> {
  */
 export async function ensureActiveVolumeForBackup(
   server: ServerRecord,
-  onLog: (msg: string) => void
+  onLog: (msg: string) => void,
+  jobId?: number
 ): Promise<StorageVolume> {
   const volumes = await refreshAllVolumes();
   const db = getDb();
@@ -581,7 +582,13 @@ export async function ensureActiveVolumeForBackup(
     serverId: server.id,
   });
 
-  await performCrossVolumeLocalSeeding(server, currentVol, targetVol, onLog);
+  await performCrossVolumeLocalSeeding(
+    server,
+    currentVol,
+    targetVol,
+    onLog,
+    jobId
+  );
 
   db.prepare('UPDATE servers SET assigned_volume_id = ? WHERE id = ?').run(
     targetVol.id,
@@ -595,7 +602,8 @@ export async function performCrossVolumeLocalSeeding(
   server: ServerRecord,
   fromVolume: StorageVolume,
   toVolume: StorageVolume,
-  onLog: (msg: string) => void
+  onLog: (msg: string) => void,
+  jobId?: number
 ): Promise<void> {
   const oldHostDir = path.join(fromVolume.mount_path, server.hostname);
   const oldLatestReal = resolveLatestSnapshotDir(oldHostDir);
@@ -619,13 +627,17 @@ export async function performCrossVolumeLocalSeeding(
     const res = await execLocalCommand(
       'rsync',
       ['-a', '--delete', `${oldLatestReal}/`, `${seedDir}/`],
-      3600 * 1000
+      3600 * 1000,
+      jobId
     );
     if (res.code !== 0) {
       throw new Error(`Local Seeding rsync thất bại: ${res.stderr}`);
     }
   } else {
-    fs.cpSync(oldLatestReal, seedDir, { recursive: true, force: true });
+    await fs.promises.cp(oldLatestReal, seedDir, {
+      recursive: true,
+      force: true,
+    });
   }
 
   await updateLatestSymlink(newHostDir, seedDir);

@@ -3,14 +3,26 @@ import { safeErrorJson } from '@/lib/api-error';
 import { recordAuditLog } from '@/lib/audit';
 import {
   SESSION_COOKIE_NAME,
-  hashPassword,
+  hashPasswordAsync,
   isValidUserRole,
   normalizeUserRole,
   requireRole,
   sessionCookieOptions,
   signSessionToken,
+  verifyPasswordAsync,
 } from '@/lib/auth';
 import { getDb } from '@/lib/db';
+import {
+  clearLoginFailures,
+  getLoginLockSeconds,
+  recordLoginFailure,
+} from '@/lib/login-throttle';
+import {
+  consumeTotpStepAtomically,
+  decryptTotpSecret,
+  verifyAndConsumeRecoveryCode,
+  verifyTotpCodeWithStep,
+} from '@/lib/totp';
 
 export async function PATCH(
   req: NextRequest,
@@ -87,21 +99,11 @@ export async function PATCH(
           ? body.newPassword
           : '';
 
-    let nextPasswordHash = String(targetUser.password_hash);
     const passwordChanged = rawNewPassword.length > 0;
-    if (passwordChanged) {
-      if (rawNewPassword.length < 8 || rawNewPassword.length > 256) {
-        return NextResponse.json(
-          { error: 'Mật khẩu mới phải có độ dài từ 8 đến 256 ký tự.' },
-          { status: 400 }
-        );
-      }
-      nextPasswordHash = hashPassword(rawNewPassword);
-    }
-
     const shouldReset2fa =
       body.reset2fa === true ||
       body.disable2fa === true ||
+      body.resetTotp === true ||
       body.totp_enabled === 0 ||
       body.totpEnabled === false;
 
@@ -111,6 +113,142 @@ export async function PATCH(
         { error: 'Không có thay đổi nào được gửi lên.' },
         { status: 400 }
       );
+    }
+
+    // A9 Security Fix:
+    // 1. Cấm tự đổi mật khẩu / tự gỡ 2FA của chính mình qua API quản trị RBAC (phải dùng Tab Tài khoản cá nhân để kiểm tra mật khẩu + TOTP).
+    // 2. Bắt buộc xác thực lại mật khẩu hiện tại (và mã 2FA nếu ADMIN đang bật 2FA) trước khi đặt lại mật khẩu hoặc gỡ 2FA của người dùng khác.
+    if (passwordChanged || shouldReset2fa) {
+      if (targetId === guard.session.userId) {
+        return NextResponse.json(
+          {
+            error:
+              'Không được tự đặt lại mật khẩu hoặc gỡ 2FA của chính bạn qua mục Quản trị RBAC. Vui lòng sử dụng mục Tài khoản & Bảo mật 2FA cá nhân.',
+          },
+          { status: 400 }
+        );
+      }
+
+      const reauthKey = `reauth:${guard.session.userId}`;
+      const lockSeconds = getLoginLockSeconds(reauthKey);
+      if (lockSeconds > 0) {
+        return NextResponse.json(
+          {
+            error: `Xác thực quản trị sai quá nhiều lần. Vui lòng thử lại sau ${Math.ceil(
+              lockSeconds / 60
+            )} phút.`,
+          },
+          { status: 429, headers: { 'Retry-After': String(lockSeconds) } }
+        );
+      }
+
+      const actingAdmin = db
+        .prepare('SELECT * FROM users WHERE id = ?')
+        .get(guard.session.userId);
+      if (!actingAdmin) {
+        return NextResponse.json(
+          { error: 'Phiên quản trị không hợp lệ.' },
+          { status: 401 }
+        );
+      }
+
+      const rawAdminPassword =
+        typeof body.adminPassword === 'string'
+          ? body.adminPassword
+          : typeof body.currentAdminPassword === 'string'
+          ? body.currentAdminPassword
+          : '';
+      if (
+        !rawAdminPassword ||
+        !(await verifyPasswordAsync(
+          rawAdminPassword,
+          String(actingAdmin.password_hash)
+        ))
+      ) {
+        recordLoginFailure(reauthKey);
+        recordAuditLog({
+          session: guard.session,
+          action: 'USER_REAUTH_FAILED',
+          resourceType: 'USER',
+          resourceId: String(targetId),
+          detail: `Xác thực mật khẩu ADMIN thất bại khi cố đặt lại thông tin bảo mật cho "${targetUser.username}"`,
+          req,
+        });
+        return NextResponse.json(
+          {
+            error:
+              'Vui lòng nhập chính xác mật khẩu Quản trị viên (ADMIN) hiện tại để xác nhận thao tác nhạy cảm này.',
+          },
+          { status: 403 }
+        );
+      }
+
+      if (Number(actingAdmin.totp_enabled) === 1 && actingAdmin.totp_secret) {
+        const rawAdminCode = String(
+          body.adminTotpCode ?? body.totpCode ?? body.code ?? ''
+        ).trim();
+        if (!rawAdminCode) {
+          return NextResponse.json(
+            {
+              error:
+                'Tài khoản ADMIN của bạn đang bật 2FA — vui lòng nhập kèm mã xác thực 6 chữ số (hoặc Mã khôi phục) để xác nhận.',
+            },
+            { status: 403 }
+          );
+        }
+
+        const adminPlainSecret = decryptTotpSecret(
+          String(actingAdmin.totp_secret)
+        );
+        const stepCheck = verifyTotpCodeWithStep(
+          adminPlainSecret,
+          rawAdminCode
+        );
+        const validTotp =
+          stepCheck.valid &&
+          stepCheck.matchedStep !== null &&
+          consumeTotpStepAtomically(
+            guard.session.userId,
+            stepCheck.matchedStep
+          );
+        let validRecovery = false;
+        if (!validTotp) {
+          const recCheck = verifyAndConsumeRecoveryCode(
+            rawAdminCode,
+            String(actingAdmin.recovery_codes_json || '[]')
+          );
+          if (recCheck.matched) {
+            validRecovery = true;
+            db.prepare(
+              'UPDATE users SET recovery_codes_json = ? WHERE id = ?'
+            ).run(recCheck.remainingJson, guard.session.userId);
+          }
+        }
+
+        if (!validTotp && !validRecovery) {
+          recordLoginFailure(reauthKey);
+          return NextResponse.json(
+            {
+              error:
+                'Mã xác thực 2FA của Quản trị viên không chính xác hoặc vừa được sử dụng.',
+            },
+            { status: 403 }
+          );
+        }
+      }
+
+      clearLoginFailures(reauthKey);
+    }
+
+    let nextPasswordHash = String(targetUser.password_hash);
+    if (passwordChanged) {
+      if (rawNewPassword.length < 8 || rawNewPassword.length > 256) {
+        return NextResponse.json(
+          { error: 'Mật khẩu mới phải có độ dài từ 8 đến 256 ký tự.' },
+          { status: 400 }
+        );
+      }
+      nextPasswordHash = await hashPasswordAsync(rawNewPassword);
     }
 
     const nextTokenVersion = Number(targetUser.token_version ?? 1) + 1;

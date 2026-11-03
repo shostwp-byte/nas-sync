@@ -1,7 +1,7 @@
 # 🛡️ NAS-Sync — Open-Source Universal Multi-NAS & Docker Backup/Migration Platform
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-emerald.svg)](https://github.com/shostwp-byte/nas-sync/blob/main/LICENSE)
-[![Version](https://img.shields.io/badge/version-1.7.0-blue.svg)](https://github.com/shostwp-byte/nas-sync/releases)
+[![Version](https://img.shields.io/badge/version-1.7.1-blue.svg)](https://github.com/shostwp-byte/nas-sync/releases)
 [![Multi-Arch](https://img.shields.io/badge/Docker-amd64%20%7C%20arm64-2496ED.svg)](https://github.com/shostwp-byte/nas-sync/pkgs/container/nas-sync)
 [![Filesystems](https://img.shields.io/badge/Storage-ZFS%20%7C%20Btrfs%20%7C%20Ext4%20%7C%20XFS-0ea5e9.svg)](https://github.com/shostwp-byte/nas-sync)
 [![Signed Releases](https://img.shields.io/badge/Updater-Ed25519%20Signed-10b981.svg)](https://github.com/shostwp-byte/nas-sync/releases)
@@ -117,8 +117,8 @@ Không cần biên dịch mã nguồn trên NAS — kéo trực tiếp Image đa
 ### Cách 3: Cài đặt bằng Gói Nén Giao diện Web (`nas-sync-bundle.zip`)
 
 1. Tải gói **`nas-sync-bundle.zip`** tại mục [GitHub Releases](https://github.com/shostwp-byte/nas-sync/releases).
-2. Dùng trình quản lý tệp trên giao diện Web của NAS để tải lên thư mục chứa ứng dụng Docker và giải nén ra thư mục `nas-sync` (tệp `.env` và các thư mục `app_data`, `ssh_keys` đã được tạo sẵn).
-3. Chỉnh sửa tệp `.env` (`NAS_VOL1_PATH`, `ADMIN_PASSWORD`, `PUID`, `PGID`), tạo sẵn thư mục lưu trữ sao lưu và khởi chạy dự án từ `docker-compose.yml`.
+2. Dùng trình quản lý tệp trên giao diện Web của NAS để tải lên thư mục chứa ứng dụng Docker và giải nén ra thư mục `nas-sync` (các thư mục `app_data`, `ssh_keys` đã được tạo sẵn).
+3. Nhân bản tệp `.env.example` thành `.env`, chỉnh sửa các thông số bắt buộc (`NAS_VOL1_PATH`, `ADMIN_PASSWORD`, `PUID`, `PGID`), tạo sẵn thư mục lưu trữ sao lưu và khởi chạy dự án từ `docker-compose.yml` (hoặc chạy `sudo bash install.sh` để hệ thống tự sinh `.env` với khóa bảo mật ngẫu nhiên).
 4. Truy cập giao diện quản trị tại `http://<IP_NAS_CỦA_BẠN>:3080`.
 
 *(Xem hướng dẫn chi tiết từng bước về phân quyền `PUID/PGID`, cấu hình Cloudflare Tunnel / Reverse Proxy hỗ trợ WebSocket tại [HUONG-DAN-CAI-DAT-NAS.md](./HUONG-DAN-CAI-DAT-NAS.md)).*

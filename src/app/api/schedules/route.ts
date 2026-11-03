@@ -1,6 +1,7 @@
 import cron from 'node-cron';
 import { NextRequest, NextResponse } from 'next/server';
 import { safeErrorJson } from '@/lib/api-error';
+import { recordAuditLog } from '@/lib/audit';
 import { requireRole } from '@/lib/auth';
 import { getDb } from '@/lib/db';
 import { reloadCronSchedules } from '@/lib/engine/queue';
@@ -118,7 +119,7 @@ export async function POST(req: NextRequest) {
     const btrfsAfter = body.btrfs_snapshot_after ? 1 : 0;
     const enabled = body.enabled !== false ? 1 : 0;
 
-    getDb()
+    const ins = getDb()
       .prepare(
         `INSERT INTO backup_schedules
          (name, cron_expression, server_ids, max_concurrency, retention_policy, verify_db_sandbox, btrfs_snapshot_after, enabled)
@@ -136,6 +137,14 @@ export async function POST(req: NextRequest) {
       );
 
     reloadCronSchedules();
+    recordAuditLog({
+      session: guard.session,
+      action: 'SCHEDULE_CREATE',
+      resourceType: 'SCHEDULE',
+      resourceId: String(ins.lastInsertRowid),
+      detail: `Tạo lịch sao lưu tự động "${name}" (${cronExp}, ${serverIds.length} VPS)`,
+      req,
+    });
     return NextResponse.json({ ok: true });
   } catch (err) {
     return safeErrorJson(err, 'Không thể tạo lịch sao lưu mới.', 500);

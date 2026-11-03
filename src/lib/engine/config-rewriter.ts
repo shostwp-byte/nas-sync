@@ -19,6 +19,7 @@ import {
 } from './safe-names';
 import {
   DETACHED_PROCESS_GROUP,
+  registerJobChildProcess,
   terminateChildGracefully,
 } from './worker-state';
 
@@ -54,10 +55,16 @@ function wrapPrivilegeDropToSiteUser(
   assertSafe(isSafeSystemUser, siteUser, 'siteUser');
   const quotedUser = shellSingleQuote(siteUser);
   const quotedInner = shellSingleQuote(innerWorkerScript);
+  // S2 Fix: Khi kết nối SSH dưới quyền root, BẮT BUỘC phải hạ quyền xuống siteUser hợp lệ != root.
+  // Tuyệt đối không có nhánh fallback chạy INNER_SCRIPT dưới quyền root nếu user đích không tồn tại!
   return [
     `SITE_USER=${quotedUser}`,
     `INNER_SCRIPT=${quotedInner}`,
-    'if [ "$SITE_USER" != "root" ] && [ "$(id -u)" = "0" ] && id -u "$SITE_USER" >/dev/null 2>&1; then',
+    'if [ "$(id -u)" = "0" ]; then',
+    '  if [ "$SITE_USER" = "root" ] || ! id -u "$SITE_USER" >/dev/null 2>&1; then',
+    '    echo "ERR_UNSAFE_SITE_USER" >&2',
+    '    exit 93',
+    '  fi',
     '  if command -v runuser >/dev/null 2>&1; then',
     '    exec runuser -u "$SITE_USER" -- sh -c "$INNER_SCRIPT"',
     '  else',
@@ -70,9 +77,9 @@ function wrapPrivilegeDropToSiteUser(
 }
 
 /**
- * S2 Security Fix: Kiểm tra từng thành phần đường dẫn không chứa symlink, hạ quyền xuống user của site,
- * và dùng `mktemp` (O_CREAT|O_EXCL) kết hợp `mv -f` (rename nguyên tử không đi theo symlink đích) để chặn tuyệt đối
- * kịch bản tạo sẵn `wp-config.php.nas-sync.bak -> /root/.ssh/authorized_keys`.
+ * S2 Security Fix: Kiểm tra từng thành phần đường dẫn không chứa symlink, bắt buộc hạ quyền xuống user của site,
+ * từ chối nếu đích là thư mục, và dùng `mktemp` (O_CREAT|O_EXCL) kết hợp `mv -fT` (rename nguyên tử không đi vào thư mục đích)
+ * để chặn tuyệt đối kịch bản tạo sẵn symlink hoặc thư mục `.nas-sync.bak`.
  */
 export function buildSafeConfigWriteScript(
   cleanTargetWebroot: string,
@@ -105,11 +112,13 @@ export function buildSafeConfigWriteScript(
     'done',
     'IFS="$OLD_IFS"',
     'F="$CUR"',
-    '[ -f "$F" ] && [ ! -L "$F" ]',
+    '[ -f "$F" ] && [ ! -L "$F" ] && [ ! -d "$F" ]',
     'D_DIR=$(dirname -- "$F")',
     '[ -d "$D_DIR" ] && [ ! -L "$D_DIR" ]',
     'REAL_F=$(realpath -e -- "$F")',
     'case "$REAL_F" in "$REAL_ROOT"/*) ;; *) exit 92 ;; esac',
+    '[ ! -d "$REAL_F" ] || exit 92',
+    '[ ! -d "$REAL_F.nas-sync.bak" ] || exit 92',
     'BAK_TMP=$(mktemp "$D_DIR/.nas-sync-bak.XXXXXX")',
     'TMP_NEW=$(mktemp "$D_DIR/.nas-sync-tmp.XXXXXX")',
     'trap \'rm -f -- "$BAK_TMP" "$TMP_NEW"\' EXIT',
@@ -117,10 +126,11 @@ export function buildSafeConfigWriteScript(
     'chmod 600 -- "$BAK_TMP"',
     'cat > "$TMP_NEW"',
     'chmod --reference="$REAL_F" "$TMP_NEW" 2>/dev/null || chmod 640 "$TMP_NEW"',
-    'if [ "$(id -u)" = "0" ]; then chown --reference="$REAL_F" "$BAK_TMP" "$TMP_NEW" 2>/dev/null || true; fi',
     'rm -f -- "$REAL_F.nas-sync.bak"',
-    'mv -f -- "$BAK_TMP" "$REAL_F.nas-sync.bak"',
-    'mv -f -- "$TMP_NEW" "$REAL_F"',
+    '[ ! -d "$REAL_F.nas-sync.bak" ] || exit 92',
+    'mv -fT -- "$BAK_TMP" "$REAL_F.nas-sync.bak" 2>/dev/null || { [ ! -d "$REAL_F.nas-sync.bak" ] && mv -f -- "$BAK_TMP" "$REAL_F.nas-sync.bak"; }',
+    '[ ! -d "$REAL_F" ] || exit 92',
+    'mv -fT -- "$TMP_NEW" "$REAL_F" 2>/dev/null || { [ ! -d "$REAL_F" ] && mv -f -- "$TMP_NEW" "$REAL_F"; }',
     'trap - EXIT',
   ].join('\n');
 
@@ -261,7 +271,8 @@ function writeRemoteFileAtomicallyOverSsh(
   relFile: string,
   siteUser: string,
   content: string,
-  timeoutMs = 20000
+  timeoutMs = 20000,
+  jobId?: number
 ): Promise<void> {
   const sshUser = (server.ssh_user || 'root').trim();
   const ipAddr = (server.ip_address || '').trim();
@@ -285,6 +296,8 @@ function writeRemoteFileAtomicallyOverSsh(
       windowsHide: true,
       detached: DETACHED_PROCESS_GROUP,
     });
+    const unregisterChild =
+      jobId !== undefined ? registerJobChildProcess(jobId, child) : null;
 
     let stderr = '';
     let settled = false;
@@ -292,6 +305,7 @@ function writeRemoteFileAtomicallyOverSsh(
     const timer = setTimeout(() => {
       if (!settled) {
         settled = true;
+        unregisterChild?.();
         terminateChildGracefully(child);
         reject(
           new Error(`Quá thời gian chờ khi ghi cấu hình ${relFile} qua SSH.`)
@@ -305,6 +319,7 @@ function writeRemoteFileAtomicallyOverSsh(
 
     child.on('error', (err) => {
       clearTimeout(timer);
+      unregisterChild?.();
       if (!settled) {
         settled = true;
         reject(err);
@@ -313,6 +328,7 @@ function writeRemoteFileAtomicallyOverSsh(
 
     child.on('close', (code) => {
       clearTimeout(timer);
+      unregisterChild?.();
       if (settled) return;
       settled = true;
       if (code === 0) {
@@ -358,6 +374,7 @@ export async function patchRestoredWebConfigOverSsh(params: {
   dbRenameMap: Record<string, string>;
   isMock: boolean;
   mockWebrootDir?: string;
+  jobId?: number;
   onLog: (msg: string) => void;
 }): Promise<{ patchedFiles: string[] }> {
   const { server, targetUser, targetDomain, onLog } = params;
@@ -524,6 +541,7 @@ export async function patchRestoredWebConfigOverSsh(params: {
   const probeRes = await execRemoteSSH(server, probeScript, {
     zeroImpact: true,
     timeoutMs: 20000,
+    jobId: params.jobId,
   });
 
   if (probeRes.code !== 0 || !probeRes.stdout.trim()) {
@@ -545,6 +563,7 @@ export async function patchRestoredWebConfigOverSsh(params: {
     const readRes = await execRemoteSSH(server, readScript, {
       zeroImpact: true,
       timeoutMs: 20000,
+      jobId: params.jobId,
     });
     if (readRes.code !== 0 || !readRes.stdout || readRes.stdout.includes('\0')) {
       continue;
@@ -562,7 +581,9 @@ export async function patchRestoredWebConfigOverSsh(params: {
         cleanTargetWebroot,
         relFile,
         effectiveSiteUser,
-        updated
+        updated,
+        20000,
+        params.jobId
       );
       patchedFiles.push(relFile);
       onLog(

@@ -254,7 +254,12 @@ export default function SettingsPage() {
   const [resetPassTarget, setResetPassTarget] = useState<UserRecord | null>(
     null
   );
+  const [resetSecurityMode, setResetSecurityMode] = useState<
+    'password' | '2fa'
+  >('password');
   const [resetPassValue, setResetPassValue] = useState('');
+  const [resetAdminPassword, setResetAdminPassword] = useState('');
+  const [resetAdminTotpCode, setResetAdminTotpCode] = useState('');
   const [resettingPass, setResettingPass] = useState(false);
 
   const isAdmin = !currentUser || currentUser.role === 'ADMIN';
@@ -1076,57 +1081,65 @@ export default function SettingsPage() {
     setResettingPass(true);
     setRbacFeedback(null);
     try {
+      const payload: Record<string, unknown> = {
+        adminPassword: resetAdminPassword,
+        ...(twoFaState.enabled
+          ? { adminTotpCode: resetAdminTotpCode.trim() }
+          : {}),
+      };
+      if (resetSecurityMode === 'password') {
+        payload.password = resetPassValue;
+      } else {
+        payload.resetTotp = true;
+        payload.reset2fa = true;
+      }
+
       const resp = await fetch(`/api/users/${resetPassTarget.id}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ password: resetPassValue }),
+        body: JSON.stringify(payload),
       });
       const json = await resp.json().catch(() => ({}));
       if (!resp.ok) {
         setRbacFeedback({
           ok: false,
-          text: json.error || 'Đặt lại mật khẩu thất bại.',
+          text:
+            json.error ||
+            (resetSecurityMode === 'password'
+              ? 'Đặt lại mật khẩu thất bại.'
+              : 'Không thể đặt lại 2FA cho tài khoản này.'),
         });
         return;
       }
       setRbacFeedback({
         ok: true,
-        text: `✅ Đã đặt lại mật khẩu mới cho tài khoản "${resetPassTarget.username}".`,
+        text:
+          resetSecurityMode === 'password'
+            ? `✅ Đã đặt lại mật khẩu mới cho tài khoản "${resetPassTarget.username}".`
+            : `✅ Đã gỡ Bảo mật 2 lớp (2FA) cho tài khoản "${resetPassTarget.username}".`,
       });
       setResetPassTarget(null);
       setResetPassValue('');
+      setResetAdminPassword('');
+      setResetAdminTotpCode('');
+      if (resetSecurityMode === '2fa') {
+        await loadUsers();
+      }
     } finally {
       setResettingPass(false);
     }
   };
 
-  const handleResetUser2fa = async (user: UserRecord) => {
-    if (
-      !confirm(
-        `Xác nhận tắt & đặt lại Bảo mật 2 lớp (2FA) cho tài khoản "${user.username}"?`
-      )
-    ) {
-      return;
-    }
+  const openResetSecurityModal = (
+    user: UserRecord,
+    mode: 'password' | '2fa'
+  ) => {
+    setResetSecurityMode(mode);
+    setResetPassTarget(user);
+    setResetPassValue('');
+    setResetAdminPassword('');
+    setResetAdminTotpCode('');
     setRbacFeedback(null);
-    const resp = await fetch(`/api/users/${user.id}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ resetTotp: true, reset2fa: true }),
-    });
-    const json = await resp.json().catch(() => ({}));
-    if (!resp.ok) {
-      setRbacFeedback({
-        ok: false,
-        text: json.error || 'Không thể đặt lại 2FA cho tài khoản này.',
-      });
-      return;
-    }
-    setRbacFeedback({
-      ok: true,
-      text: `✅ Đã gỡ Bảo mật 2 lớp (2FA) cho tài khoản "${user.username}".`,
-    });
-    await loadUsers();
   };
 
   const handleDeleteUser = async (user: UserRecord) => {
@@ -1553,13 +1566,13 @@ export default function SettingsPage() {
                       <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
                         <div className="lg:col-span-5 flex flex-col justify-between">
                           <label className="block text-slate-300 font-medium mb-1">
-                            Mật khẩu Mã hóa Đầu-Cuối AES-256-GCM * (tối thiểu 8 ký
+                            Mật khẩu Mã hóa Đầu-Cuối AES-256-GCM * (tối thiểu 12 ký
                             tự)
                           </label>
                           <div className="relative">
                             <input
                               type={showOffsitePassphrase ? 'text' : 'password'}
-                              minLength={8}
+                              minLength={12}
                               autoComplete="new-password"
                               value={settings.offsite_encryption_passphrase || ''}
                               onChange={(e) =>
@@ -1568,7 +1581,7 @@ export default function SettingsPage() {
                                   e.target.value
                                 )
                               }
-                              placeholder="Nhập khóa bí mật tối thiểu 8 ký tự..."
+                              placeholder="Nhập khóa bí mật tối thiểu 12 ký tự..."
                               className="w-full min-h-[42px] bg-slate-950 border border-slate-700 focus:border-emerald-500 rounded-lg pl-3 pr-10 py-2 text-white font-mono outline-none"
                             />
                             <button
@@ -3734,7 +3747,7 @@ export default function SettingsPage() {
                   <input
                     type={showNewUserPass ? 'text' : 'password'}
                     required
-                    minLength={6}
+                    minLength={8}
                     value={createUserForm.password}
                     onChange={(e) =>
                       setCreateUserForm({
@@ -3742,7 +3755,7 @@ export default function SettingsPage() {
                         password: e.target.value,
                       })
                     }
-                    placeholder="Tối thiểu 6 ký tự..."
+                    placeholder="Tối thiểu 8 ký tự..."
                     className="w-full min-h-[42px] bg-slate-950 border border-slate-800 rounded-lg pl-3 pr-10 py-2 text-white"
                   />
                   <button
@@ -3902,20 +3915,19 @@ export default function SettingsPage() {
                       </div>
 
                       <div className="flex flex-wrap items-center gap-2 pt-1">
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setResetPassTarget(u);
-                            setResetPassValue('');
-                          }}
-                          className="flex-1 min-h-[38px] px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 inline-flex items-center justify-center text-center whitespace-nowrap"
-                        >
-                          Đặt lại mật khẩu
-                        </button>
-                        {u.totp_enabled === 1 && (
+                        {!isSelf && (
                           <button
                             type="button"
-                            onClick={() => void handleResetUser2fa(u)}
+                            onClick={() => openResetSecurityModal(u, 'password')}
+                            className="flex-1 min-h-[38px] px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 inline-flex items-center justify-center text-center whitespace-nowrap"
+                          >
+                            Đặt lại mật khẩu
+                          </button>
+                        )}
+                        {!isSelf && u.totp_enabled === 1 && (
+                          <button
+                            type="button"
+                            onClick={() => openResetSecurityModal(u, '2fa')}
                             className="flex-1 min-h-[38px] px-3 py-1.5 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/30 inline-flex items-center justify-center text-center whitespace-nowrap"
                           >
                             Reset 2FA
@@ -4022,20 +4034,23 @@ export default function SettingsPage() {
                           </td>
                           <td className="p-3.5 text-right whitespace-nowrap">
                             <div className="inline-flex items-center justify-end gap-1.5">
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  setResetPassTarget(u);
-                                  setResetPassValue('');
-                                }}
-                                className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700"
-                              >
-                                Đặt lại MK
-                              </button>
-                              {u.totp_enabled === 1 && (
+                              {!isSelf && (
                                 <button
                                   type="button"
-                                  onClick={() => void handleResetUser2fa(u)}
+                                  onClick={() =>
+                                    openResetSecurityModal(u, 'password')
+                                  }
+                                  className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700"
+                                >
+                                  Đặt lại MK
+                                </button>
+                              )}
+                              {!isSelf && u.totp_enabled === 1 && (
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    openResetSecurityModal(u, '2fa')
+                                  }
                                   className="px-2.5 py-1.5 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/30"
                                 >
                                   Reset 2FA
@@ -4065,13 +4080,15 @@ export default function SettingsPage() {
             </div>
           </div>
 
-          {/* Reset User Password Modal */}
+          {/* Reset User Password / 2FA Re-Auth Modal */}
           {resetPassTarget && (
             <div className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4">
               <div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-md w-full p-4 sm:p-6 space-y-4 max-h-[calc(100dvh-2rem)] overflow-y-auto">
                 <div className="flex items-start justify-between gap-2">
                   <h4 className="text-sm font-bold text-white break-words">
-                    Đặt lại mật khẩu cho{' '}
+                    {resetSecurityMode === 'password'
+                      ? 'Đặt lại mật khẩu cho '
+                      : 'Xác nhận gỡ Bảo mật 2FA cho '}
                     <span className="text-cyan-300 font-mono">
                       {resetPassTarget.username}
                     </span>
@@ -4090,21 +4107,57 @@ export default function SettingsPage() {
                   onSubmit={handleSubmitResetUserPassword}
                   className="space-y-4 text-xs"
                 >
+                  {resetSecurityMode === 'password' && (
+                    <div>
+                      <label className="block text-slate-300 mb-1">
+                        Mật khẩu mới cho {resetPassTarget.username} (tối thiểu 8 ký tự) *
+                      </label>
+                      <input
+                        type="text"
+                        required
+                        minLength={8}
+                        autoFocus
+                        value={resetPassValue}
+                        onChange={(e) => setResetPassValue(e.target.value)}
+                        placeholder="Nhập mật khẩu mới..."
+                        className="w-full min-h-[42px] bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white font-mono"
+                      />
+                    </div>
+                  )}
+
                   <div>
                     <label className="block text-slate-300 mb-1">
-                      Mật khẩu mới (tối thiểu 6 ký tự)
+                      Mật khẩu Quản trị viên (ADMIN) hiện tại của bạn *
                     </label>
                     <input
-                      type="text"
+                      type="password"
                       required
-                      minLength={6}
-                      autoFocus
-                      value={resetPassValue}
-                      onChange={(e) => setResetPassValue(e.target.value)}
-                      placeholder="Nhập mật khẩu mới..."
-                      className="w-full min-h-[42px] bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white font-mono"
+                      autoComplete="current-password"
+                      value={resetAdminPassword}
+                      onChange={(e) => setResetAdminPassword(e.target.value)}
+                      placeholder="Xác thực mật khẩu ADMIN của bạn..."
+                      className="w-full min-h-[42px] bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white"
                     />
                   </div>
+
+                  {twoFaState.enabled && (
+                    <div>
+                      <label className="block text-slate-300 mb-1">
+                        Mã 2FA 6 chữ số (hoặc Mã khôi phục) của bạn *
+                      </label>
+                      <input
+                        type="text"
+                        required
+                        maxLength={16}
+                        autoComplete="one-time-code"
+                        value={resetAdminTotpCode}
+                        onChange={(e) => setResetAdminTotpCode(e.target.value)}
+                        placeholder="123456 / XXXX-XXXX"
+                        className="w-full min-h-[42px] bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white font-mono"
+                      />
+                    </div>
+                  )}
+
                   <div className="flex flex-col-reverse sm:flex-row sm:justify-end gap-2">
                     <button
                       type="button"
@@ -4115,10 +4168,24 @@ export default function SettingsPage() {
                     </button>
                     <button
                       type="submit"
-                      disabled={resettingPass || resetPassValue.length < 6}
-                      className="min-h-[40px] px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white font-semibold"
+                      disabled={
+                        resettingPass ||
+                        !resetAdminPassword ||
+                        (twoFaState.enabled && !resetAdminTotpCode.trim()) ||
+                        (resetSecurityMode === 'password' &&
+                          resetPassValue.length < 8)
+                      }
+                      className={`min-h-[40px] px-4 py-2 rounded-lg disabled:opacity-50 text-white font-semibold ${
+                        resetSecurityMode === '2fa'
+                          ? 'bg-amber-600 hover:bg-amber-500'
+                          : 'bg-blue-600 hover:bg-blue-500'
+                      }`}
                     >
-                      {resettingPass ? 'Đang lưu...' : 'Lưu Mật khẩu Mới'}
+                      {resettingPass
+                        ? 'Đang xử lý...'
+                        : resetSecurityMode === 'password'
+                        ? 'Lưu Mật khẩu Mới'
+                        : 'Xác nhận Gỡ 2FA'}
                     </button>
                   </div>
                 </form>
@@ -4282,6 +4349,14 @@ export default function SettingsPage() {
           {updateInfo?.blockingReason && (
             <div className="p-3 rounded-lg bg-amber-500/15 border border-amber-500/30 text-amber-200 break-words">
               ⚠️ {updateInfo.blockingReason}
+            </div>
+          )}
+
+          {updateInfo?.imageRebuildRecommended && (
+            <div className="p-3 rounded-lg bg-cyan-500/15 border border-cyan-500/30 text-cyan-200 break-words">
+              ℹ️{' '}
+              {updateInfo.imageRebuildHint ||
+                'Bản cập nhật này có thay đổi ở tầng Base Image / docker-entrypoint.sh — khuyến nghị chạy thêm bash update.sh trên máy chủ NAS để đồng bộ container nền mới nhất.'}
             </div>
           )}
 

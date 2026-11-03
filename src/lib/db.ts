@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { hashPassword } from './password';
+import { migrateLegacyV1TotpSecrets } from './totp';
 
 export interface SqliteStatement {
   run(...params: unknown[]): { changes: number | bigint; lastInsertRowid: number | bigint };
@@ -96,6 +97,7 @@ export function getDb(): SqliteDatabase {
   seedDefaults(db);
 
   globalThis.__nasSyncDb = db;
+  migrateLegacyV1TotpSecrets(db);
   return db;
 }
 
@@ -377,6 +379,15 @@ function initializeSchema(db: SqliteDatabase) {
     }
   }
 
+  // A15 Fix: Ràng buộc duy nhất không phân biệt chữ hoa/thường cho tên đăng nhập
+  try {
+    db.exec(
+      'CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_nocase ON users(LOWER(username))'
+    );
+  } catch {
+    // Giữ tương thích nếu CSDL cũ đã tồn tại bản ghi trùng khác hoa/thường trước khi nâng cấp
+  }
+
   // Nâng cấp v1.4.0: Đảm bảo các máy chủ Demo mô phỏng (is_mock = 1) có sẵn khóa TOFU mẫu
   try {
     db.prepare(
@@ -485,8 +496,6 @@ function seedDefaults(db: SqliteDatabase) {
         idx === 0 ? 1 : 0
       );
     });
-  } else {
-    migrateLegacyVolumeLabelsAndWormSettings(db);
   }
 
   // 3. Seed Default System Settings
@@ -525,6 +534,7 @@ function seedDefaults(db: SqliteDatabase) {
     worm_cron_time: process.env.WORM_CRON_TIME || '0 6 * * *',
     worm_auto_enabled: process.env.WORM_AUTO_ENABLED || 'false',
     worm_retention_days: process.env.WORM_RETENTION_DAYS || '7',
+    worm_auto_prune_expired: 'true',
     btrfs_cron_time: '0 6 * * *',
     btrfs_auto_enabled: 'false',
     global_exclude_patterns: '',
@@ -642,57 +652,77 @@ export function migrateLegacyVolumeLabelsAndWormSettings(
      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')`
   );
 
-  if (readVal('worm_migrated_v170') === 'true') {
+  const alreadyMigratedV170 = readVal('worm_migrated_v170') === 'true';
+  const alreadyPurgedV171 = readVal('worm_purged_legacy_v171') === 'true';
+  if (alreadyMigratedV170 && alreadyPurgedV171) {
     return;
   }
 
   const p = ['d', 's', 'm_'].join('');
-  const oldUrl = readVal(`${p}api_url`).trim();
-  const oldUser = readVal(`${p}username`).trim();
-  const oldPass = readVal(`${p}password`);
-  const oldShares =
-    readVal(`${p}backup_shares`).trim() || readVal(`${p}btrfs_shares`).trim();
-  const oldInsecure = readVal(`${p}tls_insecure`).trim();
-  const oldLockDays = readVal(`${p}worm_lock_days`).trim();
-  const oldBtrfsAuto = readVal('btrfs_auto_enabled').trim();
-  const oldBtrfsCron = readVal('btrfs_cron_time').trim();
+  if (!alreadyMigratedV170) {
+    const oldUrl = readVal(`${p}api_url`).trim();
+    const oldUser = readVal(`${p}username`).trim();
+    const oldPass = readVal(`${p}password`);
+    const oldShares =
+      readVal(`${p}backup_shares`).trim() || readVal(`${p}btrfs_shares`).trim();
+    const oldInsecure = readVal(`${p}tls_insecure`).trim();
+    const oldLockDays = readVal(`${p}worm_lock_days`).trim();
+    const oldBtrfsAuto = readVal('btrfs_auto_enabled').trim();
+    const oldBtrfsCron = readVal('btrfs_cron_time').trim();
 
-  if (oldUrl && !readVal('worm_api_url').trim()) {
-    upsert.run('worm_api_url', oldUrl);
-    if (
-      !readVal('worm_provider').trim() ||
-      readVal('worm_provider').trim() === 'NONE'
-    ) {
-      upsert.run('worm_provider', 'NAS_WEBAPI');
+    if (oldUrl && !readVal('worm_api_url').trim()) {
+      upsert.run('worm_api_url', oldUrl);
+      if (
+        !readVal('worm_provider').trim() ||
+        readVal('worm_provider').trim() === 'NONE'
+      ) {
+        upsert.run('worm_provider', 'NAS_WEBAPI');
+      }
     }
-  }
-  if (oldUser && !readVal('worm_username').trim()) {
-    upsert.run('worm_username', oldUser);
-  }
-  if (oldPass && !readVal('worm_password')) {
-    upsert.run('worm_password', oldPass);
-  }
-  if (
-    oldShares &&
-    (!readVal('worm_target_shares').trim() ||
-      readVal('worm_target_shares').trim() === 'VPS_Backups')
-  ) {
-    upsert.run('worm_target_shares', oldShares);
-  }
-  if (oldInsecure === 'true') {
-    upsert.run('worm_tls_insecure', 'true');
-  }
-  if (oldLockDays && Number(oldLockDays) > 0) {
-    upsert.run('worm_retention_days', oldLockDays);
-  }
-  if (oldBtrfsAuto === 'true') {
-    upsert.run('worm_auto_enabled', 'true');
-  }
-  if (oldBtrfsCron && oldBtrfsCron !== '0 6 * * *') {
-    upsert.run('worm_cron_time', oldBtrfsCron);
+    if (oldUser && !readVal('worm_username').trim()) {
+      upsert.run('worm_username', oldUser);
+    }
+    if (oldPass && !readVal('worm_password')) {
+      upsert.run('worm_password', oldPass);
+    }
+    if (
+      oldShares &&
+      (!readVal('worm_target_shares').trim() ||
+        readVal('worm_target_shares').trim() === 'VPS_Backups')
+    ) {
+      upsert.run('worm_target_shares', oldShares);
+    }
+    if (oldInsecure === 'true') {
+      upsert.run('worm_tls_insecure', 'true');
+    }
+    if (oldLockDays && Number(oldLockDays) > 0) {
+      upsert.run('worm_retention_days', oldLockDays);
+    }
+    if (oldBtrfsAuto === 'true') {
+      upsert.run('worm_auto_enabled', 'true');
+    }
+    if (oldBtrfsCron && oldBtrfsCron !== '0 6 * * *') {
+      upsert.run('worm_cron_time', oldBtrfsCron);
+    }
+
+    upsert.run('worm_migrated_v170', 'true');
   }
 
-  upsert.run('worm_migrated_v170', 'true');
+  // A11 Security Fix: Xóa triệt để các dòng cấu hình thế hệ cũ khỏi bảng `system_settings` sau khi đã chuyển sang `worm_*`
+  const legacyKeysToPurge = [
+    `${p}api_url`,
+    `${p}username`,
+    `${p}password`,
+    `${p}backup_shares`,
+    `${p}btrfs_shares`,
+    `${p}tls_insecure`,
+    `${p}worm_lock_days`,
+  ];
+  const delLegacyStmt = db.prepare('DELETE FROM system_settings WHERE key = ?');
+  for (const legacyKey of legacyKeysToPurge) {
+    delLegacyStmt.run(legacyKey);
+  }
+  upsert.run('worm_purged_legacy_v171', 'true');
 }
 
 export function getSetting(key: string, fallback = ''): string {

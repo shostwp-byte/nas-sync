@@ -44,6 +44,7 @@ import {
   killJobChildProcesses,
   loadOrCreateState,
   registerJobChildProcess,
+  removeDirectoryTreeNonBlocking,
   requestCancelJob,
   saveState,
   throwIfCancelled,
@@ -98,13 +99,22 @@ export async function executeBackupJob(
     hostname: server.hostname,
   });
 
-  const isResuming = job.retry_count > 0 || job.status === 'INTERRUPTED';
+  const isResuming =
+    job.retry_count > 0 ||
+    job.status === 'INTERRUPTED' ||
+    job.status === 'RESUMING';
 
-  db.prepare(
-    `UPDATE backup_jobs
-     SET status = ?, started_at = COALESCE(started_at, datetime('now')), error_log = NULL
-     WHERE id = ?`
-  ).run(isResuming ? 'RESUMING' : 'RUNNING', jobId);
+  if (job.status === 'QUEUED' || job.status === 'INTERRUPTED') {
+    db.prepare(
+      `UPDATE backup_jobs
+       SET status = ?, started_at = COALESCE(started_at, datetime('now')), error_log = NULL
+       WHERE id = ?`
+    ).run(isResuming ? 'RESUMING' : 'RUNNING', jobId);
+  } else if (job.error_log) {
+    db.prepare('UPDATE backup_jobs SET error_log = NULL WHERE id = ?').run(
+      jobId
+    );
+  }
 
   db.prepare(`UPDATE servers SET status = 'BACKUP_RUNNING' WHERE id = ?`).run(
     server.id
@@ -127,13 +137,53 @@ export async function executeBackupJob(
       currentPhase: 'Kiểm tra dung lượng phân vùng NAS (Pre-Flight)...',
     });
 
-    const activeVolume = await ensureActiveVolumeForBackup(server, appendLog);
+    const activeVolume = await ensureActiveVolumeForBackup(
+      server,
+      appendLog,
+      jobId
+    );
     db.prepare('UPDATE backup_jobs SET volume_id = ? WHERE id = ?').run(
       activeVolume.id,
       jobId
     );
 
     assertSafe(isSafeSnapshotName, job.snapshot_name, 'Snapshot Name');
+
+    const hostDir = path.join(activeVolume.mount_path, server.hostname);
+    const inProgressDir = path.join(
+      hostDir,
+      `.in_progress_${job.snapshot_name}`
+    );
+    const finalSnapshotDir = path.join(hostDir, job.snapshot_name);
+
+    // N19 Fix: Nếu tiến trình cũ đã hoàn tất Atomic Commit sang thư mục đích (ví dụ bị tắt lúc đang VERIFYING),
+    // giữ nguyên Snapshot tốt trên đĩa và hoàn tất Job an toàn thay vì xóa backup_items và kéo lại từ đầu.
+    const existingCommittedItems = Number(
+      db
+        .prepare('SELECT COUNT(*) AS cnt FROM backup_items WHERE job_id = ?')
+        .get(jobId)?.cnt || 0
+    );
+    if (
+      fs.existsSync(finalSnapshotDir) &&
+      !fs.existsSync(inProgressDir) &&
+      existingCommittedItems > 0
+    ) {
+      snapshotCommitted = true;
+      appendLog(
+        `[Recovery] Phát hiện bản Snapshot ${finalSnapshotDir} đã Atomic Commit nguyên vẹn trước khi khởi động lại (${existingCommittedItems} domain) — giữ nguyên dữ liệu và hoàn tất an toàn.`
+      );
+      db.prepare(
+        `UPDATE backup_jobs
+         SET status = 'COMPLETED', progress_percent = 100, current_phase = 'Hoàn tất (Phục hồi sau khởi động lại)',
+             current_domain = '', speed_bps = 0, eta_seconds = 0, completed_at = COALESCE(completed_at, datetime('now'))
+         WHERE id = ?`
+      ).run(jobId);
+      db.prepare(`UPDATE servers SET status = 'ONLINE' WHERE id = ?`).run(
+        server.id
+      );
+      emitJobUpdated(jobId);
+      return;
+    }
 
     // 1b. Xác thực khóa định danh SSH Host Key (TOFU Pinning & Chống MITM) trước mọi kết nối SSH/Rsync
     updateProgress({
@@ -150,12 +200,6 @@ export async function executeBackupJob(
       `[SSH TOFU] Xác thực khóa định danh máy chủ thành công (${hostKeyCheck.status}: ${hostKeyCheck.fingerprint}).`
     );
 
-    const hostDir = path.join(activeVolume.mount_path, server.hostname);
-    const inProgressDir = path.join(
-      hostDir,
-      `.in_progress_${job.snapshot_name}`
-    );
-    const finalSnapshotDir = path.join(hostDir, job.snapshot_name);
     fs.mkdirSync(inProgressDir, { recursive: true });
 
     const latestSnapshotDir = resolveLatestSnapshotDir(hostDir);
@@ -329,8 +373,10 @@ export async function executeBackupJob(
                 mustExist: true,
                 expectedDomain: dom.domain,
                 parentDomain: dom.parentDomain,
+                jobId,
               }
             );
+            throwIfCancelled(jobId);
 
             if (!safety.ok) {
               if (safety.code === 'SSH_ERROR') {
@@ -374,6 +420,7 @@ export async function executeBackupJob(
                 jobId,
                 server,
                 remoteWebroot: safety.resolvedPath,
+                systemUser: dom.systemUser,
                 destPublicHtmlDir,
                 linkDestPublicHtmlDir,
                 excludedSubpaths: dom.excludedSubpaths,
@@ -426,9 +473,11 @@ export async function executeBackupJob(
                 dbEntry.name,
                 'PostgreSQL DB Name'
               );
+              // S12 Security Fix: Xuất bản sao lưu PostgreSQL mới dưới dạng nhị phân pg_dump -Fc (.pgdump.zst)
+              // để khôi phục bằng pg_restore thay vì truyền qua psql parser.
               const destZstFile = path.join(
                 destDatabasesDir,
-                `pg_${safePgDb}.sql.zst`
+                `pg_${safePgDb}.pgdump.zst`
               );
               const pgRes = await streamRemotePostgresDumpToZst({
                 jobId,
@@ -569,7 +618,7 @@ export async function executeBackupJob(
 
     fs.rmSync(stateFilePath, { force: true });
     if (fs.existsSync(finalSnapshotDir)) {
-      fs.rmSync(finalSnapshotDir, { recursive: true, force: true });
+      await removeDirectoryTreeNonBlocking(finalSnapshotDir);
     }
     fs.renameSync(inProgressDir, finalSnapshotDir);
     snapshotCommitted = true;
@@ -771,7 +820,12 @@ export async function executeBackupJob(
       );
     }
 
-    if (err instanceof RetryableNetworkError && !snapshotCommitted) {
+    // N20 Fix: Nếu quản trị viên đã bấm Hủy (isJobCancelled), tuyệt đối không chuyển sang INTERRUPTED để tự động Resume
+    if (
+      err instanceof RetryableNetworkError &&
+      !snapshotCommitted &&
+      !isJobCancelled(jobId)
+    ) {
       const freshRetryRow = db
         .prepare('SELECT retry_count FROM backup_jobs WHERE id = ?')
         .get(jobId);

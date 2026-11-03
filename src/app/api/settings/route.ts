@@ -9,6 +9,7 @@ import {
   validateExcludePatternsInput,
 } from '@/lib/engine/exclude-rules';
 import { sendDailyMorningDigest } from '@/lib/engine/morning-digest';
+import { MIN_OFFSITE_PASSPHRASE_LENGTH } from '@/lib/engine/offsite-cloud';
 import { reloadCronSchedules } from '@/lib/engine/queue';
 import {
   detectTelegramChatId,
@@ -56,6 +57,7 @@ const ALLOWED_SETTING_KEYS = new Set([
   'worm_cron_time',
   'worm_auto_enabled',
   'worm_retention_days',
+  'worm_auto_prune_expired',
   'btrfs_cron_time',
   'btrfs_auto_enabled',
   'github_token',
@@ -180,6 +182,18 @@ function applySettingsDictionary(
       );
       continue;
     }
+    if (
+      k === 'offsite_encryption_passphrase' &&
+      strVal.length > 0 &&
+      strVal.length < MIN_OFFSITE_PASSPHRASE_LENGTH
+    ) {
+      return NextResponse.json(
+        {
+          error: `Mật khẩu mã hóa Offsite (AES-256-GCM) phải có tối thiểu ${MIN_OFFSITE_PASSPHRASE_LENGTH} ký tự.`,
+        },
+        { status: 400 }
+      );
+    }
     sanitized[k] = strVal;
   }
 
@@ -206,11 +220,14 @@ export async function GET() {
     const guard = await requireRole(['ADMIN']);
     if (!guard.ok) return guard.response;
 
+    // A11 Security Fix: Chỉ trả về các khóa nằm trong ALLOWED_SETTING_KEYS, tuyệt đối không lộ khóa lạ/cũ trong bảng system_settings
     const rawSettings = getAllSettings();
-    const settings: Record<string, string> = { ...rawSettings };
-    for (const key of SECRET_SETTING_KEYS) {
-      if (settings[key]) {
-        settings[key] = SECRET_MASK;
+    const settings: Record<string, string> = {};
+    for (const key of ALLOWED_SETTING_KEYS) {
+      if (Object.prototype.hasOwnProperty.call(rawSettings, key)) {
+        const val = rawSettings[key];
+        settings[key] =
+          SECRET_SETTING_KEYS.has(key) && val ? SECRET_MASK : val;
       }
     }
 

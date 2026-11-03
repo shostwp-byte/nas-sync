@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { safeErrorJson } from '@/lib/api-error';
 import { recordAuditLog } from '@/lib/audit';
-import { hashPassword, isValidUserRole, requireRole } from '@/lib/auth';
+import { hashPasswordAsync, isValidUserRole, requireRole } from '@/lib/auth';
 import { getDb } from '@/lib/db';
 import type { UserRecord, UserRole } from '@/types';
 
@@ -85,12 +85,13 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    const passwordHash = await hashPasswordAsync(password);
     const res = db
       .prepare(
         `INSERT INTO users (username, password_hash, role)
          VALUES (?, ?, ?)`
       )
-      .run(username, hashPassword(password), rawRole);
+      .run(username, passwordHash, rawRole);
 
     const newId = Number(res.lastInsertRowid);
 

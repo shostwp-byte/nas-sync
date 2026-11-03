@@ -188,7 +188,7 @@ test('2. [S2, S3, S5, S9, S11] Chống TOCTOU Symlink trên VPS: Rsync Jail, Con
   assert.ok(aaPermCmd.includes('cd -P -- "$EXPECTED"'));
   assert.ok(aaPermCmd.includes('chown -hR www:www .'));
   assert.ok(
-    aaPermCmd.includes('find . -P ! -type l -type d -exec chmod 755 {} +')
+    aaPermCmd.includes('find -P . ! -type l -type d -exec chmod 755 {} +')
   );
   assert.ok(aaPermCmd.includes('su -s /bin/sh www -c'));
 

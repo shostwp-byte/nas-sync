@@ -1,4 +1,7 @@
-import { spawn } from 'node:child_process';
+import {
+  spawn,
+  type ChildProcessWithoutNullStreams,
+} from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { Readable, Transform } from 'node:stream';
@@ -55,6 +58,7 @@ const RESTORE_PERMISSION_FIX_TIMEOUT_MS = 15 * 60 * 1000;
 function pushFilesViaRsync(params: {
   jobId: number;
   targetServer: ServerRecord;
+  targetUser: string;
   localPublicHtmlDir: string;
   targetWebroot: string;
   excludedSubpaths?: string[];
@@ -63,14 +67,19 @@ function pushFilesViaRsync(params: {
   const {
     jobId,
     targetServer,
+    targetUser,
     localPublicHtmlDir,
     targetWebroot,
     excludedSubpaths,
     onProgress,
   } = params;
 
+  // S14 Security Fix: Loại bỏ quyền sở hữu gốc (--no-owner --no-group) và bit setuid/setgid (--chmod=ugo-s)
   const args: string[] = [
     '-az',
+    '--no-owner',
+    '--no-group',
+    '--chmod=ugo-s',
     '--delete',
     '--no-devices',
     '--no-specials',
@@ -91,8 +100,13 @@ function pushFilesViaRsync(params: {
     args.push(`--bwlimit=${targetServer.bw_limit_kbps}`);
   }
   args.push('-e', buildRsyncSshTransport(targetServer));
-  // S3 Security Fix: Ghim inode thư mục webroot đích bằng realpath + cd -P + pwd -P ngay trong phiên rsync
-  args.push(`--rsync-path=${buildJailedRsyncPath(targetWebroot)}`);
+  // S3 Security Fix: Ghim inode thư mục webroot đích bằng realpath + cd -P + pwd -P và ưu tiên hạ quyền xuống user của site
+  args.push(
+    `--rsync-path=${buildJailedRsyncPath(targetWebroot, {
+      runAsUser: targetUser,
+      mode: 'push',
+    })}`
+  );
   args.push(
     `${localPublicHtmlDir.replace(/\/+$/, '')}/`,
     `${targetServer.ssh_user || 'root'}@${targetServer.ip_address}:./`
@@ -157,6 +171,21 @@ function pushFilesViaRsync(params: {
   });
 }
 
+/**
+ * S13 Fix: Đặt `${authFlags}` (có thể chứa `--defaults-extra-file=...`) ĐỨNG ĐẦU TIÊN ngay sau `mysql`
+ * trước `--binary-mode` để tương thích tuyệt đối với MySQL 8.x trên cPanel/HestiaCP/CyberPanel/CloudPanel.
+ */
+export function buildRemoteMysqlRestoreInnerCommand(
+  creds: MysqlAdminCredentials,
+  targetDbName: string
+): string {
+  const authFlags = buildMysqlAuthFlags(creds).trim();
+  const envPrelude = buildRemoteMysqlEnvPrelude(creds);
+  const safeDb = assertSafe(isSafeDbName, targetDbName, 'Tên database đích');
+  const flagPart = authFlags ? `${authFlags} --binary-mode` : '--binary-mode';
+  return `${envPrelude}mysql ${flagPart} ${shellSingleQuote(safeDb)}`;
+}
+
 function streamRestoreDatabaseOverSsh(params: {
   jobId: number;
   targetServer: ServerRecord;
@@ -167,30 +196,36 @@ function streamRestoreDatabaseOverSsh(params: {
   const { jobId, targetServer, creds, dumpFilePath, targetDbName } = params;
 
   return new Promise((resolve, reject) => {
+    let sshChild: ChildProcessWithoutNullStreams;
     const ext = path.extname(dumpFilePath).toLowerCase();
-    const authFlags = buildMysqlAuthFlags(creds);
-    const envPrelude = buildRemoteMysqlEnvPrelude(creds);
+    try {
+      // S1 & S13 Security Fix: --defaults-extra-file đứng đầu, --binary-mode vô hiệu hóa meta-command `\! <shell>` của MySQL client
+      const remoteInner = buildRemoteMysqlRestoreInnerCommand(
+        creds,
+        targetDbName
+      );
+      const remoteMysqlCmd = `bash -o pipefail -c ${shellSingleQuote(remoteInner)}`;
 
-    // S1 Security Fix: --binary-mode chặn đứng 100% meta-command `\! <shell>` thực thi lệnh root trên VPS đích
-    const remoteInner = `${envPrelude}mysql --binary-mode ${authFlags} ${shellSingleQuote(targetDbName)}`;
-    const remoteMysqlCmd = `bash -o pipefail -c ${shellSingleQuote(remoteInner)}`;
-
-    // N2 & N5 Fix: Không dùng `bash -c "... | ssh"`, nối trực tiếp stream giải nén trong Node sang ssh.stdin
-    // và ghi nhận từng khối byte đọc từ file dump là hoạt động sống (tránh Idle Timeout giả khi import > 30 phút)
-    const sshChild = spawn(
-      'ssh',
-      [
-        ...buildSshBaseArgs(targetServer),
-        '--',
-        `${targetServer.ssh_user || 'root'}@${targetServer.ip_address}`,
-        remoteMysqlCmd,
-      ],
-      {
-        stdio: ['pipe', 'pipe', 'pipe'],
-        detached: DETACHED_PROCESS_GROUP,
-      }
-    );
-    registerJobChildProcess(jobId, sshChild);
+      // N2 & N5 Fix: Không dùng `bash -c "... | ssh"`, nối trực tiếp stream giải nén trong Node sang ssh.stdin
+      // và ghi nhận từng khối byte đọc từ file dump là hoạt động sống (tránh Idle Timeout giả khi import > 30 phút)
+      sshChild = spawn(
+        'ssh',
+        [
+          ...buildSshBaseArgs(targetServer),
+          '--',
+          `${targetServer.ssh_user || 'root'}@${targetServer.ip_address}`,
+          remoteMysqlCmd,
+        ],
+        {
+          stdio: ['pipe', 'pipe', 'pipe'],
+          detached: DETACHED_PROCESS_GROUP,
+        }
+      );
+      registerJobChildProcess(jobId, sshChild);
+    } catch (syncErr) {
+      reject(syncErr);
+      return;
+    }
 
     const zlibWithZstd = zlib as typeof zlib & {
       createZstdDecompress?: () => Transform;
@@ -354,39 +389,76 @@ function streamRestoreDatabaseOverSsh(params: {
  */
 export async function executeRestoreJob(jobId: number): Promise<void> {
   const db = getDb();
-  const job = db
-    .prepare('SELECT * FROM backup_jobs WHERE id = ?')
-    .get(jobId) as unknown as BackupJob | undefined;
-  if (!job || !job.restore_options) {
-    throw new Error(`Không tìm thấy thông tin cấu hình Restore cho Job #${jobId}`);
-  }
+  let job: BackupJob | undefined;
+  let payload: RestoreRequestPayload;
+  let item: BackupItem;
+  let sourceServer: ServerRecord;
+  let targetServer: ServerRecord;
+  let sourceVolume: StorageVolume;
 
-  const payload = JSON.parse(job.restore_options) as RestoreRequestPayload;
+  // N22 Fix: Bọc toàn bộ bước kiểm tra đầu vào bên trong try/catch để mọi lỗi cấu hình/dữ liệu mồ côi
+  // đều chuyển Job sang FAILED kèm cảnh báo thay vì kẹt vĩnh viễn ở RUNNING.
+  try {
+    job = db
+      .prepare('SELECT * FROM backup_jobs WHERE id = ?')
+      .get(jobId) as unknown as BackupJob | undefined;
+    if (!job || !job.restore_options) {
+      throw new Error(`Không tìm thấy thông tin cấu hình Restore cho Job #${jobId}`);
+    }
 
-  const itemRow = db
-    .prepare('SELECT * FROM backup_items WHERE id = ?')
-    .get(payload.backupItemId) as Record<string, unknown> | undefined;
-  if (!itemRow) {
-    throw new Error(`Không tìm thấy bản sao lưu domain #${payload.backupItemId}`);
-  }
+    payload = JSON.parse(job.restore_options) as RestoreRequestPayload;
 
-  const item: BackupItem = {
-    ...(itemRow as unknown as BackupItem),
-    databases_list: JSON.parse(String(itemRow.databases_list || '[]')),
-  };
+    const itemRow = db
+      .prepare('SELECT * FROM backup_items WHERE id = ?')
+      .get(payload.backupItemId) as Record<string, unknown> | undefined;
+    if (!itemRow) {
+      throw new Error(`Không tìm thấy bản sao lưu domain #${payload.backupItemId}`);
+    }
 
-  const sourceServer = db
-    .prepare('SELECT * FROM servers WHERE id = ?')
-    .get(item.server_id) as unknown as ServerRecord;
-  let targetServer = db
-    .prepare('SELECT * FROM servers WHERE id = ?')
-    .get(payload.targetServerId) as unknown as ServerRecord;
-  const sourceVolume = db
-    .prepare('SELECT * FROM storage_volumes WHERE id = ?')
-    .get(item.volume_id) as unknown as StorageVolume;
+    item = {
+      ...(itemRow as unknown as BackupItem),
+      databases_list: JSON.parse(String(itemRow.databases_list || '[]')),
+    };
 
-  if (!sourceServer || !targetServer || !sourceVolume) {
-    throw new Error('Thiếu thông tin máy chủ nguồn, máy chủ đích hoặc Volume lưu trữ.');
+    sourceServer = db
+      .prepare('SELECT * FROM servers WHERE id = ?')
+      .get(item.server_id) as unknown as ServerRecord;
+    targetServer = db
+      .prepare('SELECT * FROM servers WHERE id = ?')
+      .get(payload.targetServerId) as unknown as ServerRecord;
+    sourceVolume = db
+      .prepare('SELECT * FROM storage_volumes WHERE id = ?')
+      .get(item.volume_id) as unknown as StorageVolume;
+
+    if (!sourceServer || !targetServer || !sourceVolume) {
+      throw new Error('Thiếu thông tin máy chủ nguồn, máy chủ đích hoặc Volume lưu trữ.');
+    }
+  } catch (preErr) {
+    const errMsg = (preErr as Error).message || 'Dữ liệu đầu vào khôi phục không hợp lệ.';
+    const cancelled = isJobCancelled(jobId);
+    db.prepare(
+      `UPDATE backup_jobs
+       SET status = ?, current_phase = ?, completed_at = datetime('now'), error_log = ?
+       WHERE id = ?`
+    ).run(
+      cancelled ? 'CANCELLED' : 'FAILED',
+      cancelled ? 'Đã hủy bởi quản trị viên' : 'Khôi phục thất bại (Dữ liệu đầu vào)',
+      errMsg,
+      jobId
+    );
+    if (!cancelled) {
+      await createSystemAlert({
+        severity: 'CRITICAL',
+        category: 'RESTORE',
+        title: `Khôi phục thất bại (Job #${jobId})`,
+        message: errMsg,
+        serverId: job?.target_server_id || job?.server_id || null,
+        jobId,
+      }).catch(() => {});
+    }
+    clearCancelledJob(jobId);
+    emitJobUpdated(jobId);
+    throw preErr;
   }
 
   const isCrossPanel =
@@ -575,6 +647,7 @@ export async function executeRestoreJob(jobId: number): Promise<void> {
             mustExist: false,
             expectedDomain: targetDomain,
             parentDomain: item.parent_domain || undefined,
+            jobId,
           }
         );
         if (!preSafety.ok) {
@@ -583,26 +656,39 @@ export async function executeRestoreJob(jobId: number): Promise<void> {
           );
         }
 
-        // Tạo thư mục webroot an toàn: không đi qua symlink ở các thành phần tồn tại và ưu tiên tạo dưới quyền user của site
+        // S15 Fix: Duyệt kiểm tra từng thành phần đường dẫn cha không phải symlink và tạo từng đoạn (tuyệt đối không fallback root `mkdir -p`)
         const safeMkdirScript = [
           'set -e',
           `TARGET=${shellSingleQuote(resolvedWebroot)}`,
           `SITE_USER=${shellSingleQuote(targetUser)}`,
           '[ ! -L "$TARGET" ] || exit 91',
-          'if [ ! -d "$TARGET" ]; then',
-          '  if [ "$SITE_USER" != "root" ] && [ "$(id -u)" = "0" ] && id -u "$SITE_USER" >/dev/null 2>&1; then',
-          '    if command -v runuser >/dev/null 2>&1; then',
-          '      runuser -u "$SITE_USER" -- mkdir -p -- "$TARGET" 2>/dev/null || mkdir -p -- "$TARGET"',
+          'CUR=""',
+          'OLD_IFS="$IFS"',
+          'IFS="/"',
+          'for SEG in $TARGET; do',
+          '  [ -n "$SEG" ] || continue',
+          '  CUR="$CUR/$SEG"',
+          '  if [ -L "$CUR" ]; then exit 91; fi',
+          '  if [ ! -e "$CUR" ]; then',
+          '    if [ "$SITE_USER" != "root" ] && [ "$(id -u)" = "0" ] && id -u "$SITE_USER" >/dev/null 2>&1; then',
+          '      if command -v runuser >/dev/null 2>&1 && runuser -u "$SITE_USER" -- mkdir -- "$CUR" 2>/dev/null; then',
+          '        :',
+          '      else',
+          '        mkdir -m 0755 -- "$CUR"',
+          '        chown -h "$SITE_USER:$SITE_USER" -- "$CUR" 2>/dev/null || chown -h "$SITE_USER" -- "$CUR" 2>/dev/null || true',
+          '      fi',
           '    else',
-          '      su -s /bin/sh "$SITE_USER" -c \'mkdir -p -- "$1"\' sh "$TARGET" 2>/dev/null || mkdir -p -- "$TARGET"',
+          '      mkdir -m 0755 -- "$CUR"',
           '    fi',
-          '  else',
-          '    mkdir -p -- "$TARGET"',
+          '  elif [ ! -d "$CUR" ]; then',
+          '    exit 91',
           '  fi',
-          'fi',
+          'done',
+          'IFS="$OLD_IFS"',
         ].join('\n');
         const mkdirRes = await execRemoteSSH(targetServer, safeMkdirScript, {
           zeroImpact: true,
+          jobId,
         });
         if (mkdirRes.code !== 0) {
           throw new Error(
@@ -619,6 +705,7 @@ export async function executeRestoreJob(jobId: number): Promise<void> {
             mustExist: true,
             expectedDomain: targetDomain,
             parentDomain: item.parent_domain || undefined,
+            jobId,
           }
         );
         if (!liveSafety.ok) {
@@ -638,6 +725,7 @@ export async function executeRestoreJob(jobId: number): Promise<void> {
         await pushFilesViaRsync({
           jobId,
           targetServer,
+          targetUser,
           localPublicHtmlDir: localPublicHtml,
           targetWebroot: resolvedWebroot,
           excludedSubpaths: savedExcludedSubpaths,
@@ -653,10 +741,11 @@ export async function executeRestoreJob(jobId: number): Promise<void> {
           resolvedWebroot
         );
         setStep(58, `Đang gán quyền chủ sở hữu (${targetServer.panel_type})...`);
-        // N11 Fix: Cấp timeout 15 phút cho chown/chmod trên webroot dung lượng lớn dưới nice/ionice
+        // N11 & N28 Fix: Cấp timeout 15 phút và đăng ký jobId để lệnh chown/chmod có thể hủy tức thì
         const chownRes = await execRemoteSSH(targetServer, permCmd, {
           zeroImpact: true,
           timeoutMs: RESTORE_PERMISSION_FIX_TIMEOUT_MS,
+          jobId,
         });
         if (chownRes.code !== 0) {
           appendLog(
@@ -762,6 +851,7 @@ export async function executeRestoreJob(jobId: number): Promise<void> {
               )}`;
               const createRes = await execRemoteSSH(targetServer, createDbCmd, {
                 zeroImpact: true,
+                jobId,
               });
               if (createRes.code !== 0) {
                 throw new Error(
@@ -796,6 +886,7 @@ export async function executeRestoreJob(jobId: number): Promise<void> {
         dbRenameMap: payload.targetDbMap || {},
         isMock: Boolean(targetServer.is_mock),
         mockWebrootDir: targetServer.is_mock ? mockRestoreDest : undefined,
+        jobId,
         onLog: appendLog,
       });
 
@@ -809,6 +900,7 @@ export async function executeRestoreJob(jobId: number): Promise<void> {
           const reChown = await execRemoteSSH(targetServer, postPatchPermCmd, {
             zeroImpact: true,
             timeoutMs: RESTORE_PERMISSION_FIX_TIMEOUT_MS,
+            jobId,
           });
           if (reChown.code !== 0) {
             appendLog(

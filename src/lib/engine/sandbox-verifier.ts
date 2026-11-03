@@ -16,8 +16,9 @@ import {
 } from './worker-state';
 
 const SANDBOX_MIN_IMPORT_TIMEOUT_MS = 10 * 60 * 1000; // 10 phút tối thiểu
-const SANDBOX_MAX_IMPORT_TIMEOUT_MS = 90 * 60 * 1000; // 90 phút tối đa
+const SANDBOX_MAX_IMPORT_TIMEOUT_MS = 4 * 60 * 60 * 1000; // 4 giờ tối đa cho DB dung lượng lớn (N5)
 const SANDBOX_STREAM_IDLE_TIMEOUT_MS = 15 * 60 * 1000; // 15 phút không đọc được byte nào
+const SANDBOX_QUERY_TIMEOUT_MS = 30 * 1000; // 30 giây tối đa cho mỗi câu lệnh quản trị MariaDB (N28)
 
 type Node24ZlibWithZstd = typeof zlib & {
   createZstdDecompress?: () => NodeJS.ReadWriteStream;
@@ -98,32 +99,60 @@ async function tryConnectSandboxMariaDb(): Promise<mysql.Connection | null> {
   }
 }
 
+/**
+ * N21 Fix: Tạo tên tài khoản MariaDB Sandbox riêng biệt cho từng phiên kiểm định (`ns_v_<jobId>_<hex>` <= 32 ký tự)
+ * để nhiều server kiểm định song song không bao giờ ghi đè mật khẩu của nhau qua `ALTER USER`.
+ */
+export function buildIsolatedSandboxVerifierUsername(
+  jobId: number,
+  suffixHex = crypto.randomBytes(3).toString('hex')
+): string {
+  const safeJob = Math.max(0, Math.floor(Number(jobId) || 0));
+  const cleanHex = suffixHex.replace(/[^a-f0-9]/gi, '').slice(0, 6) || '000001';
+  return `ns_v_${safeJob}_${cleanHex}`.slice(0, 32);
+}
+
 async function ensureLeastPrivilegeSandboxCredentials(
-  conn: mysql.Connection
-): Promise<{ user: string; pass: string }> {
+  conn: mysql.Connection,
+  jobId: number
+): Promise<{ user: string; pass: string; ephemeralUserCreated: boolean }> {
   const defaultUser = process.env.SANDBOX_DB_USER || 'root';
   const defaultPass = process.env.SANDBOX_DB_PASSWORD || 'sandbox_secret_pass';
-  const verifierUser = 'nas_sync_verifier';
+  const verifierUser = buildIsolatedSandboxVerifierUsername(jobId);
   const verifierPass = crypto.randomBytes(24).toString('hex');
+  const dbPattern = `verify_${Math.max(0, Math.floor(Number(jobId) || 0))}_%`;
 
   try {
     await conn.query(
-      `CREATE USER IF NOT EXISTS '${verifierUser}'@'%' IDENTIFIED BY ?`,
+      {
+        sql: `CREATE USER '${verifierUser}'@'%' IDENTIFIED BY ?`,
+        timeout: SANDBOX_QUERY_TIMEOUT_MS,
+      },
       [verifierPass]
     );
-    await conn.query(
-      `ALTER USER '${verifierUser}'@'%' IDENTIFIED BY ?`,
-      [verifierPass]
-    );
-    await conn.query(
-      `GRANT ALL PRIVILEGES ON \`verify_%\`.* TO '${verifierUser}'@'%'`
-    );
-    await conn.query('FLUSH PRIVILEGES');
-    return { user: verifierUser, pass: verifierPass };
+    await conn.query({
+      sql: `GRANT ALL PRIVILEGES ON \`${dbPattern}\`.* TO '${verifierUser}'@'%'`,
+      timeout: SANDBOX_QUERY_TIMEOUT_MS,
+    });
+    return {
+      user: verifierUser,
+      pass: verifierPass,
+      ephemeralUserCreated: true,
+    };
   } catch {
-    return { user: defaultUser, pass: defaultPass };
+    return {
+      user: defaultUser,
+      pass: defaultPass,
+      ephemeralUserCreated: false,
+    };
   }
 }
+
+type SandboxImportOutcome = {
+  ok: boolean;
+  untested?: boolean;
+  error?: string;
+};
 
 function streamDumpIntoMariaDb(params: {
   jobId: number;
@@ -132,7 +161,7 @@ function streamDumpIntoMariaDb(params: {
   dbUser: string;
   dbPass: string;
   timeoutMs?: number;
-}): Promise<{ ok: boolean; error?: string }> {
+}): Promise<SandboxImportOutcome> {
   const { jobId, dumpFilePath, tempDbName, dbUser, dbPass } = params;
   const stat = fs.statSync(dumpFilePath, { throwIfNoEntry: false });
   const effectiveTimeoutMs =
@@ -143,7 +172,7 @@ function streamDumpIntoMariaDb(params: {
     const port = Number(process.env.SANDBOX_DB_PORT || 3306) || 3306;
     const ext = path.extname(dumpFilePath).toLowerCase();
 
-    // S1 Security Fix: --binary-mode (+ --sandbox nếu hỗ trợ) chặn đứng 100% meta-command `\! <shell>` thực thi lệnh trong container NAS!
+    // S1 Security Fix: --binary-mode (+ --sandbox nếu hỗ trợ) vô hiệu hóa meta-command `\! <shell>` của MariaDB client trong container NAS
     const safeFlags = buildSafeMariaDbClientFlags({
       includeSandboxIfSupported: true,
     });
@@ -190,7 +219,7 @@ function streamDumpIntoMariaDb(params: {
       }
     };
 
-    const finish = (result: { ok: boolean; error?: string }) => {
+    const finish = (result: SandboxImportOutcome) => {
       if (settled) return;
       settled = true;
       clearTimeout(totalTimer);
@@ -291,6 +320,7 @@ function streamDumpIntoMariaDb(params: {
       if (isJobCancelled(jobId)) {
         finish({
           ok: false,
+          untested: true,
           error:
             'Tiến trình kiểm định Sandbox đã bị hủy theo yêu cầu quản trị viên',
         });
@@ -299,6 +329,7 @@ function streamDumpIntoMariaDb(params: {
       if (totalTimedOut) {
         finish({
           ok: false,
+          untested: true,
           error: `Quá thời gian chờ tối đa (${Math.round(
             effectiveTimeoutMs / 60000
           )} phút) khi nạp kiểm định vào MariaDB Sandbox`,
@@ -308,6 +339,7 @@ function streamDumpIntoMariaDb(params: {
       if (idleTimedOut) {
         finish({
           ok: false,
+          untested: true,
           error:
             'Luồng nạp MariaDB Sandbox bị treo quá 15 phút không tiến triển dữ liệu',
         });
@@ -591,6 +623,147 @@ export async function verifyPostgresDumpFile(dumpFilePath: string): Promise<{
   }
 
   const zlibExt = zlib as Node24ZlibWithZstd;
+  const { detectPostgresDumpFormat } = await import('./postgres-streamer');
+  let dumpFormat: 'CUSTOM' | 'PLAIN_SQL';
+  try {
+    dumpFormat = await detectPostgresDumpFormat(dumpFilePath);
+  } catch (fmtErr) {
+    return {
+      ok: false,
+      tablesCount: 0,
+      rowsCount: 0,
+      error: `Không thể giải nén tiêu đề tệp PostgreSQL dump: ${(fmtErr as Error).message}`,
+    };
+  }
+
+  // S12 Fix: Hỗ trợ kiểm định toàn vẹn định dạng nhị phân `pg_dump -Fc` (`PGDMP` Custom Archive)
+  if (dumpFormat === 'CUSTOM') {
+    return new Promise((resolve) => {
+      let totalBytes = 0;
+      let headBuf = Buffer.alloc(0);
+      let tableCount = 0;
+      let tableDataCount = 0;
+      let carry = '';
+      let settled = false;
+
+      const finishCustom = (res: {
+        ok: boolean;
+        tablesCount: number;
+        rowsCount: number;
+        error?: string;
+      }) => {
+        if (settled) return;
+        settled = true;
+        resolve(res);
+      };
+
+      const scanBinaryChunk = (chunk: Buffer) => {
+        totalBytes += chunk.length;
+        if (headBuf.length < 32) {
+          headBuf = Buffer.concat([headBuf, chunk.subarray(0, 32 - headBuf.length)]);
+        }
+        const text = carry + chunk.toString('latin1');
+        const cut = Math.max(0, text.length - 32);
+        const part = text.slice(0, cut);
+        carry = text.slice(cut);
+        const tblMatches = part.match(/CREATE TABLE\b/gi);
+        if (tblMatches) tableCount += tblMatches.length;
+        const dataMatches = part.match(/TABLE DATA\b/g);
+        if (dataMatches) tableDataCount += dataMatches.length;
+      };
+
+      const finalizeBinaryScan = () => {
+        if (carry) {
+          const tblMatches = carry.match(/CREATE TABLE\b/gi);
+          if (tblMatches) tableCount += tblMatches.length;
+          const dataMatches = carry.match(/TABLE DATA\b/g);
+          if (dataMatches) tableDataCount += dataMatches.length;
+        }
+        if (
+          totalBytes < 32 ||
+          headBuf.subarray(0, 5).toString('ascii') !== 'PGDMP'
+        ) {
+          finishCustom({
+            ok: false,
+            tablesCount: 0,
+            rowsCount: 0,
+            error:
+              'Tệp PostgreSQL Custom Archive (PGDMP) bị cắt cụt hoặc hỏng cấu trúc header',
+          });
+          return;
+        }
+        const resolvedTables = Math.max(tableCount, tableDataCount);
+        finishCustom({
+          ok: true,
+          tablesCount: resolvedTables,
+          rowsCount: tableDataCount * 10,
+        });
+      };
+
+      if (ext === '.zst' && typeof zlibExt.createZstdDecompress !== 'function') {
+        const zc = spawn('zstd', ['-dc', '--', dumpFilePath], {
+          stdio: ['ignore', 'pipe', 'pipe'],
+          windowsHide: true,
+        });
+        let zErr = '';
+        zc.stdout.on('data', (c: Buffer) => scanBinaryChunk(c));
+        zc.stderr.on('data', (c: Buffer) => {
+          zErr += c.toString('utf8');
+        });
+        zc.on('error', (e) =>
+          finishCustom({
+            ok: false,
+            tablesCount: 0,
+            rowsCount: 0,
+            error: e.message,
+          })
+        );
+        zc.on('close', (code) => {
+          if (code !== 0) {
+            finishCustom({
+              ok: false,
+              tablesCount: 0,
+              rowsCount: 0,
+              error: zErr.trim() || `Giải nén zstd thất bại (code ${code})`,
+            });
+          } else {
+            finalizeBinaryScan();
+          }
+        });
+        return;
+      }
+
+      const rs = fs.createReadStream(dumpFilePath);
+      const ds: NodeJS.ReadableStream =
+        ext === '.zst' && typeof zlibExt.createZstdDecompress === 'function'
+          ? rs.pipe(zlibExt.createZstdDecompress())
+          : ext === '.gz'
+          ? rs.pipe(zlib.createGunzip())
+          : rs;
+      rs.on('error', (e) =>
+        finishCustom({
+          ok: false,
+          tablesCount: 0,
+          rowsCount: 0,
+          error: e.message,
+        })
+      );
+      if (ds !== rs) {
+        ds.on('error', (e: Error) =>
+          finishCustom({
+            ok: false,
+            tablesCount: 0,
+            rowsCount: 0,
+            error: e.message,
+          })
+        );
+      }
+      ds.on('data', (c: Buffer | string) =>
+        scanBinaryChunk(Buffer.isBuffer(c) ? c : Buffer.from(c))
+      );
+      ds.on('end', finalizeBinaryScan);
+    });
+  }
 
   return new Promise((resolve) => {
     const WINDOW_BYTES = 8192;
@@ -791,7 +964,7 @@ export async function verifyJobDatabasesInSandbox(
   const usingRealSandbox = Boolean(conn && process.platform !== 'win32');
   const sandboxCreds =
     usingRealSandbox && conn
-      ? await ensureLeastPrivilegeSandboxCredentials(conn)
+      ? await ensureLeastPrivilegeSandboxCredentials(conn, jobId)
       : null;
 
   if (usingRealSandbox) {
@@ -833,10 +1006,23 @@ export async function verifyJobDatabasesInSandbox(
       }
 
       let allPassed = !preSecurityFailure;
+      let hasCorrupted = Boolean(preSecurityFailure);
+      let hasUntested = false;
       const details: string[] = preSecurityFailure ? [preSecurityFailure] : [];
       const updatedDbs: DatabaseBackupInfo[] = [];
 
       for (const dbInfo of item.databases_list) {
+        if (isJobCancelled(jobId)) {
+          allPassed = false;
+          hasUntested = true;
+          details.push(`${dbInfo.name}: Đã dừng kiểm định do quản trị viên hủy`);
+          updatedDbs.push({
+            ...dbInfo,
+            verified: false,
+            error: 'Đã hủy kiểm định',
+          });
+          continue;
+        }
         if (
           !dbInfo.file ||
           path.basename(dbInfo.file) !== dbInfo.file ||
@@ -844,6 +1030,7 @@ export async function verifyJobDatabasesInSandbox(
           /[/\\\0]/.test(dbInfo.file)
         ) {
           allPassed = false;
+          hasCorrupted = true;
           const badMsg = `Tên file dump không hợp lệ: ${JSON.stringify(
             dbInfo.file
           )}`;
@@ -868,6 +1055,7 @@ export async function verifyJobDatabasesInSandbox(
           const pgCheck = await verifyPostgresDumpFile(dumpPath);
           if (!pgCheck.ok) {
             allPassed = false;
+            hasCorrupted = true;
             details.push(`${dbInfo.name} [PG]: Lỗi (${pgCheck.error})`);
             onLog(
               `[Sandbox Verify] ❌ ${item.domain_name} -> ${dbInfo.name} (PostgreSQL): ${pgCheck.error}`
@@ -896,9 +1084,10 @@ export async function verifyJobDatabasesInSandbox(
         } else if (usingRealSandbox && conn) {
           const tempDb = `verify_${jobId}_${crypto.randomBytes(4).toString('hex')}`;
           try {
-            await conn.query(
-              `CREATE DATABASE \`${tempDb}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`
-            );
+            await conn.query({
+              sql: `CREATE DATABASE \`${tempDb}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`,
+              timeout: SANDBOX_QUERY_TIMEOUT_MS,
+            });
             const importRes = await streamDumpIntoMariaDb({
               jobId,
               dumpFilePath: dumpPath,
@@ -908,7 +1097,18 @@ export async function verifyJobDatabasesInSandbox(
             });
             if (!importRes.ok) {
               allPassed = false;
-              details.push(`${dbInfo.name}: Lỗi nạp SQL (${importRes.error})`);
+              if (importRes.untested) {
+                hasUntested = true;
+                details.push(
+                  `${dbInfo.name}: Chưa hoàn tất kiểm định (${importRes.error})`
+                );
+                onLog(
+                  `[Sandbox Verify] ⚠️ ${item.domain_name} -> ${dbInfo.name}: Tạm dừng/Quá thời gian kiểm định (${importRes.error}) — đánh dấu UNTESTED.`
+                );
+              } else {
+                hasCorrupted = true;
+                details.push(`${dbInfo.name}: Lỗi nạp SQL (${importRes.error})`);
+              }
               updatedDbs.push({
                 ...dbInfo,
                 verified: false,
@@ -916,9 +1116,12 @@ export async function verifyJobDatabasesInSandbox(
               });
             } else {
               const [statRows] = await conn.query<mysql.RowDataPacket[]>(
-                `SELECT COUNT(*) AS tablesCount, IFNULL(SUM(table_rows), 0) AS rowsCount
-                 FROM information_schema.tables
-                 WHERE table_schema = ?`,
+                {
+                  sql: `SELECT COUNT(*) AS tablesCount, IFNULL(SUM(table_rows), 0) AS rowsCount
+                        FROM information_schema.tables
+                        WHERE table_schema = ?`,
+                  timeout: SANDBOX_QUERY_TIMEOUT_MS,
+                },
                 [tempDb]
               );
               const tablesCount = Number(statRows[0]?.tablesCount || 0);
@@ -938,13 +1141,17 @@ export async function verifyJobDatabasesInSandbox(
             }
           } finally {
             await conn
-              .query(`DROP DATABASE IF EXISTS \`${tempDb}\``)
+              .query({
+                sql: `DROP DATABASE IF EXISTS \`${tempDb}\``,
+                timeout: SANDBOX_QUERY_TIMEOUT_MS,
+              })
               .catch(() => {});
           }
         } else {
           const check = await verifySqlFileStructureFallback(dumpPath);
           if (!check.ok) {
             allPassed = false;
+            hasCorrupted = true;
             details.push(`${dbInfo.name}: Lỗi (${check.error})`);
             onLog(
               `[Sandbox Verify] ❌ ${item.domain_name} -> ${dbInfo.name}: ${check.error}`
@@ -967,7 +1174,14 @@ export async function verifyJobDatabasesInSandbox(
         }
       }
 
-      const finalStatus = allPassed ? 'PASSED' : 'CORRUPTED';
+      // N5 Fix: Nếu chỉ bị timeout hoặc bị hủy (không có lỗi hỏng dữ liệu thực sự), đánh dấu UNTESTED thay vì CORRUPTED
+      const finalStatus: 'PASSED' | 'CORRUPTED' | 'UNTESTED' = allPassed
+        ? 'PASSED'
+        : hasCorrupted
+        ? 'CORRUPTED'
+        : hasUntested
+        ? 'UNTESTED'
+        : 'CORRUPTED';
       const detailStr = details.join(' | ');
 
       db.prepare(
@@ -986,6 +1200,14 @@ export async function verifyJobDatabasesInSandbox(
     }
   } finally {
     if (conn) {
+      if (sandboxCreds?.ephemeralUserCreated && sandboxCreds.user) {
+        await conn
+          .query({
+            sql: `DROP USER IF EXISTS '${sandboxCreds.user}'@'%'`,
+            timeout: SANDBOX_QUERY_TIMEOUT_MS,
+          })
+          .catch(() => {});
+      }
       await conn.end().catch(() => {});
     }
   }

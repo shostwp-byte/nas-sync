@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { NextRequest, NextResponse } from 'next/server';
 import { safeErrorJson } from '@/lib/api-error';
+import { recordAuditLog } from '@/lib/audit';
 import { requireRole } from '@/lib/auth';
 import { getDataDir, getDb, getSshKeysDir } from '@/lib/db';
 import {
@@ -208,19 +209,30 @@ export async function POST(req: NextRequest) {
     }
 
     const db = getDb();
-    db.prepare(
-      `INSERT INTO storage_volumes
-       (name, mount_path, max_usage_percent, min_free_gb, status, priority, btrfs_immutable_enabled, btrfs_retention_days)
-       VALUES (?, ?, ?, ?, 'ACTIVE', ?, ?, ?)`
-    ).run(
-      name,
-      mountPath,
-      maxUsage,
-      minFreeGb,
-      priority,
-      btrfsEnabled,
-      btrfsDays
-    );
+    const ins = db
+      .prepare(
+        `INSERT INTO storage_volumes
+         (name, mount_path, max_usage_percent, min_free_gb, status, priority, btrfs_immutable_enabled, btrfs_retention_days)
+         VALUES (?, ?, ?, ?, 'ACTIVE', ?, ?, ?)`
+      )
+      .run(
+        name,
+        mountPath,
+        maxUsage,
+        minFreeGb,
+        priority,
+        btrfsEnabled,
+        btrfsDays
+      );
+
+    recordAuditLog({
+      session: guard.session,
+      action: 'VOLUME_CREATE',
+      resourceType: 'VOLUME',
+      resourceId: String(ins.lastInsertRowid),
+      detail: `Thêm phân vùng lưu trữ NAS "${name}" (${mountPath})`,
+      req,
+    });
 
     const volumes = await refreshAllVolumes();
     return NextResponse.json({ ok: true, volumes });

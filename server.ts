@@ -19,8 +19,17 @@ process.on('unhandledRejection', (reason) => {
   console.error('[NAS-Sync UnhandledRejection]:', reason);
 });
 
+let fatalUncaughtExiting = false;
 process.on('uncaughtException', (err) => {
-  console.error('[NAS-Sync UncaughtException]:', err);
+  console.error('[NAS-Sync Fatal UncaughtException]:', err);
+  // N16 Fix: Ngoại lệ đồng bộ không bắt được có thể để lại stream/lock CSDL ở trạng thái hỏng —
+  // thoát có trật tự sau 500ms để Docker (`restart: unless-stopped`) khởi động lại worker sạch sẽ.
+  if (!fatalUncaughtExiting) {
+    fatalUncaughtExiting = true;
+    setTimeout(() => {
+      process.exit(1);
+    }, 500).unref();
+  }
 });
 
 const dev = process.env.NODE_ENV !== 'production';

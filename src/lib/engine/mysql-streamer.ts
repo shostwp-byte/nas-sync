@@ -32,22 +32,30 @@ export function streamRemoteMysqlDumpToZst(params: {
   fs.mkdirSync(destDatabasesDir, { recursive: true });
 
   return new Promise((resolve, reject) => {
-    const authFlags = buildMysqlAuthFlags(creds);
-    const envPrelude = buildRemoteMysqlEnvPrelude(creds);
+    let authFlags: string;
+    let envPrelude: string;
+    let probe: ChildProcessByStdio<null, Readable, Readable>;
+    try {
+      authFlags = buildMysqlAuthFlags(creds);
+      envPrelude = buildRemoteMysqlEnvPrelude(creds);
 
-    // Ưu tiên nén zstd -3 -T1 theo đặc tả; tự động fallback sang gzip -c nếu VPS chưa cài zstd
-    const checkZstdArgs = [
-      ...buildSshBaseArgs(server),
-      '--',
-      `${server.ssh_user || 'root'}@${server.ip_address}`,
-      'command -v zstd >/dev/null 2>&1 && echo ZSTD || echo GZIP',
-    ];
+      // Ưu tiên nén zstd -3 -T1 theo đặc tả; tự động fallback sang gzip -c nếu VPS chưa cài zstd
+      const checkZstdArgs = [
+        ...buildSshBaseArgs(server),
+        '--',
+        `${server.ssh_user || 'root'}@${server.ip_address}`,
+        'command -v zstd >/dev/null 2>&1 && echo ZSTD || echo GZIP',
+      ];
 
-    const probe = spawn('ssh', checkZstdArgs, {
-      stdio: ['ignore', 'pipe', 'pipe'],
-      detached: DETACHED_PROCESS_GROUP,
-    });
-    registerJobChildProcess(jobId, probe);
+      probe = spawn('ssh', checkZstdArgs, {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        detached: DETACHED_PROCESS_GROUP,
+      });
+      registerJobChildProcess(jobId, probe);
+    } catch (syncErr) {
+      reject(syncErr);
+      return;
+    }
 
     let probeOut = '';
     let probeSettled = false;

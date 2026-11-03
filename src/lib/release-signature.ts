@@ -1,14 +1,19 @@
 import crypto from 'node:crypto';
+import {
+  BUNDLE_SIGNATURE_DOMAIN,
+  DEFAULT_RELEASE_ED25519_PUBLIC_KEY_PEM,
+  PREBUILT_SIGNATURE_DOMAIN,
+} from './release-public-key.mjs';
 
-/**
- * U1 & U2 Security Fix:
- * Khóa công khai Ed25519 chính thức dùng để xác thực nguồn gốc và tính toàn vẹn của gói phát hành Prebuilt
- * (`nas-sync-prebuilt.tar.gz` + `.sha256` + `.sig`).
- * Cho phép ghi đè qua biến môi trường `NAS_SYNC_RELEASE_PUBLIC_KEY_PEM` đối với bản fork nội bộ hoặc kiểm thử tự động.
- */
-export const DEFAULT_RELEASE_ED25519_PUBLIC_KEY_PEM = `-----BEGIN PUBLIC KEY-----
-MCowBQYDK2VwAyEApSztKo5UUyVAV5hfAmATSIyCR6Teo3PDUEkE4HXi30Q=
------END PUBLIC KEY-----`;
+export {
+  BUNDLE_SIGNATURE_DOMAIN,
+  DEFAULT_RELEASE_ED25519_PUBLIC_KEY_PEM,
+  PREBUILT_SIGNATURE_DOMAIN,
+};
+
+export type ReleaseSignatureDomain =
+  | typeof PREBUILT_SIGNATURE_DOMAIN
+  | typeof BUNDLE_SIGNATURE_DOMAIN;
 
 export function normalizeReleaseTag(tag: string): string {
   const cleaned = String(tag || '')
@@ -34,11 +39,12 @@ export function normalizeSha256Hex(sha256Hex: string): string {
 
 export function buildReleaseSignaturePayload(
   tag: string,
-  sha256Hex: string
+  sha256Hex: string,
+  domain: ReleaseSignatureDomain = PREBUILT_SIGNATURE_DOMAIN
 ): Buffer {
   const cleanTag = normalizeReleaseTag(tag);
   const cleanSha = normalizeSha256Hex(sha256Hex);
-  return Buffer.from(`nas-sync-release-v1|${cleanTag}|${cleanSha}`, 'utf8');
+  return Buffer.from(`${domain}|${cleanTag}|${cleanSha}`, 'utf8');
 }
 
 export function getActiveReleasePublicKeyPem(overridePem?: string): string {
@@ -52,9 +58,10 @@ export function getActiveReleasePublicKeyPem(overridePem?: string): string {
 export function signReleasePayload(
   tag: string,
   sha256Hex: string,
-  privateKeyPem: string
+  privateKeyPem: string,
+  domain: ReleaseSignatureDomain = PREBUILT_SIGNATURE_DOMAIN
 ): string {
-  const payload = buildReleaseSignaturePayload(tag, sha256Hex);
+  const payload = buildReleaseSignaturePayload(tag, sha256Hex, domain);
   const normalizedKey = String(privateKeyPem || '').replace(/\\n/g, '\n').trim();
   const keyObj = crypto.createPrivateKey(normalizedKey);
   const sig = crypto.sign(null, payload, keyObj);
@@ -65,10 +72,11 @@ export function verifyReleaseSignature(
   tag: string,
   sha256Hex: string,
   signatureBase64: string,
-  publicKeyPem?: string
+  publicKeyPem?: string,
+  domain: ReleaseSignatureDomain = PREBUILT_SIGNATURE_DOMAIN
 ): boolean {
   try {
-    const payload = buildReleaseSignaturePayload(tag, sha256Hex);
+    const payload = buildReleaseSignaturePayload(tag, sha256Hex, domain);
     const cleanSigB64 = String(signatureBase64 || '')
       .trim()
       .split(/\s+/)[0];
@@ -86,4 +94,3 @@ export function verifyReleaseSignature(
     return false;
   }
 }
-

@@ -4,6 +4,7 @@ import { getDb } from '@/lib/db';
 import { isSafeSnapshotName } from './safe-names';
 import { isSnapshotReadPinned } from './snapshot-pins';
 import { refreshAllVolumes, resolveLatestSnapshotDir } from './volume-manager';
+import { removeDirectoryTreeNonBlocking } from './worker-state';
 import type { RetentionPolicy } from '@/types';
 
 interface SnapshotCandidate {
@@ -227,8 +228,16 @@ export async function applyGfsRetentionForServer(
       continue;
     }
 
-    deletedSnapshots.push(c.snapshotName);
     if (!dryRun) {
+      // Kiểm tra lại Read Pin ngay trước bước rename đồng bộ để không bao giờ xóa nhầm bản vừa mở tải trong lúc chờ xóa bản trước
+      if (isSnapshotReadPinned(c.serverId, c.snapshotName)) {
+        keptSnapshots.push({
+          snapshotName: c.snapshotName,
+          reason: 'Active Reader Pin (Đang tải về / Kiểm định / Đồng bộ Offsite)',
+        });
+        continue;
+      }
+      deletedSnapshots.push(c.snapshotName);
       const hostDir = path.resolve(c.mountPath, c.hostname);
       const snapDir = path.resolve(hostDir, c.snapshotName);
       if (
@@ -236,9 +245,11 @@ export async function applyGfsRetentionForServer(
         path.dirname(snapDir) === hostDir &&
         fs.existsSync(snapDir)
       ) {
-        fs.rmSync(snapDir, { recursive: true, force: true });
+        await removeDirectoryTreeNonBlocking(snapDir);
       }
       db.prepare('DELETE FROM backup_jobs WHERE id = ?').run(c.jobId);
+    } else {
+      deletedSnapshots.push(c.snapshotName);
     }
   }
 
