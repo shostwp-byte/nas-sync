@@ -1169,123 +1169,219 @@ export default function SettingsPage() {
   return (
     <div className="space-y-5 sm:space-y-6 min-w-0">
       <div className="min-w-0">
-        <h2 className="text-base sm:text-lg font-bold text-white flex items-center gap-2">
-          <Settings className="w-5 h-5 text-blue-400 shrink-0" />
+        <h2 className="text-base sm:text-lg font-bold text-white flex items-start sm:items-center gap-2">
+          <Settings className="w-5 h-5 text-blue-400 shrink-0 mt-0.5 sm:mt-0" />
           <span>
-            {isAdmin
-              ? 'Cấu hình Hệ thống, Sao lưu Offsite, Bảo mật 2FA, Phân quyền RBAC & Cập nhật'
-              : 'Tài khoản Cá nhân & Bảo mật 2 lớp (2FA TOTP)'}
+            {isAdmin ? (
+              <>
+                <span className="sm:hidden">Cấu hình &amp; Cập nhật Hệ thống</span>
+                <span className="hidden sm:inline">
+                  Cấu hình Hệ thống, Sao lưu Offsite, Bảo mật 2FA, Phân quyền RBAC &amp; Cập nhật
+                </span>
+              </>
+            ) : (
+              'Tài khoản Cá nhân & Bảo mật 2 lớp (2FA TOTP)'
+            )}
           </span>
         </h2>
-        <p className="text-xs text-slate-400 mt-0.5">
-          {isAdmin
-            ? 'Quản lý cấu hình thông báo & Btrfs WORM, Sao lưu Đám mây Offsite chuẩn 3-2-1 (AES-256-GCM), Bộ lọc file toàn cục, Bảo mật 2FA, Phân quyền RBAC và Cập nhật Prebuilt 1-Click từ GitHub (shostwp-byte/nas-sync).'
-            : 'Quản lý mật khẩu đăng nhập và thiết lập xác thực 2 lớp (Google Authenticator / Authy) cho tài khoản của bạn.'}
+        <p className="text-xs text-slate-400 mt-0.5 leading-relaxed">
+          {isAdmin ? (
+            <>
+              <span className="sm:hidden">
+                Quản lý cảnh báo, Btrfs WORM, Sao lưu Offsite 3-2-1, bảo mật 2FA, phân quyền RBAC và cập nhật 1-Click từ GitHub.
+              </span>
+              <span className="hidden sm:inline">
+                Quản lý cấu hình thông báo &amp; Btrfs WORM, Sao lưu Đám mây Offsite chuẩn 3-2-1 (AES-256-GCM), Bộ lọc file toàn cục, Bảo mật 2FA, Phân quyền RBAC và Cập nhật Prebuilt 1-Click từ GitHub (shostwp-byte/nas-sync).
+              </span>
+            </>
+          ) : (
+            'Quản lý mật khẩu đăng nhập và thiết lập xác thực 2 lớp (Google Authenticator / Authy) cho tài khoản của bạn.'
+          )}
         </p>
       </div>
 
-      {/* Section Tab Bar (Wrapped & Scroll-Safe down to 320px) */}
-      <div className="flex flex-wrap gap-1.5 p-1.5 bg-slate-900 border border-slate-800 rounded-2xl text-xs">
-        {isAdmin && (
-          <>
-            <button
-              type="button"
-              onClick={() => {
-                setFeedback('');
-                setActiveTab('config');
-              }}
-              className={`flex-1 sm:flex-initial min-h-[42px] px-3.5 py-2 rounded-xl font-semibold inline-flex items-center justify-center gap-1.5 transition-all ${
-                activeTab === 'config'
-                  ? 'bg-blue-600 text-white shadow-lg shadow-blue-600/20'
-                  : 'text-slate-400 hover:text-white hover:bg-slate-800/70'
-              }`}
-            >
-              <span>⚙️ Cấu hình Hệ thống</span>
-            </button>
-
-            <button
-              type="button"
-              onClick={() => {
-                setFeedback('');
-                setActiveTab('backup');
-              }}
-              className={`flex-1 sm:flex-initial min-h-[42px] px-3.5 py-2 rounded-xl font-semibold inline-flex items-center justify-center gap-1.5 transition-all ${
-                activeTab === 'backup'
-                  ? 'bg-blue-600 text-white shadow-lg shadow-blue-600/20'
-                  : 'text-slate-400 hover:text-white hover:bg-slate-800/70'
-              }`}
-            >
-              <Cloud className="w-3.5 h-3.5 shrink-0" />
-              <span>Sao lưu</span>
-              {settings.offsite_provider &&
-                settings.offsite_provider !== 'NONE' && (
-                  <span className="px-1.5 py-0.5 text-[10px] rounded bg-emerald-500/20 text-emerald-200 border border-emerald-400/30">
-                    ON
-                  </span>
-                )}
-            </button>
-          </>
-        )}
-
-        <button
-          type="button"
-          onClick={() => {
-            setFeedback('');
-            setActiveTab('account');
-          }}
-          className={`flex-1 sm:flex-initial min-h-[42px] px-3.5 py-2 rounded-xl font-semibold inline-flex items-center justify-center gap-1.5 transition-all ${
-            activeTab === 'account'
-              ? 'bg-blue-600 text-white shadow-lg shadow-blue-600/20'
-              : 'text-slate-400 hover:text-white hover:bg-slate-800/70'
-          }`}
+      {/* Section Tab Bar: 5-column Segmented Icon+Label Bar on Mobile (< sm), Single-Row Pill Bar on Tablet/Desktop (>= sm) */}
+      <div
+        role="tablist"
+        aria-label="Các mục cấu hình và cập nhật hệ thống"
+        className="overflow-x-auto no-scrollbar bg-slate-900 border border-slate-800 rounded-2xl p-1 sm:p-1.5 text-xs"
+      >
+        <div
+          className={
+            isAdmin
+              ? 'grid grid-cols-5 gap-1 min-w-[290px] sm:min-w-0 sm:flex sm:items-center sm:gap-1.5'
+              : 'flex items-center gap-1.5'
+          }
         >
-          <span>🔐 Tài khoản &amp; Bảo mật 2FA</span>
-          {twoFaState.enabled && (
-            <span className="px-1.5 py-0.5 text-[10px] rounded bg-emerald-500/20 text-emerald-200 border border-emerald-400/30">
-              ON
-            </span>
-          )}
-        </button>
-
-        {isAdmin && (
-          <>
-            <button
-              type="button"
-              onClick={() => {
-                setFeedback('');
-                setActiveTab('rbac');
-              }}
-              className={`flex-1 sm:flex-initial min-h-[42px] px-3.5 py-2 rounded-xl font-semibold inline-flex items-center justify-center gap-1.5 transition-all ${
-                activeTab === 'rbac'
-                  ? 'bg-blue-600 text-white shadow-lg shadow-blue-600/20'
-                  : 'text-slate-400 hover:text-white hover:bg-slate-800/70'
-              }`}
-            >
-              <span>👥 Phân quyền Người dùng (RBAC)</span>
-            </button>
-
-            <button
-              type="button"
-              onClick={() => {
-                setFeedback('');
-                setActiveTab('update');
-              }}
-              className={`flex-1 sm:flex-initial min-h-[42px] px-3.5 py-2 rounded-xl font-semibold inline-flex items-center justify-center gap-1.5 transition-all ${
-                activeTab === 'update'
-                  ? 'bg-blue-600 text-white shadow-lg shadow-blue-600/20'
-                  : 'text-slate-400 hover:text-white hover:bg-slate-800/70'
-              }`}
-            >
-              <ArrowUpCircle className="w-3.5 h-3.5 shrink-0" />
-              <span>Cập nhật</span>
-              {updateInfo?.hasUpdate && (
-                <span className="px-1.5 py-0.5 text-[10px] rounded bg-amber-500/20 text-amber-200 border border-amber-400/30 font-mono">
-                  v{updateInfo.latestVersion}
+          {isAdmin && (
+            <>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={activeTab === 'config'}
+                onClick={() => {
+                  setFeedback('');
+                  setActiveTab('config');
+                }}
+                className={`relative min-h-[54px] sm:min-h-[42px] px-1 sm:px-3.5 py-1.5 sm:py-2 rounded-xl font-semibold flex flex-col sm:flex-row items-center justify-center gap-1 sm:gap-1.5 shrink-0 whitespace-nowrap transition-all ${
+                  activeTab === 'config'
+                    ? 'bg-blue-600 text-white shadow-lg shadow-blue-600/25'
+                    : 'text-slate-400 hover:text-white hover:bg-slate-800/70'
+                }`}
+              >
+                <Settings className="w-4 h-4 sm:w-3.5 sm:h-3.5 shrink-0" />
+                <span className="text-[10px] min-[380px]:text-[11px] sm:text-xs leading-tight tracking-tight sm:tracking-normal">
+                  <span className="sm:hidden">Cấu hình</span>
+                  <span className="hidden sm:inline">Cấu hình Hệ thống</span>
                 </span>
-              )}
-            </button>
-          </>
-        )}
+              </button>
+
+              <button
+                type="button"
+                role="tab"
+                aria-selected={activeTab === 'backup'}
+                onClick={() => {
+                  setFeedback('');
+                  setActiveTab('backup');
+                }}
+                className={`relative min-h-[54px] sm:min-h-[42px] px-1 sm:px-3.5 py-1.5 sm:py-2 rounded-xl font-semibold flex flex-col sm:flex-row items-center justify-center gap-1 sm:gap-1.5 shrink-0 whitespace-nowrap transition-all ${
+                  activeTab === 'backup'
+                    ? 'bg-blue-600 text-white shadow-lg shadow-blue-600/25'
+                    : 'text-slate-400 hover:text-white hover:bg-slate-800/70'
+                }`}
+              >
+                <Cloud className="w-4 h-4 sm:w-3.5 sm:h-3.5 shrink-0" />
+                <span className="text-[10px] min-[380px]:text-[11px] sm:text-xs leading-tight tracking-tight sm:tracking-normal">
+                  Sao lưu
+                </span>
+                {settings.offsite_provider &&
+                  settings.offsite_provider !== 'NONE' && (
+                    <>
+                      <span
+                        aria-hidden="true"
+                        className="sm:hidden absolute top-1.5 right-1.5 w-2 h-2 rounded-full bg-emerald-400 ring-2 ring-slate-900"
+                      />
+                      <span className="hidden sm:inline-block px-1.5 py-0.5 text-[10px] rounded bg-emerald-500/20 text-emerald-200 border border-emerald-400/30">
+                        ON
+                      </span>
+                    </>
+                  )}
+              </button>
+            </>
+          )}
+
+          <button
+            type="button"
+            role="tab"
+            aria-selected={activeTab === 'account'}
+            onClick={() => {
+              setFeedback('');
+              setActiveTab('account');
+            }}
+            className={`relative ${
+              isAdmin
+                ? 'min-h-[54px] sm:min-h-[42px] px-1 sm:px-3.5 py-1.5 sm:py-2 flex-col sm:flex-row gap-1 sm:gap-1.5'
+                : 'flex-1 sm:flex-initial min-h-[42px] px-3.5 py-2 flex-row gap-1.5'
+            } rounded-xl font-semibold flex items-center justify-center shrink-0 whitespace-nowrap transition-all ${
+              activeTab === 'account'
+                ? 'bg-blue-600 text-white shadow-lg shadow-blue-600/25'
+                : 'text-slate-400 hover:text-white hover:bg-slate-800/70'
+            }`}
+          >
+            <ShieldCheck className="w-4 h-4 sm:w-3.5 sm:h-3.5 shrink-0" />
+            {isAdmin ? (
+              <span className="text-[10px] min-[380px]:text-[11px] sm:text-xs leading-tight tracking-tight sm:tracking-normal">
+                <span className="sm:hidden">Tài khoản</span>
+                <span className="hidden sm:inline xl:hidden">
+                  Tài khoản &amp; 2FA
+                </span>
+                <span className="hidden xl:inline">
+                  Tài khoản &amp; Bảo mật 2FA
+                </span>
+              </span>
+            ) : (
+              <span className="text-xs">Tài khoản &amp; Bảo mật 2FA</span>
+            )}
+            {twoFaState.enabled && (
+              <>
+                {isAdmin && (
+                  <span
+                    aria-hidden="true"
+                    className="sm:hidden absolute top-1.5 right-1.5 w-2 h-2 rounded-full bg-emerald-400 ring-2 ring-slate-900"
+                  />
+                )}
+                <span
+                  className={`${
+                    isAdmin ? 'hidden sm:inline-block' : 'inline-block'
+                  } px-1.5 py-0.5 text-[10px] rounded bg-emerald-500/20 text-emerald-200 border border-emerald-400/30`}
+                >
+                  ON
+                </span>
+              </>
+            )}
+          </button>
+
+          {isAdmin && (
+            <>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={activeTab === 'rbac'}
+                onClick={() => {
+                  setFeedback('');
+                  setActiveTab('rbac');
+                }}
+                className={`relative min-h-[54px] sm:min-h-[42px] px-1 sm:px-3.5 py-1.5 sm:py-2 rounded-xl font-semibold flex flex-col sm:flex-row items-center justify-center gap-1 sm:gap-1.5 shrink-0 whitespace-nowrap transition-all ${
+                  activeTab === 'rbac'
+                    ? 'bg-blue-600 text-white shadow-lg shadow-blue-600/25'
+                    : 'text-slate-400 hover:text-white hover:bg-slate-800/70'
+                }`}
+              >
+                <Users className="w-4 h-4 sm:w-3.5 sm:h-3.5 shrink-0" />
+                <span className="text-[10px] min-[380px]:text-[11px] sm:text-xs leading-tight tracking-tight sm:tracking-normal">
+                  <span className="sm:hidden">Phân quyền</span>
+                  <span className="hidden sm:inline xl:hidden">
+                    Phân quyền (RBAC)
+                  </span>
+                  <span className="hidden xl:inline">
+                    Phân quyền Người dùng (RBAC)
+                  </span>
+                </span>
+              </button>
+
+              <button
+                type="button"
+                role="tab"
+                aria-selected={activeTab === 'update'}
+                onClick={() => {
+                  setFeedback('');
+                  setActiveTab('update');
+                }}
+                className={`relative min-h-[54px] sm:min-h-[42px] px-1 sm:px-3.5 py-1.5 sm:py-2 rounded-xl font-semibold flex flex-col sm:flex-row items-center justify-center gap-1 sm:gap-1.5 shrink-0 whitespace-nowrap transition-all ${
+                  activeTab === 'update'
+                    ? 'bg-blue-600 text-white shadow-lg shadow-blue-600/25'
+                    : 'text-slate-400 hover:text-white hover:bg-slate-800/70'
+                }`}
+              >
+                <ArrowUpCircle className="w-4 h-4 sm:w-3.5 sm:h-3.5 shrink-0" />
+                <span className="text-[10px] min-[380px]:text-[11px] sm:text-xs leading-tight tracking-tight sm:tracking-normal">
+                  Cập nhật
+                </span>
+                {updateInfo?.hasUpdate && (
+                  <>
+                    <span
+                      aria-hidden="true"
+                      className="sm:hidden absolute top-1.5 right-1.5 w-2 h-2 rounded-full bg-amber-400 ring-2 ring-slate-900 animate-pulse"
+                    />
+                    <span className="hidden sm:inline-block px-1.5 py-0.5 text-[10px] rounded bg-amber-500/20 text-amber-200 border border-amber-400/30 font-mono">
+                      v{updateInfo.latestVersion}
+                    </span>
+                  </>
+                )}
+              </button>
+            </>
+          )}
+        </div>
       </div>
 
       {/* =====================================================================
@@ -1365,8 +1461,8 @@ export default function SettingsPage() {
                 <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-6 space-y-5 min-w-0">
                   <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3">
                     <div className="min-w-0 space-y-1">
-                      <h3 className="text-sm font-bold text-white flex items-center gap-2 flex-wrap">
-                        <Cloud className="w-4 h-4 text-cyan-400 shrink-0" />
+                      <h3 className="text-sm font-bold text-white flex items-start sm:items-center gap-2">
+                        <Cloud className="w-4 h-4 text-cyan-400 shrink-0 mt-0.5 sm:mt-0" />
                         <span>
                           Sao lưu Đám mây Offsite chuẩn 3-2-1 (Mã hóa Đầu-Cuối
                           AES-256-GCM)
@@ -1812,11 +1908,11 @@ export default function SettingsPage() {
                           ) : (
                             <div className="space-y-3 pt-2 border-t border-slate-800/80">
                               <div>
-                                <label className="block text-slate-300 font-medium mb-1">
-                                  Nội dung tệp JSON Service Account
+                                <label className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-slate-300 font-medium mb-1">
+                                  <span>Nội dung tệp JSON Service Account</span>
                                   {settings.offsite_gdrive_service_account_json ===
                                     '••••••••' && (
-                                    <span className="ml-2 text-[11px] text-emerald-400 font-normal">
+                                    <span className="text-[11px] text-emerald-400 font-normal">
                                       (Đã lưu bảo mật — dán JSON mới nếu muốn thay
                                       thế)
                                     </span>
@@ -1860,7 +1956,7 @@ export default function SettingsPage() {
                             <label className="block text-slate-300 font-semibold">
                               Chọn nhanh Nhà cung cấp S3-Compatible
                             </label>
-                            <div className="flex flex-wrap items-center gap-2">
+                            <div className="grid grid-cols-2 sm:flex sm:flex-wrap items-center gap-2">
                               {[
                                 {
                                   key: 'R2' as const,
@@ -1896,7 +1992,7 @@ export default function SettingsPage() {
                                             : prev.offsite_s3_region || '',
                                       }));
                                     }}
-                                    className={`min-h-[38px] px-3.5 py-1.5 rounded-lg border font-medium transition-colors ${
+                                    className={`min-h-[38px] px-3 py-1.5 rounded-lg border font-medium text-center justify-center inline-flex items-center transition-colors ${
                                       active
                                         ? 'bg-amber-500/20 border-amber-500/50 text-amber-200'
                                         : 'bg-slate-900 border-slate-800 text-slate-300 hover:bg-slate-800'
@@ -2328,16 +2424,16 @@ export default function SettingsPage() {
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 items-start">
               {/* Left Column: Telegram & SMTP */}
               <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-6 space-y-4">
-                  <div className="flex items-center justify-between gap-2 flex-wrap">
-                    <h3 className="text-sm font-bold text-white flex items-center gap-2">
-                      <BellRing className="w-4 h-4 text-cyan-400 shrink-0" />
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+                    <h3 className="text-sm font-bold text-white flex items-start sm:items-center gap-2">
+                      <BellRing className="w-4 h-4 text-cyan-400 shrink-0 mt-0.5 sm:mt-0" />
                       <span>Cảnh báo Telegram &amp; Báo cáo SMTP Email</span>
                     </h3>
                     <button
                       type="button"
                       onClick={() => void handleTestNotification()}
                       disabled={testingNotify}
-                      className="w-full sm:w-auto justify-center min-h-[38px] inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 hover:bg-cyan-500/25 disabled:opacity-50 transition-colors"
+                      className="w-full sm:w-auto justify-center min-h-[38px] inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 hover:bg-cyan-500/25 disabled:opacity-50 transition-colors shrink-0"
                     >
                       <Send className="w-3.5 h-3.5 shrink-0" />
                       {testingNotify ? 'Đang gửi...' : 'Gửi Tin nhắn Test'}
@@ -2401,7 +2497,7 @@ export default function SettingsPage() {
                       </div>
                     </div>
                     <div className="flex flex-col justify-between">
-                      <div className="flex flex-wrap items-center justify-between gap-1 mb-1">
+                      <div className="flex flex-wrap items-center justify-between gap-1.5 mb-1">
                         <label className="text-slate-400">
                           Telegram Chat ID / Group ID
                         </label>
@@ -2413,7 +2509,7 @@ export default function SettingsPage() {
                             (settings.telegram_bot_token || '').trim()
                               .length === 0
                           }
-                          className="inline-flex items-center gap-1 text-[11px] text-cyan-400 hover:text-cyan-300 font-medium disabled:opacity-50"
+                          className="min-h-[28px] px-2 py-0.5 rounded-md bg-cyan-500/10 hover:bg-cyan-500/20 border border-cyan-500/25 inline-flex items-center gap-1 text-[11px] text-cyan-300 font-medium disabled:opacity-50 transition-colors"
                         >
                           <Search className="w-3 h-3 shrink-0" />
                           {detectingChatId ? 'Đang dò...' : 'Tự lấy Chat ID'}
@@ -2536,8 +2632,8 @@ export default function SettingsPage() {
                 {/* Right Column: Anomaly Detection & Synology DSM Btrfs API */}
                 <div className="space-y-6">
                   <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-6 space-y-4">
-                    <h3 className="text-sm font-bold text-white flex items-center gap-2">
-                      <ShieldAlert className="w-4 h-4 text-amber-400 shrink-0" />
+                    <h3 className="text-sm font-bold text-white flex items-start sm:items-center gap-2">
+                      <ShieldAlert className="w-4 h-4 text-amber-400 shrink-0 mt-0.5 sm:mt-0" />
                       <span>
                         Ngưỡng Phát hiện Sớm Ransomware (Anomaly Detection)
                       </span>
@@ -2580,8 +2676,8 @@ export default function SettingsPage() {
                   </div>
 
                   <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-6 space-y-4">
-                    <h3 className="text-sm font-bold text-white flex items-center gap-2">
-                      <Lock className="w-4 h-4 text-emerald-400 shrink-0" />
+                    <h3 className="text-sm font-bold text-white flex items-start sm:items-center gap-2">
+                      <Lock className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5 sm:mt-0" />
                       <span>
                         Tích hợp Synology DSM Btrfs Immutable Snapshot (WORM)
                       </span>
@@ -2658,7 +2754,7 @@ export default function SettingsPage() {
                         </div>
                       </div>
                     </div>
-                    <label className="flex items-start gap-2.5 text-slate-300 cursor-pointer">
+                    <label className="flex items-start gap-2.5 py-1 text-slate-300 cursor-pointer">
                       <input
                         type="checkbox"
                         checked={settings.btrfs_auto_enabled === 'true'}
@@ -2668,9 +2764,9 @@ export default function SettingsPage() {
                             e.target.checked ? 'true' : 'false'
                           )
                         }
-                        className="mt-0.5 shrink-0"
+                        className="w-4 h-4 mt-0.5 rounded accent-blue-500 shrink-0"
                       />
-                      <span>
+                      <span className="leading-relaxed">
                         Tự động tạo Btrfs WORM Snapshot lúc 06:00 AM hàng ngày
                         (Khóa chống xóa 7 ngày)
                       </span>
@@ -2684,61 +2780,62 @@ export default function SettingsPage() {
                 {/* Daily Morning Digest Card */}
                 <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-6 space-y-4 flex flex-col justify-between">
                   <div className="space-y-4">
-                    <div className="flex flex-wrap items-start justify-between gap-3">
-                      <div className="min-w-0 space-y-1 flex-1">
-                        <h3 className="text-sm font-bold text-white flex items-center gap-2">
-                          <CalendarClock className="w-4 h-4 text-emerald-400 shrink-0" />
+                    <div className="space-y-1.5">
+                      <div className="flex items-start sm:items-center justify-between gap-2.5">
+                        <h3 className="text-sm font-bold text-white flex items-start sm:items-center gap-2 min-w-0">
+                          <CalendarClock className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5 sm:mt-0" />
                           <span>
                             Báo cáo Tổng hợp Sáng sớm (Daily Morning Digest)
                           </span>
                         </h3>
-                        <p className="text-[11px] text-slate-400 leading-relaxed">
-                          Tự động gửi bản tin tổng kết 24 giờ qua (Job thành công/lỗi,
-                          dung lượng Delta thực tốn, SQL Verified, sức khỏe Volume
-                          NAS &amp; khóa SSH TOFU) qua Telegram &amp; Email mỗi sáng.
-                        </p>
-                      </div>
 
-                      {/* Accessible Switch for digest_enabled */}
-                      <button
-                        type="button"
-                        role="switch"
-                        aria-checked={settings.digest_enabled === 'true'}
-                        onClick={handleToggleDigestEnabled}
-                        className={`min-h-[38px] px-3 py-1.5 rounded-xl border inline-flex items-center gap-2 font-semibold transition-all shrink-0 ${
-                          settings.digest_enabled === 'true'
-                            ? 'bg-emerald-500/20 border-emerald-500/40 text-emerald-300'
-                            : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
-                        }`}
-                      >
-                        <span
-                          className={`w-8 h-4 rounded-full relative transition-colors inline-block ${
+                        {/* Accessible Switch for digest_enabled */}
+                        <button
+                          type="button"
+                          role="switch"
+                          aria-checked={settings.digest_enabled === 'true'}
+                          onClick={handleToggleDigestEnabled}
+                          className={`min-h-[36px] px-2.5 sm:px-3 py-1.5 rounded-xl border inline-flex items-center gap-1.5 sm:gap-2 font-semibold transition-all shrink-0 whitespace-nowrap ${
                             settings.digest_enabled === 'true'
-                              ? 'bg-emerald-500'
-                              : 'bg-slate-700'
+                              ? 'bg-emerald-500/20 border-emerald-500/40 text-emerald-300'
+                              : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
                           }`}
                         >
                           <span
-                            className={`w-3 h-3 rounded-full bg-white absolute top-0.5 transition-all ${
+                            className={`w-8 h-4 rounded-full relative transition-colors inline-block shrink-0 ${
                               settings.digest_enabled === 'true'
-                                ? 'left-4'
-                                : 'left-0.5'
+                                ? 'bg-emerald-500'
+                                : 'bg-slate-700'
                             }`}
-                          />
-                        </span>
-                        <span>
-                          {settings.digest_enabled === 'true'
-                            ? 'Đang bật'
-                            : 'Đang tắt'}
-                        </span>
-                      </button>
+                          >
+                            <span
+                              className={`w-3 h-3 rounded-full bg-white absolute top-0.5 transition-all ${
+                                settings.digest_enabled === 'true'
+                                  ? 'left-4'
+                                  : 'left-0.5'
+                              }`}
+                            />
+                          </span>
+                          <span>
+                            {settings.digest_enabled === 'true'
+                              ? 'Đang bật'
+                              : 'Đang tắt'}
+                          </span>
+                        </button>
+                      </div>
+
+                      <p className="text-[11px] text-slate-400 leading-relaxed">
+                        Tự động gửi bản tin tổng kết 24 giờ qua (Job thành công/lỗi,
+                        dung lượng Delta thực tốn, SQL Verified, sức khỏe Volume
+                        NAS &amp; khóa SSH TOFU) qua Telegram &amp; Email mỗi sáng.
+                      </p>
                     </div>
 
                     <div className="space-y-2.5">
                       <label className="block text-slate-400">
                         Khung giờ gửi tự động hàng ngày (Chọn nhanh hoặc nhập biểu thức Cron)
                       </label>
-                      <div className="flex flex-wrap items-center gap-1.5">
+                      <div className="grid grid-cols-3 sm:flex sm:flex-wrap items-center gap-1.5">
                         {DIGEST_CRON_PRESETS.map((preset) => {
                           const activeCron =
                             (settings.digest_cron_time || '0 7 * * *').trim() ===
@@ -2750,7 +2847,7 @@ export default function SettingsPage() {
                               onClick={() =>
                                 updateField('digest_cron_time', preset.cron)
                               }
-                              className={`min-h-[38px] px-3 py-1.5 rounded-lg border font-mono text-xs font-medium transition-colors ${
+                              className={`min-h-[38px] px-2.5 sm:px-3 py-1.5 rounded-lg border font-mono text-xs font-medium inline-flex items-center justify-center transition-colors ${
                                 activeCron
                                   ? 'bg-cyan-500/20 border-cyan-500/40 text-cyan-300'
                                   : 'bg-slate-950 border-slate-800 text-slate-300 hover:bg-slate-800'
@@ -2898,8 +2995,8 @@ export default function SettingsPage() {
                 {/* Global Exclude Rules Card (Horizontal right neighbor of Daily Morning Digest) */}
                 <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-6 space-y-3.5 flex flex-col">
                   <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-                    <h3 className="text-sm font-bold text-white flex items-center gap-2">
-                      <Filter className="w-4 h-4 text-violet-400 shrink-0" />
+                    <h3 className="text-sm font-bold text-white flex items-start sm:items-center gap-2">
+                      <Filter className="w-4 h-4 text-violet-400 shrink-0 mt-0.5 sm:mt-0" />
                       <span>
                         Bộ lọc Loại trừ File Toàn cục (Global Exclude Rules)
                       </span>
@@ -3047,26 +3144,26 @@ export default function SettingsPage() {
 
           {/* 2FA TOTP Google Authenticator Card */}
           <div className="lg:col-span-7 bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-6 space-y-4 h-fit">
-            <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-2.5">
               <div className="min-w-0">
-                <h3 className="text-sm font-bold text-white flex items-center gap-2">
-                  <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" />
+                <h3 className="text-sm font-bold text-white flex items-start sm:items-center gap-2">
+                  <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5 sm:mt-0" />
                   <span>
                     Bảo mật 2 lớp (2FA TOTP — Google Authenticator / Authy)
                   </span>
                 </h3>
-                <p className="text-[11px] text-slate-400 mt-0.5">
+                <p className="text-[11px] text-slate-400 mt-0.5 leading-relaxed">
                   Bảo vệ tài khoản trước nguy cơ lộ mật khẩu bằng mã OTP 6 chữ
                   số đổi mới mỗi 30 giây và 8 Mã khôi phục dự phòng một lần.
                 </p>
               </div>
               {twoFaState.enabled ? (
-                <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 font-semibold text-[11px]">
+                <span className="self-start shrink-0 inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 font-semibold text-[11px]">
                   <ShieldCheck className="w-3.5 h-3.5 shrink-0" />
                   Đã kích hoạt Bảo mật 2 lớp (2FA)
                 </span>
               ) : (
-                <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-slate-800 border border-slate-700 text-slate-400 font-medium text-[11px]">
+                <span className="self-start shrink-0 inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-slate-800 border border-slate-700 text-slate-400 font-medium text-[11px]">
                   Chưa kích hoạt 2FA
                 </span>
               )}
@@ -3128,7 +3225,7 @@ export default function SettingsPage() {
                   {freshRecoveryCodes.map((code) => (
                     <div
                       key={code}
-                      className="px-2.5 py-2 rounded-lg bg-slate-950 border border-amber-500/30 text-center font-mono font-bold text-amber-200 tracking-wider select-all"
+                      className="px-2 py-2 rounded-lg bg-slate-950 border border-amber-500/30 text-center font-mono text-[11px] sm:text-xs font-bold text-amber-200 tracking-wider select-all"
                     >
                       {code}
                     </div>
@@ -3293,7 +3390,7 @@ export default function SettingsPage() {
                     </div>
                   </div>
 
-                  <div className="flex flex-wrap items-center gap-2">
+                  <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 w-full sm:w-auto">
                     <button
                       type="button"
                       onClick={() => {
@@ -3303,7 +3400,7 @@ export default function SettingsPage() {
                         setTwoFaActionPassword('');
                         setTwoFaActionCode('');
                       }}
-                      className={`min-h-[38px] px-3 py-1.5 rounded-lg border font-medium transition-colors ${
+                      className={`min-h-[38px] px-3 py-1.5 rounded-lg border font-medium text-center justify-center inline-flex items-center transition-colors ${
                         twoFaManageAction === 'regenerate'
                           ? 'bg-cyan-500/20 border-cyan-500/40 text-cyan-200'
                           : 'bg-slate-800 hover:bg-slate-700 border-slate-700 text-slate-200'
@@ -3320,7 +3417,7 @@ export default function SettingsPage() {
                         setTwoFaActionPassword('');
                         setTwoFaActionCode('');
                       }}
-                      className={`min-h-[38px] px-3 py-1.5 rounded-lg border font-medium transition-colors ${
+                      className={`min-h-[38px] px-3 py-1.5 rounded-lg border font-medium text-center justify-center inline-flex items-center transition-colors ${
                         twoFaManageAction === 'disable'
                           ? 'bg-rose-600 text-white border-rose-500'
                           : 'bg-rose-600/15 hover:bg-rose-600/25 border-rose-500/30 text-rose-300'
@@ -3380,7 +3477,7 @@ export default function SettingsPage() {
                           !twoFaActionPassword ||
                           !twoFaActionCode.trim()
                         }
-                        className={`min-h-[40px] px-4 py-2 rounded-lg font-semibold text-white disabled:opacity-50 transition-colors ${
+                        className={`flex-1 sm:flex-initial justify-center min-h-[42px] inline-flex items-center px-4 py-2 rounded-lg font-semibold text-white disabled:opacity-50 transition-colors ${
                           twoFaManageAction === 'disable'
                             ? 'bg-rose-600 hover:bg-rose-500'
                             : 'bg-blue-600 hover:bg-blue-500'
@@ -3395,7 +3492,7 @@ export default function SettingsPage() {
                       <button
                         type="button"
                         onClick={() => setTwoFaManageAction('none')}
-                        className="min-h-[40px] px-3.5 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300"
+                        className="min-h-[42px] px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300"
                       >
                         Hủy
                       </button>
@@ -3427,8 +3524,8 @@ export default function SettingsPage() {
 
           {/* Create New User Card */}
           <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-6 space-y-4">
-            <h3 className="text-sm font-bold text-white flex items-center gap-2">
-              <UserPlus className="w-4 h-4 text-blue-400 shrink-0" />
+            <h3 className="text-sm font-bold text-white flex items-start sm:items-center gap-2">
+              <UserPlus className="w-4 h-4 text-blue-400 shrink-0 mt-0.5 sm:mt-0" />
               <span>Tạo Tài khoản Vận hành / Giám sát Mới (RBAC)</span>
             </h3>
 
@@ -3548,15 +3645,15 @@ export default function SettingsPage() {
           {/* Users List Card */}
           <div className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden">
             <div className="p-4 sm:p-5 border-b border-slate-800 flex items-center justify-between gap-2">
-              <h3 className="text-sm font-bold text-white flex items-center gap-2">
-                <Users className="w-4 h-4 text-cyan-400 shrink-0" />
+              <h3 className="text-sm font-bold text-white flex items-start sm:items-center gap-2 min-w-0">
+                <Users className="w-4 h-4 text-cyan-400 shrink-0 mt-0.5 sm:mt-0" />
                 <span>Danh sách Tài khoản Hệ thống ({usersList.length})</span>
               </h3>
               <button
                 type="button"
                 onClick={() => void loadUsers()}
                 disabled={usersLoading}
-                className="min-h-[36px] inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors"
+                className="min-h-[36px] shrink-0 whitespace-nowrap inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors"
               >
                 <RefreshCw
                   className={`w-3.5 h-3.5 shrink-0 ${
@@ -3639,7 +3736,7 @@ export default function SettingsPage() {
                             setResetPassTarget(u);
                             setResetPassValue('');
                           }}
-                          className="flex-1 min-h-[38px] px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 whitespace-nowrap"
+                          className="flex-1 min-h-[38px] px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 inline-flex items-center justify-center text-center whitespace-nowrap"
                         >
                           Đặt lại mật khẩu
                         </button>
@@ -3647,7 +3744,7 @@ export default function SettingsPage() {
                           <button
                             type="button"
                             onClick={() => void handleResetUser2fa(u)}
-                            className="flex-1 min-h-[38px] px-3 py-1.5 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/30 whitespace-nowrap"
+                            className="flex-1 min-h-[38px] px-3 py-1.5 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/30 inline-flex items-center justify-center text-center whitespace-nowrap"
                           >
                             Reset 2FA
                           </button>
@@ -3657,7 +3754,7 @@ export default function SettingsPage() {
                           disabled={isSelf}
                           onClick={() => void handleDeleteUser(u)}
                           aria-label={`Xóa người dùng ${u.username}`}
-                          className="min-h-[38px] min-w-[38px] p-2 inline-flex items-center justify-center rounded-lg bg-slate-800 hover:bg-rose-600/30 text-rose-400 border border-slate-700 disabled:opacity-40"
+                          className="min-h-[38px] min-w-[38px] p-2 inline-flex items-center justify-center rounded-lg bg-slate-800 hover:bg-rose-600/30 text-rose-400 border border-slate-700 disabled:opacity-40 shrink-0"
                         >
                           <Trash2 className="w-3.5 h-3.5" />
                         </button>
@@ -3865,10 +3962,10 @@ export default function SettingsPage() {
       {isAdmin && activeTab === 'update' && (
         <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-6 space-y-4 text-xs">
           <div className="flex flex-col xl:flex-row xl:items-center justify-between gap-4">
-            <div className="min-w-0 space-y-1">
+            <div className="min-w-0 space-y-1.5">
               <div className="flex flex-wrap items-center gap-2">
-                <h3 className="text-sm font-bold text-white flex items-center gap-2">
-                  <GitBranch className="w-4 h-4 text-emerald-400 shrink-0" />
+                <h3 className="text-sm font-bold text-white flex items-start sm:items-center gap-2">
+                  <GitBranch className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5 sm:mt-0" />
                   <span>
                     Cập nhật Hệ thống Trực tiếp từ GitHub (1-Click Self-Update)
                   </span>
@@ -3899,34 +3996,36 @@ export default function SettingsPage() {
               </p>
             </div>
 
-            <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto shrink-0">
-              <button
-                type="button"
-                onClick={() => void handleCheckUpdate()}
-                disabled={checkingUpdate || isUpdatingNow}
-                className="flex-1 sm:flex-initial justify-center min-h-[40px] whitespace-nowrap inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 disabled:opacity-50 transition-colors"
-              >
-                <RefreshCw
-                  className={`w-3.5 h-3.5 shrink-0 ${
-                    checkingUpdate ? 'animate-spin' : ''
-                  }`}
-                />
-                {checkingUpdate ? 'Đang kiểm tra...' : 'Kiểm tra bản mới'}
-              </button>
-
-              {updateInfo?.canRollback && (
+            <div className="flex flex-col sm:flex-row sm:flex-wrap items-stretch sm:items-center gap-2 w-full xl:w-auto shrink-0">
+              <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto">
                 <button
                   type="button"
-                  onClick={() => void handleStartRollback()}
-                  disabled={isUpdatingNow || !updateInfo.canUpdateNow}
-                  className="flex-1 sm:flex-initial justify-center min-h-[40px] whitespace-nowrap inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-amber-500/15 hover:bg-amber-500 text-amber-300 hover:text-slate-950 border border-amber-500/40 font-semibold disabled:opacity-50 transition-colors"
+                  onClick={() => void handleCheckUpdate()}
+                  disabled={checkingUpdate || isUpdatingNow}
+                  className="flex-1 sm:flex-initial justify-center min-h-[42px] whitespace-nowrap inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 disabled:opacity-50 transition-colors"
                 >
-                  <RotateCcw className="w-3.5 h-3.5 shrink-0" />
+                  <RefreshCw
+                    className={`w-3.5 h-3.5 shrink-0 ${
+                      checkingUpdate ? 'animate-spin' : ''
+                    }`}
+                  />
                   <span>
-                    ↩ Quay lại v{updateInfo.rollbackVersion || 'trước'}
+                    {checkingUpdate ? 'Đang kiểm tra...' : 'Kiểm tra bản mới'}
                   </span>
                 </button>
-              )}
+
+                {updateInfo?.canRollback && (
+                  <button
+                    type="button"
+                    onClick={() => void handleStartRollback()}
+                    disabled={isUpdatingNow || !updateInfo.canUpdateNow}
+                    className="flex-1 sm:flex-initial justify-center min-h-[42px] whitespace-nowrap inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-amber-500/15 hover:bg-amber-500 text-amber-300 hover:text-slate-950 border border-amber-500/40 font-semibold disabled:opacity-50 transition-colors"
+                  >
+                    <RotateCcw className="w-3.5 h-3.5 shrink-0" />
+                    <span>Quay lại v{updateInfo.rollbackVersion || 'trước'}</span>
+                  </button>
+                )}
+              </div>
 
               <button
                 type="button"
@@ -3935,7 +4034,7 @@ export default function SettingsPage() {
                   isUpdatingNow ||
                   (updateInfo !== null && !updateInfo.canUpdateNow)
                 }
-                className={`w-full sm:w-auto flex-1 sm:flex-initial justify-center min-h-[40px] inline-flex items-center gap-1.5 px-4 py-2 rounded-lg font-semibold transition-all disabled:opacity-50 ${
+                className={`w-full sm:w-auto justify-center min-h-[42px] inline-flex items-center gap-1.5 px-4 py-2 rounded-lg font-semibold transition-all disabled:opacity-50 ${
                   updateInfo?.hasUpdate
                     ? 'bg-emerald-600 hover:bg-emerald-500 text-white shadow-lg shadow-emerald-600/20'
                     : 'bg-blue-600/20 hover:bg-blue-600 text-blue-300 hover:text-white border border-blue-500/30'

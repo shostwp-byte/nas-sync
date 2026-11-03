@@ -437,18 +437,29 @@ export default function AlertsAndLogsPage() {
 
       {/* Tab Switcher (System Alerts + Admin Security Audit Logs) */}
       {isAdmin && (
-        <div className="flex flex-wrap gap-1.5 p-1.5 bg-slate-900 border border-slate-800 rounded-2xl text-xs">
+        <div
+          role="tablist"
+          aria-label="Chuyển đổi Nhật ký Sự kiện và Nhật ký Kiểm toán"
+          className="grid grid-cols-2 sm:inline-flex gap-1.5 p-1.5 bg-slate-900 border border-slate-800 rounded-2xl text-xs w-full sm:w-auto"
+        >
           <button
             type="button"
+            role="tab"
+            aria-selected={activeTab === 'alerts'}
             onClick={() => setActiveTab('alerts')}
-            className={`flex-1 sm:flex-initial min-h-[42px] px-4 py-2 rounded-xl font-semibold inline-flex items-center justify-center gap-2 transition-all ${
+            className={`min-h-[42px] px-2.5 sm:px-4 py-2 rounded-xl font-semibold inline-flex items-center justify-center gap-1.5 sm:gap-2 whitespace-nowrap transition-all ${
               activeTab === 'alerts'
                 ? 'bg-blue-600 text-white shadow-lg shadow-blue-600/25'
                 : 'text-slate-400 hover:text-white hover:bg-slate-800/70'
             }`}
           >
-            <BellRing className="w-4 h-4 shrink-0" />
-            <span>Sự kiện &amp; Cảnh báo Hệ thống</span>
+            <BellRing className="w-3.5 h-3.5 sm:w-4 sm:h-4 shrink-0" />
+            <span>
+              <span className="sm:hidden">Cảnh báo</span>
+              <span className="hidden sm:inline">
+                Sự kiện &amp; Cảnh báo Hệ thống
+              </span>
+            </span>
             {summary.unreadCount > 0 && (
               <span className="px-1.5 py-0.5 rounded-full text-[10px] bg-white/20 text-white font-mono">
                 {summary.unreadCount}
@@ -458,20 +469,27 @@ export default function AlertsAndLogsPage() {
 
           <button
             type="button"
+            role="tab"
+            aria-selected={activeTab === 'audit'}
             onClick={() => {
               setActiveTab('audit');
               if (auditLogs.length === 0) {
                 void loadAuditLogs();
               }
             }}
-            className={`flex-1 sm:flex-initial min-h-[42px] px-4 py-2 rounded-xl font-semibold inline-flex items-center justify-center gap-2 transition-all ${
+            className={`min-h-[42px] px-2.5 sm:px-4 py-2 rounded-xl font-semibold inline-flex items-center justify-center gap-1.5 sm:gap-2 whitespace-nowrap transition-all ${
               activeTab === 'audit'
                 ? 'bg-blue-600 text-white shadow-lg shadow-blue-600/25'
                 : 'text-slate-400 hover:text-white hover:bg-slate-800/70'
             }`}
           >
-            <FileText className="w-4 h-4 shrink-0" />
-            <span>Nhật ký Kiểm toán Bảo mật (Audit Logs)</span>
+            <FileText className="w-3.5 h-3.5 sm:w-4 sm:h-4 shrink-0" />
+            <span>
+              <span className="sm:hidden">Kiểm toán (Audit)</span>
+              <span className="hidden sm:inline">
+                Nhật ký Kiểm toán Bảo mật (Audit Logs)
+              </span>
+            </span>
           </button>
         </div>
       )}

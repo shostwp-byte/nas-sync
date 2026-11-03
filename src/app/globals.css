@@ -33,6 +33,16 @@
   background: #475569;
 }
 
+/* Hide scrollbar on horizontal touch-scroll strips while keeping scrollability */
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
 /* Prevent iOS Safari auto-zoom on input focus (< 768px) while preserving desktop text sizing */
 @media screen and (max-width: 767px) {
   input,

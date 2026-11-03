@@ -14,6 +14,9 @@ Mọi thay đổi đáng chú ý của dự án **NAS-Sync** (<https://github.co
   - Bỏ thao tác gọi lặp `ssh-keyscan` (vốn mở đồng thời 5 kết nối TCP chưa xác thực dễ chạm ngưỡng CSF `PORTFLOOD` / `PerSourceMaxStartups`) đối với các máy chủ đã ghim khóa `VERIFIED`, ủy quyền xác thực trực tiếp cho `StrictHostKeyChecking=yes` + `UserKnownHostsFile` và chỉ quét lại khi phát hiện cảnh báo thay đổi Host Key.
   - Kích hoạt cơ chế gộp kênh OpenSSH Multiplexing (`ControlMaster=auto`, `ControlPersist=90s`, `ConnectionAttempts=3`) cho cả `ssh` và `rsync`, tái sử dụng duy nhất 1 kết nối TCP cho toàn bộ phiên sao lưu của mỗi VPS, đồng thời gộp đọc thông tin MySQL vào chung 1 lượt gọi SSH trong `DirectAdminAdapter.discoverDomains` và giãn cách `1.5s` khi lập lịch Cron nhiều VPS cùng giờ.
   - Bổ sung cơ chế tự động thử lại tức thì (3 lần kèm backoff) trong `execRemoteSSH` khi gặp lỗi rơi gói bắt tay KEX (`kex_exchange_identification` / `Connection reset by peer`), và tự động chuyển Job sang trạng thái `INTERRUPTED` (`Auto-Resume`) thay vì `FAILED` nếu cổng SSH đang bị tường lửa giới hạn tạm thời.
+- **Tối ưu hóa toàn diện thanh 5 Tab & bố cục Mobile trên trang `Cấu hình & Cập nhật` (`src/app/settings/page.tsx`, `src/app/alerts/page.tsx`, `src/app/globals.css`)**:
+  - Thiết kế lại thanh điều hướng 5 tab (`Cấu hình`, `Sao lưu`, `Tài khoản`, `Phân quyền`, `Cập nhật`) dạng Segmented Bar 5 cột 1 hàng duy nhất trên màn hình di động (`320px` – `639px`) với bộ icon Lucide đồng nhất và chấm trạng thái trực quan, chấm dứt tình trạng chữ bị bẻ gãy thành nhiều dòng lệch chiều cao.
+  - Sửa xung đột Flexbox `w-full flex-1` ở nhóm nút hành động trong tab **Cập nhật**, tách dòng mô tả toàn chiều rộng cho thẻ **Báo cáo Tổng hợp Sáng sớm**, chuẩn hóa lưới 2×2 cho bộ chọn S3, lưới 3 cột cho khung giờ Cron và tối ưu kích thước vùng chạm trên toàn bộ 5 tab.
 
 ## [1.5.5] - 2026-11-02
 
