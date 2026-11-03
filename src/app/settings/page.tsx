@@ -155,7 +155,7 @@ export default function SettingsPage() {
   } | null>(null);
   const [showTelegramToken, setShowTelegramToken] = useState(false);
   const [showSmtpPass, setShowSmtpPass] = useState(false);
-  const [showDsmPass, setShowDsmPass] = useState(false);
+  const [showWormSecret, setShowWormSecret] = useState(false);
 
   // Daily Morning Digest State (Tab 1)
   const [testingDigest, setTestingDigest] = useState(false);
@@ -2420,7 +2420,7 @@ export default function SettingsPage() {
           )}
 
           <form onSubmit={handleSaveSettings} className="space-y-6 text-xs">
-            {/* Row 1: Telegram & SMTP (Left) + Anomaly Detection & Synology DSM Btrfs WORM (Right) */}
+            {/* Row 1: Telegram & SMTP (Left) + Anomaly Detection & Universal OS-Level WORM (Right) */}
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 items-start">
               {/* Left Column: Telegram & SMTP */}
               <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-6 space-y-4">
@@ -2629,7 +2629,7 @@ export default function SettingsPage() {
                   </div>
                 </div>
 
-                {/* Right Column: Anomaly Detection & Synology DSM Btrfs API */}
+                {/* Right Column: Anomaly Detection & Universal OS-Level WORM Snapshot */}
                 <div className="space-y-6">
                   <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-6 space-y-4">
                     <h3 className="text-sm font-bold text-white flex items-start sm:items-center gap-2">
@@ -2679,98 +2679,270 @@ export default function SettingsPage() {
                     <h3 className="text-sm font-bold text-white flex items-start sm:items-center gap-2">
                       <Lock className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5 sm:mt-0" />
                       <span>
-                        Tích hợp Synology DSM Btrfs Immutable Snapshot (WORM)
+                        Khóa Bất biến Snapshot Cấp Hệ điều hành (OS-Level WORM)
                       </span>
                     </h3>
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                      <div className="flex flex-col justify-between">
+
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                      <div className="sm:col-span-2 flex flex-col justify-between">
                         <label className="block text-slate-400 mb-1">
-                          Synology DSM URL
+                          Nền tảng / Cơ chế khóa WORM
                         </label>
-                        <input
-                          value={settings.dsm_api_url || ''}
+                        <select
+                          value={settings.worm_provider || 'NONE'}
                           onChange={(e) =>
-                            updateField('dsm_api_url', e.target.value)
-                          }
-                          placeholder="https://192.168.1.10:5001"
-                          className="w-full min-h-[42px] bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white font-mono"
-                        />
-                      </div>
-                      <div className="flex flex-col justify-between">
-                        <label className="block text-slate-400 mb-1">
-                          Shared Folders (cách nhau dấu phẩy)
-                        </label>
-                        <input
-                          value={settings.dsm_backup_shares || 'VPS_Backups'}
-                          onChange={(e) =>
-                            updateField('dsm_backup_shares', e.target.value)
-                          }
-                          className="w-full min-h-[42px] bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white font-mono"
-                        />
-                      </div>
-                    </div>
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                      <div className="flex flex-col justify-between">
-                        <label className="block text-slate-400 mb-1">
-                          DSM Admin User
-                        </label>
-                        <input
-                          value={settings.dsm_username || ''}
-                          onChange={(e) =>
-                            updateField('dsm_username', e.target.value)
+                            updateField('worm_provider', e.target.value)
                           }
                           className="w-full min-h-[42px] bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white"
-                        />
+                        >
+                          <option value="NONE">
+                            Mặc định — Khóa GFS Pin nội bộ &amp; Offsite 3-2-1 (Mọi NAS Docker)
+                          </option>
+                          <option value="TRUENAS_ZFS">
+                            TrueNAS SCALE — ZFS Snapshot &amp; Kernel Hold API v2.0
+                          </option>
+                          <option value="NAS_WEBAPI">
+                            NAS Btrfs Share Snapshot WebAPI (Immutable Share Lock)
+                          </option>
+                          <option value="WEBHOOK">
+                            Custom Host Webhook — Ký HMAC-SHA256 (QNAP / Unraid / OMV / Linux)
+                          </option>
+                        </select>
                       </div>
                       <div className="flex flex-col justify-between">
                         <label className="block text-slate-400 mb-1">
-                          DSM Password
+                          Số ngày khóa WORM
                         </label>
-                        <div className="relative">
-                          <input
-                            type={showDsmPass ? 'text' : 'password'}
-                            value={settings.dsm_password || ''}
-                            onChange={(e) =>
-                              updateField('dsm_password', e.target.value)
-                            }
-                            className="w-full min-h-[42px] bg-slate-950 border border-slate-800 rounded-lg pl-3 pr-10 py-2 text-white"
-                          />
-                          <button
-                            type="button"
-                            onClick={() => setShowDsmPass((v) => !v)}
-                            aria-label={
-                              showDsmPass
-                                ? 'Ẩn mật khẩu DSM'
-                                : 'Hiện mật khẩu DSM'
-                            }
-                            className="h-9 w-9 inline-flex items-center justify-center rounded-md text-slate-400 hover:text-white absolute right-1 top-1/2 -translate-y-1/2"
-                          >
-                            {showDsmPass ? (
-                              <EyeOff className="w-4 h-4" />
-                            ) : (
-                              <Eye className="w-4 h-4" />
-                            )}
-                          </button>
-                        </div>
+                        <input
+                          type="number"
+                          min={1}
+                          max={3650}
+                          value={settings.worm_retention_days || '7'}
+                          onChange={(e) =>
+                            updateField('worm_retention_days', e.target.value)
+                          }
+                          className="w-full min-h-[42px] bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white font-mono"
+                        />
                       </div>
                     </div>
-                    <label className="flex items-start gap-2.5 py-1 text-slate-300 cursor-pointer">
-                      <input
-                        type="checkbox"
-                        checked={settings.btrfs_auto_enabled === 'true'}
-                        onChange={(e) =>
-                          updateField(
-                            'btrfs_auto_enabled',
-                            e.target.checked ? 'true' : 'false'
-                          )
-                        }
-                        className="w-4 h-4 mt-0.5 rounded accent-blue-500 shrink-0"
-                      />
-                      <span className="leading-relaxed">
-                        Tự động tạo Btrfs WORM Snapshot lúc 06:00 AM hàng ngày
-                        (Khóa chống xóa 7 ngày)
-                      </span>
-                    </label>
+
+                    {(settings.worm_provider || 'NONE') === 'NONE' && (
+                      <p className="text-[11px] text-slate-400 bg-slate-950/80 border border-slate-800 rounded-xl p-3 leading-relaxed">
+                        Tương thích mặc định với <strong className="text-slate-200">100% thiết bị NAS &amp; Docker</strong> (QNAP, TrueNAS, UGREEN, TerraMaster, Asustor, Unraid, OpenMediaVault, Linux Server). Nếu thiết bị NAS của bạn có REST API ZFS / Btrfs hoặc Webhook riêng, hãy chọn cơ chế tương ứng ở trên để kích hoạt thêm lớp khóa bất biến cấp Kernel.
+                      </p>
+                    )}
+
+                    {(settings.worm_provider || 'NONE') !== 'NONE' && (
+                      <>
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                          <div className="flex flex-col justify-between">
+                            <label className="block text-slate-400 mb-1">
+                              {settings.worm_provider === 'TRUENAS_ZFS'
+                                ? 'TrueNAS SCALE URL'
+                                : settings.worm_provider === 'WEBHOOK'
+                                ? 'Webhook Endpoint URL'
+                                : 'NAS WebAPI URL'}
+                            </label>
+                            <input
+                              value={settings.worm_api_url || ''}
+                              onChange={(e) =>
+                                updateField('worm_api_url', e.target.value)
+                              }
+                              placeholder={
+                                settings.worm_provider === 'TRUENAS_ZFS'
+                                  ? 'https://192.168.1.50'
+                                  : settings.worm_provider === 'WEBHOOK'
+                                  ? 'https://192.168.1.10:9443/hooks/worm'
+                                  : 'https://192.168.1.10:5001'
+                              }
+                              className="w-full min-h-[42px] bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white font-mono"
+                            />
+                          </div>
+                          <div className="flex flex-col justify-between">
+                            <label className="block text-slate-400 mb-1">
+                              {settings.worm_provider === 'TRUENAS_ZFS'
+                                ? 'ZFS Datasets (cách nhau dấu phẩy)'
+                                : 'Shared Folders / Targets (dấu phẩy)'}
+                            </label>
+                            <input
+                              value={
+                                settings.worm_target_shares || 'VPS_Backups'
+                              }
+                              onChange={(e) =>
+                                updateField(
+                                  'worm_target_shares',
+                                  e.target.value
+                                )
+                              }
+                              placeholder={
+                                settings.worm_provider === 'TRUENAS_ZFS'
+                                  ? 'tank/vps_backups'
+                                  : 'VPS_Backups'
+                              }
+                              className="w-full min-h-[42px] bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white font-mono"
+                            />
+                          </div>
+                        </div>
+
+                        {settings.worm_provider === 'TRUENAS_ZFS' && (
+                          <div className="flex flex-col justify-between">
+                            <label className="block text-slate-400 mb-1">
+                              TrueNAS Bearer API Key
+                            </label>
+                            <div className="relative">
+                              <input
+                                type={showWormSecret ? 'text' : 'password'}
+                                value={settings.worm_api_key || ''}
+                                onChange={(e) =>
+                                  updateField('worm_api_key', e.target.value)
+                                }
+                                placeholder="1-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+                                className="w-full min-h-[42px] bg-slate-950 border border-slate-800 rounded-lg pl-3 pr-10 py-2 text-white font-mono"
+                              />
+                              <button
+                                type="button"
+                                onClick={() => setShowWormSecret((v) => !v)}
+                                aria-label={
+                                  showWormSecret ? 'Ẩn API Key' : 'Hiện API Key'
+                                }
+                                className="h-9 w-9 inline-flex items-center justify-center rounded-md text-slate-400 hover:text-white absolute right-1 top-1/2 -translate-y-1/2"
+                              >
+                                {showWormSecret ? (
+                                  <EyeOff className="w-4 h-4" />
+                                ) : (
+                                  <Eye className="w-4 h-4" />
+                                )}
+                              </button>
+                            </div>
+                          </div>
+                        )}
+
+                        {settings.worm_provider === 'NAS_WEBAPI' && (
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                            <div className="flex flex-col justify-between">
+                              <label className="block text-slate-400 mb-1">
+                                Tài khoản Quản trị NAS
+                              </label>
+                              <input
+                                value={settings.worm_username || ''}
+                                onChange={(e) =>
+                                  updateField('worm_username', e.target.value)
+                                }
+                                className="w-full min-h-[42px] bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white"
+                              />
+                            </div>
+                            <div className="flex flex-col justify-between">
+                              <label className="block text-slate-400 mb-1">
+                                Mật khẩu Quản trị NAS
+                              </label>
+                              <div className="relative">
+                                <input
+                                  type={showWormSecret ? 'text' : 'password'}
+                                  value={settings.worm_password || ''}
+                                  onChange={(e) =>
+                                    updateField('worm_password', e.target.value)
+                                  }
+                                  className="w-full min-h-[42px] bg-slate-950 border border-slate-800 rounded-lg pl-3 pr-10 py-2 text-white"
+                                />
+                                <button
+                                  type="button"
+                                  onClick={() => setShowWormSecret((v) => !v)}
+                                  aria-label={
+                                    showWormSecret
+                                      ? 'Ẩn mật khẩu NAS'
+                                      : 'Hiện mật khẩu NAS'
+                                  }
+                                  className="h-9 w-9 inline-flex items-center justify-center rounded-md text-slate-400 hover:text-white absolute right-1 top-1/2 -translate-y-1/2"
+                                >
+                                  {showWormSecret ? (
+                                    <EyeOff className="w-4 h-4" />
+                                  ) : (
+                                    <Eye className="w-4 h-4" />
+                                  )}
+                                </button>
+                              </div>
+                            </div>
+                          </div>
+                        )}
+
+                        {settings.worm_provider === 'WEBHOOK' && (
+                          <div className="flex flex-col justify-between">
+                            <label className="block text-slate-400 mb-1">
+                              Khóa ký HMAC-SHA256 (Header X-NasSync-Signature)
+                            </label>
+                            <div className="relative">
+                              <input
+                                type={showWormSecret ? 'text' : 'password'}
+                                value={settings.worm_webhook_secret || ''}
+                                onChange={(e) =>
+                                  updateField(
+                                    'worm_webhook_secret',
+                                    e.target.value
+                                  )
+                                }
+                                placeholder="Chuỗi bí mật xác thực trên Host Agent"
+                                className="w-full min-h-[42px] bg-slate-950 border border-slate-800 rounded-lg pl-3 pr-10 py-2 text-white font-mono"
+                              />
+                              <button
+                                type="button"
+                                onClick={() => setShowWormSecret((v) => !v)}
+                                aria-label={
+                                  showWormSecret
+                                    ? 'Ẩn khóa Webhook'
+                                    : 'Hiện khóa Webhook'
+                                }
+                                className="h-9 w-9 inline-flex items-center justify-center rounded-md text-slate-400 hover:text-white absolute right-1 top-1/2 -translate-y-1/2"
+                              >
+                                {showWormSecret ? (
+                                  <EyeOff className="w-4 h-4" />
+                                ) : (
+                                  <Eye className="w-4 h-4" />
+                                )}
+                              </button>
+                            </div>
+                          </div>
+                        )}
+
+                        <label className="flex items-start gap-2.5 py-1 text-slate-300 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={
+                              settings.worm_auto_enabled === 'true' ||
+                              settings.btrfs_auto_enabled === 'true'
+                            }
+                            onChange={(e) => {
+                              const nextVal = e.target.checked
+                                ? 'true'
+                                : 'false';
+                              updateField('worm_auto_enabled', nextVal);
+                              updateField('btrfs_auto_enabled', nextVal);
+                            }}
+                            className="w-4 h-4 mt-0.5 rounded accent-blue-500 shrink-0"
+                          />
+                          <span className="leading-relaxed">
+                            Tự động chụp khóa bất biến WORM Snapshot lúc 06:00 AM
+                            hằng ngày
+                          </span>
+                        </label>
+                        <label className="flex items-start gap-2.5 py-1 text-slate-400 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={settings.worm_tls_insecure === 'true'}
+                            onChange={(e) =>
+                              updateField(
+                                'worm_tls_insecure',
+                                e.target.checked ? 'true' : 'false'
+                              )
+                            }
+                            className="w-4 h-4 mt-0.5 rounded accent-amber-500 shrink-0"
+                          />
+                          <span className="leading-relaxed">
+                            Cho phép chứng chỉ HTTPS tự ký (Self-Signed) trên mạng
+                            nội bộ LAN (Mặc định tắt — kiểm tra TLS nghiêm ngặt)
+                          </span>
+                        </label>
+                      </>
+                    )}
                   </div>
                 </div>
               </div>
@@ -4046,7 +4218,7 @@ export default function SettingsPage() {
                     ? 'Đang xử lý...'
                     : updateInfo?.hasUpdate
                     ? `Cập nhật ngay lên v${updateInfo.latestVersion}`
-                    : 'Đồng bộ lại từ GitHub (main)'}
+                    : 'Cài lại bản Release đã ký'}
                 </span>
               </button>
             </div>

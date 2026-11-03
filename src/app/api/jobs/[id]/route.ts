@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { NextRequest, NextResponse } from 'next/server';
+import { safeErrorJson } from '@/lib/api-error';
 import { recordAuditLog } from '@/lib/audit';
 import { requireRole } from '@/lib/auth';
 import { getDb } from '@/lib/db';
@@ -11,6 +12,10 @@ import {
 } from '@/lib/engine/queue';
 import { isSafeSnapshotName } from '@/lib/engine/safe-names';
 import { verifyJobDatabasesInSandbox } from '@/lib/engine/sandbox-verifier';
+import {
+  acquireSnapshotReadPin,
+  isSnapshotReadPinned,
+} from '@/lib/engine/snapshot-pins';
 import { resolveLatestSnapshotDir } from '@/lib/engine/volume-manager';
 
 const ACTIVE_JOB_STATUSES = new Set([
@@ -71,40 +76,48 @@ export async function GET(
   _req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const { id } = await params;
-  const db = getDb();
+  try {
+    // A8 Fix: Bổ sung kiểm tra phân quyền phòng thủ nhiều lớp ngay trong route handler
+    const guard = await requireRole(['ADMIN', 'OPERATOR', 'VIEWER']);
+    if (!guard.ok) return guard.response;
 
-  const job = db
-    .prepare(
-      `SELECT
-         j.*,
-         s.hostname AS server_hostname,
-         s.panel_type AS server_panel,
-         ts.hostname AS target_server_hostname,
-         v.name AS volume_name,
-         v.mount_path AS volume_mount_path
-       FROM backup_jobs j
-       LEFT JOIN servers s ON s.id = j.server_id
-       LEFT JOIN servers ts ON ts.id = j.target_server_id
-       LEFT JOIN storage_volumes v ON v.id = j.volume_id
-       WHERE j.id = ?`
-    )
-    .get(Number(id));
+    const { id } = await params;
+    const db = getDb();
 
-  if (!job) {
-    return NextResponse.json({ error: 'Không tìm thấy Job.' }, { status: 404 });
+    const job = db
+      .prepare(
+        `SELECT
+           j.*,
+           s.hostname AS server_hostname,
+           s.panel_type AS server_panel,
+           ts.hostname AS target_server_hostname,
+           v.name AS volume_name,
+           v.mount_path AS volume_mount_path
+         FROM backup_jobs j
+         LEFT JOIN servers s ON s.id = j.server_id
+         LEFT JOIN servers ts ON ts.id = j.target_server_id
+         LEFT JOIN storage_volumes v ON v.id = j.volume_id
+         WHERE j.id = ?`
+      )
+      .get(Number(id));
+
+    if (!job) {
+      return NextResponse.json({ error: 'Không tìm thấy Job.' }, { status: 404 });
+    }
+
+    const rawItems = db
+      .prepare('SELECT * FROM backup_items WHERE job_id = ? ORDER BY domain_name ASC')
+      .all(Number(id));
+
+    const items = rawItems.map((it) => ({
+      ...it,
+      databases_list: JSON.parse(String(it.databases_list || '[]')),
+    }));
+
+    return NextResponse.json({ job, items });
+  } catch (err) {
+    return safeErrorJson(err, 'Không thể tải thông tin chi tiết Job.');
   }
-
-  const rawItems = db
-    .prepare('SELECT * FROM backup_items WHERE job_id = ? ORDER BY domain_name ASC')
-    .all(Number(id));
-
-  const items = rawItems.map((it) => ({
-    ...it,
-    databases_list: JSON.parse(String(it.databases_list || '[]')),
-  }));
-
-  return NextResponse.json({ job, items });
 }
 
 export async function PATCH(
@@ -150,7 +163,8 @@ export async function PATCH(
     }
 
     if (action === 'retry') {
-      if (ACTIVE_JOB_STATUSES.has(String(job.status))) {
+      const currentStatus = String(job.status);
+      if (ACTIVE_JOB_STATUSES.has(currentStatus)) {
         return NextResponse.json(
           {
             error:
@@ -159,24 +173,49 @@ export async function PATCH(
           { status: 409 }
         );
       }
+      // N1 Fix: Chặn chạy lại Job đã COMPLETED (tránh ghi đè/xóa mất snapshot tốt) hoặc đang INTERRUPTED chờ tự động Resume
+      if (currentStatus === 'COMPLETED') {
+        return NextResponse.json(
+          {
+            error:
+              'Tiến trình đã hoàn tất thành công — vui lòng tạo phiên sao lưu/khôi phục mới thay vì chạy đè lên bản cũ.',
+          },
+          { status: 409 }
+        );
+      }
+      if (currentStatus === 'INTERRUPTED') {
+        return NextResponse.json(
+          {
+            error:
+              'Tiến trình đang trong chu kỳ tự động nối tiếp (Auto-Resume). Vui lòng đợi hoặc nhấn Hủy trước khi thử lại thủ công.',
+          },
+          { status: 409 }
+        );
+      }
       if (
         String(job.job_type) === 'BACKUP' &&
-        isReferencedByActiveRestore(
+        (isReferencedByActiveRestore(
           jobId,
           Number(job.server_id),
           String(job.snapshot_name || '')
-        )
+        ) ||
+          isSnapshotReadPinned(
+            Number(job.server_id),
+            String(job.snapshot_name || '')
+          ))
       ) {
         return NextResponse.json(
           {
             error:
-              'Bản sao lưu này đang được tiến trình Khôi phục (Restore) sử dụng, vui lòng đợi hoàn tất.',
+              'Bản sao lưu này đang được tiến trình Khôi phục hoặc Tải về/Đồng bộ sử dụng, vui lòng đợi hoàn tất.',
           },
           { status: 409 }
         );
       }
       db.prepare(
-        `UPDATE backup_jobs SET status = 'QUEUED', current_phase = 'Đang xếp hàng thử lại...', error_log = NULL WHERE id = ?`
+        `UPDATE backup_jobs
+         SET status = 'QUEUED', retry_count = 0, current_phase = 'Đang xếp hàng thử lại...', error_log = NULL
+         WHERE id = ? AND status IN ('FAILED', 'CANCELLED')`
       ).run(jobId);
       await dispatchExistingJob(
         jobId,
@@ -196,12 +235,20 @@ export async function PATCH(
         );
       }
       const { snapshotRoot } = resolveSafeSnapshotRoot(jobId);
-      const summary = await verifyJobDatabasesInSandbox(
-        jobId,
-        snapshotRoot,
-        () => {}
+      const releasePin = acquireSnapshotReadPin(
+        Number(job.server_id),
+        String(job.snapshot_name || '')
       );
-      return NextResponse.json({ ok: true, summary });
+      try {
+        const summary = await verifyJobDatabasesInSandbox(
+          jobId,
+          snapshotRoot,
+          () => {}
+        );
+        return NextResponse.json({ ok: true, summary });
+      } finally {
+        releasePin();
+      }
     }
 
     return NextResponse.json(
@@ -209,10 +256,7 @@ export async function PATCH(
       { status: 400 }
     );
   } catch (err) {
-    return NextResponse.json(
-      { error: (err as Error).message },
-      { status: 500 }
-    );
+    return safeErrorJson(err, 'Không thể thực hiện thao tác trên Job.');
   }
 }
 
@@ -253,16 +297,20 @@ export async function DELETE(
 
     if (
       String(row.job_type) === 'BACKUP' &&
-      isReferencedByActiveRestore(
+      (isReferencedByActiveRestore(
         jobId,
         Number(row.server_id),
         String(row.snapshot_name || '')
-      )
+      ) ||
+        isSnapshotReadPinned(
+          Number(row.server_id),
+          String(row.snapshot_name || '')
+        ))
     ) {
       return NextResponse.json(
         {
           error:
-            'Không thể xóa bản sao lưu đang được tiến trình Khôi phục (Restore) sử dụng.',
+            'Không thể xóa bản sao lưu đang được tiến trình Khôi phục, Tải về hoặc Đồng bộ Offsite sử dụng.',
         },
         { status: 409 }
       );
@@ -316,10 +364,6 @@ export async function DELETE(
 
     return NextResponse.json({ ok: true });
   } catch (err) {
-    return NextResponse.json(
-      { error: (err as Error).message },
-      { status: 500 }
-    );
+    return safeErrorJson(err, 'Không thể xóa bản ghi tiến trình.');
   }
 }
-

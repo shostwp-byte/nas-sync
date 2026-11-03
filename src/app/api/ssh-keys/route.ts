@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { NextRequest, NextResponse } from 'next/server';
+import { safeErrorJson, sanitizeErrorMessage } from '@/lib/api-error';
 import { recordAuditLog } from '@/lib/audit';
 import { requireRole } from '@/lib/auth';
 import { getDb, getSshKeysDir } from '@/lib/db';
@@ -51,7 +52,7 @@ export async function POST(req: NextRequest) {
       safeName = validateSafeSshKeyName(rawName);
     } catch (err) {
       return NextResponse.json(
-        { error: (err as Error).message },
+        { error: sanitizeErrorMessage(err, 'Tên định danh SSH Key không hợp lệ.') },
         { status: 400 }
       );
     }
@@ -198,9 +199,8 @@ export async function POST(req: NextRequest) {
       detail:
         mode === 'import'
           ? `Nhập khóa SSH "${safeName}" (imported)`
-          : `Sinh cặp khóa SSH mới "${safeName}" (${
-              body.keyType === 'rsa' ? 'rsa' : 'ed25519'
-            })`,
+          : `Sinh cặp khóa SSH mới "${safeName}" (${body.keyType === 'rsa' ? 'rsa' : 'ed25519'
+          })`,
       req,
     });
 
@@ -209,10 +209,7 @@ export async function POST(req: NextRequest) {
       .all();
     return NextResponse.json({ ok: true, keys });
   } catch (err) {
-    return NextResponse.json(
-      { error: (err as Error).message },
-      { status: 500 }
-    );
+    return safeErrorJson(err, 'Không thể tạo hoặc nhập khóa SSH.', 500);
   }
 }
 

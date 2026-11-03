@@ -3,7 +3,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { buildRsyncSshTransport } from '@/lib/ssh';
 import type { ServerRecord } from '@/types';
+import { buildJailedRsyncPath } from './adapters/base';
 import {
+  DETACHED_PROCESS_GROUP,
   RetryableNetworkError,
   STREAM_IDLE_TIMEOUT_MS,
   isJobCancelled,
@@ -11,7 +13,8 @@ import {
   terminateChildGracefully,
 } from './worker-state';
 
-const RETRYABLE_RSYNC_CODES = new Set([10, 12, 23, 30, 35, 255]);
+// N17 Fix: Không retry mã lỗi 23 (partial transfer do quyền/file lỗi trên đĩa, không phải đứt mạng tạm thời)
+const RETRYABLE_RSYNC_CODES = new Set([10, 12, 30, 35, 255]);
 
 export function parseSpeedToBps(speedStr: string): number {
   const m = speedStr.trim().match(/^([\d.]+)\s*([kKmMgGtT]?)[Bb]\/s$/);
@@ -166,18 +169,17 @@ export function runRsyncPullDomain(params: {
   }
 
   args.push('-e', buildRsyncSshTransport(server));
-  args.push('--rsync-path=ionice -c2 -n7 nice -n19 rsync');
+  // S3 Security Fix: Xác minh realpath + cd -P + pwd -P ngay trong cùng phiên thực thi rsync trên VPS và đồng bộ từ `.`
+  args.push(`--rsync-path=${buildJailedRsyncPath(remoteWebroot)}`);
   args.push(
-    `${server.ssh_user || 'root'}@${server.ip_address}:${remoteWebroot.replace(
-      /\/+$/,
-      ''
-    )}/`,
+    `${server.ssh_user || 'root'}@${server.ip_address}:./`,
     `${destPublicHtmlDir.replace(/\/+$/, '')}/`
   );
 
   return new Promise((resolve, reject) => {
     const child = spawn('rsync', args, {
       stdio: ['ignore', 'pipe', 'pipe'],
+      detached: DETACHED_PROCESS_GROUP,
     });
     registerJobChildProcess(jobId, child);
 

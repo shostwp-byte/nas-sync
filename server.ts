@@ -14,15 +14,21 @@ import {
 import { ensureJwtSecret } from './src/lib/jwt-secret';
 import type { UserRole } from './src/types';
 
+// Bảo vệ tiến trình khỏi sập âm thầm khi phát sinh Promise rejection hoặc ngoại lệ bất đồng bộ
+process.on('unhandledRejection', (reason) => {
+  console.error('[NAS-Sync UnhandledRejection]:', reason);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('[NAS-Sync UncaughtException]:', err);
+});
+
 const dev = process.env.NODE_ENV !== 'production';
 const hostname = '0.0.0.0';
 const port = Number(process.env.PORT || 3000);
 
 // Phải chạy trước next()/app.prepare() để Middleware Edge nhận đúng JWT_SECRET
 ensureJwtSecret();
-
-const app = next({ dev, hostname, port });
-const handle = app.getRequestHandler();
 
 function readCookie(header: string | undefined, name: string): string | null {
   if (!header) return null;
@@ -107,7 +113,7 @@ function getUserAuthStateFromDb(
   }
 }
 
-function evaluateApiRbac(
+export function evaluateApiRbac(
   method: string,
   rawPathname: string,
   role: UserRole
@@ -143,7 +149,8 @@ function evaluateApiRbac(
       /^\/api\/jobs\/[^/]+$/.test(p) ||
       p === '/api/schedules' ||
       p === '/api/restore' ||
-      p === '/api/offsite')
+      p === '/api/offsite' ||
+      p === '/api/alerts')
   ) {
     return { allowed: true };
   }
@@ -168,7 +175,8 @@ function evaluateApiRbac(
     (m === 'POST' && p === '/api/jobs') ||
     (m === 'PATCH' && /^\/api\/jobs\/[^/]+$/.test(p)) ||
     (m === 'POST' && p === '/api/schedules/retention') ||
-    (m === 'POST' && p === '/api/offsite')
+    (m === 'POST' && p === '/api/offsite') ||
+    (m === 'POST' && p === '/api/alerts')
   ) {
     if (role === 'ADMIN' || role === 'OPERATOR') {
       return { allowed: true };
@@ -192,6 +200,8 @@ function evaluateApiRbac(
 }
 
 async function bootstrap() {
+  const app = next({ dev, hostname, port });
+  const handle = app.getRequestHandler();
   await app.prepare();
 
   // Khởi tạo Database SQLite & kiểm tra Volume ban đầu
@@ -303,12 +313,10 @@ async function bootstrap() {
   });
 
   // Tích hợp Socket.IO phục vụ cập nhật % tiến trình & Live Terminal Log thời gian thực.
-  // Không bật CORS: giao diện Web cùng origin, cookie phiên được gửi kèm khi bắt tay.
   const io = new SocketIOServer(httpServer, {
     path: '/socket.io',
   });
 
-  // Live log / cảnh báo chứa hostname, đường dẫn & lỗi hệ thống — chỉ phát cho phiên hợp lệ & đúng Origin
   io.use(async (socket, nextFn) => {
     const origin = socket.handshake.headers.origin;
     const rawHost =
@@ -321,19 +329,63 @@ async function bootstrap() {
 
     const token = readCookie(socket.handshake.headers.cookie, SESSION_COOKIE_NAME);
     const session = token ? await verifySessionToken(token) : null;
-    if (
-      !session ||
-      !getUserAuthStateFromDb(session.userId, session.tokenVersion)
-    ) {
+    const liveUser = session
+      ? getUserAuthStateFromDb(session.userId, session.tokenVersion)
+      : null;
+    if (!session || !liveUser) {
       nextFn(new Error('unauthorized'));
       return;
     }
+
+    socket.data.userId = liveUser.id;
+    socket.data.tokenVersion = liveUser.tokenVersion;
+    socket.data.role = liveUser.role;
+    socket.data.sessionExpiresAtMs = session.expiresAtMs;
     nextFn();
   });
 
-  attachSocketIO(io);
+  let lastSocketRevalidateAt = 0;
+  const revalidateActiveSockets = (force = false) => {
+    const now = Date.now();
+    if (!force && now - lastSocketRevalidateAt < 1500) {
+      return;
+    }
+    lastSocketRevalidateAt = now;
+
+    for (const socket of io.sockets.sockets.values()) {
+      const userId = Number(socket.data.userId || 0);
+      const tokenVersion = Number(socket.data.tokenVersion ?? 1);
+      const expiresAtMs = Number(socket.data.sessionExpiresAtMs || 0);
+      if (expiresAtMs > 0 && now >= expiresAtMs) {
+        socket.disconnect(true);
+        continue;
+      }
+      const liveUser = getUserAuthStateFromDb(userId, tokenVersion);
+      if (!liveUser) {
+        socket.disconnect(true);
+        continue;
+      }
+      const prevRole = socket.data.role as UserRole | undefined;
+      if (prevRole !== liveUser.role) {
+        if (prevRole) {
+          void socket.leave(`role:${prevRole}`);
+        }
+        socket.data.role = liveUser.role;
+        void socket.join(`role:${liveUser.role}`);
+      }
+    }
+  };
+
+  const socketSweepTimer = setInterval(() => {
+    revalidateActiveSockets(true);
+  }, 15_000);
+  socketSweepTimer.unref?.();
+
+  attachSocketIO(io, () => revalidateActiveSockets(false));
 
   io.on('connection', (socket) => {
+    const role = (socket.data.role as UserRole | undefined) || 'VIEWER';
+    void socket.join(`role:${role}`);
     socket.emit('engine:connected', {
       serverTime: new Date().toISOString(),
     });
@@ -358,7 +410,9 @@ async function bootstrap() {
   });
 }
 
-bootstrap().catch((err) => {
-  console.error('[NAS-Sync Fatal] Lỗi khởi động hệ thống:', err);
-  process.exit(1);
-});
+if (process.env.NAS_SYNC_SKIP_BOOTSTRAP !== 'true') {
+  bootstrap().catch((err) => {
+    console.error('[NAS-Sync Fatal] Lỗi khởi động hệ thống:', err);
+    process.exit(1);
+  });
+}

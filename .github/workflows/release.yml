@@ -1,4 +1,4 @@
-name: Release — Package Synology NAS Bundle & GHCR Image
+name: Release — Package Signed Multi-NAS Bundle & GHCR Image
 
 on:
   push:
@@ -6,56 +6,132 @@ on:
       - 'v*.*.*'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  release:
-    name: Build & Attach Synology Deployment Archives
+  build:
+    name: Test, Build & Package Release Artifacts (Isolated Read-Only)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Checkout repository (no persisted credentials)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Setup Node.js 24
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '24'
           cache: 'npm'
 
-      - name: Install dependencies, run tests & verify build
+      - name: Install dependencies, lint, typecheck, test & build
         run: |
           npm ci
+          npm run lint
           npm run typecheck
           npm test
           npm run build
 
-      - name: Package Synology ZIP, TAR.GZ & Prebuilt SHA-256 bundles
+      - name: Package Multi-NAS ZIP, TAR.GZ & Prebuilt SHA-256 bundles
         run: |
           sudo apt-get update && sudo apt-get install -y zip
-          npm run pack:synology
+          npm run pack:release
           node scripts/package-prebuilt.mjs
 
-      - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
+      - name: Upload unsigned release bundle artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: nas-sync-release-bundle
+          path: |
+            release/nas-sync-bundle.zip
+            release/nas-sync-bundle.zip.sha256
+            release/nas-sync-bundle.tar.gz
+            release/nas-sync-bundle.tar.gz.sha256
+            release/nas-sync-prebuilt.tar.gz
+            release/nas-sync-prebuilt.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 3
+
+  publish:
+    name: Sign Ed25519 Release & Publish to GitHub Releases
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Setup Node.js 24 (clean runner, no npm install)
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+
+      - name: Download verified build artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: nas-sync-release-bundle
+          path: release
+
+      - name: Verify SHA-256 & Sign Prebuilt Bundle with Ed25519
+        env:
+          RELEASE_SIGNING_PRIVATE_KEY: ${{ secrets.RELEASE_SIGNING_PRIVATE_KEY }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        run: |
+          node -e '
+            const crypto = require("node:crypto");
+            const fs = require("node:fs");
+            const expectedPubPem = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEApSztKo5UUyVAV5hfAmATSIyCR6Teo3PDUEkE4HXi30Q=\n-----END PUBLIC KEY-----";
+            const cleanTag = String(process.env.GITHUB_REF_NAME || "").trim().replace(/^refs\/tags\//i, "").replace(/^v/i, "");
+            if (!/^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$/.test(cleanTag)) {
+              throw new Error("Invalid release tag: " + process.env.GITHUB_REF_NAME);
+            }
+            const tarBytes = fs.readFileSync("release/nas-sync-prebuilt.tar.gz");
+            const actualSha = crypto.createHash("sha256").update(tarBytes).digest("hex").toLowerCase();
+            const recordedSha = fs.readFileSync("release/nas-sync-prebuilt.tar.gz.sha256", "utf8").trim().split(/\s+/)[0].toLowerCase();
+            if (actualSha !== recordedSha) {
+              throw new Error("SHA-256 mismatch between prebuilt archive and .sha256 file!");
+            }
+            const rawPriv = String(process.env.RELEASE_SIGNING_PRIVATE_KEY || "").replace(/\\n/g, "\n").trim();
+            if (!rawPriv) {
+              throw new Error("Missing RELEASE_SIGNING_PRIVATE_KEY secret in GitHub Repository Settings -> Secrets and variables -> Actions.");
+            }
+            const payload = Buffer.from("nas-sync-release-v1|" + cleanTag + "|" + actualSha, "utf8");
+            const sig = crypto.sign(null, payload, crypto.createPrivateKey(rawPriv));
+            if (!crypto.verify(null, payload, crypto.createPublicKey(expectedPubPem), sig)) {
+              throw new Error("Generated Ed25519 signature does not match embedded public key!");
+            }
+            fs.writeFileSync("release/nas-sync-prebuilt.tar.gz.sig", sig.toString("base64") + "\n", "utf8");
+            console.log("Signed Ed25519 release payload for v" + cleanTag + " (" + actualSha + ")");
+          '
+
+      - name: Publish Signed GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           generate_release_notes: true
           files: |
-            release/nas-sync-synology.zip
-            release/nas-sync-synology.tar.gz
+            release/nas-sync-bundle.zip
+            release/nas-sync-bundle.zip.sha256
+            release/nas-sync-bundle.tar.gz
+            release/nas-sync-bundle.tar.gz.sha256
             release/nas-sync-prebuilt.tar.gz
             release/nas-sync-prebuilt.tar.gz.sha256
+            release/nas-sync-prebuilt.tar.gz.sig
 
   docker-ghcr:
     name: Build & Push Multi-Arch GHCR Docker Image (amd64 + arm64)
+    needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Checkout repository (no persisted credentials)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Extract clean release version
         id: ver
@@ -65,20 +141,20 @@ jobs:
           echo "clean=${CLEAN_VER}" >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Log in to GitHub Container Registry (GHCR)
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push Multi-Arch GHCR image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           push: true

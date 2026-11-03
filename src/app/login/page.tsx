@@ -83,7 +83,7 @@ export default function LoginPage() {
             NAS-SYNC PLATFORM
           </h1>
           <p className="text-xs text-slate-400 mt-1">
-            Hệ thống Sao lưu & Khôi phục Tập trung trên Synology NAS (Open Source)
+            Hệ thống Sao lưu &amp; Khôi phục Tập trung Đa Nền tảng NAS (Open Source)
           </p>
         </div>
 

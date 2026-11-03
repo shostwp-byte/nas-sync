@@ -1,5 +1,6 @@
 import cron from 'node-cron';
 import { NextRequest, NextResponse } from 'next/server';
+import { safeErrorJson } from '@/lib/api-error';
 import { requireRole } from '@/lib/auth';
 import { getDb } from '@/lib/db';
 import {
@@ -141,10 +142,7 @@ export async function PATCH(
     reloadCronSchedules();
     return NextResponse.json({ ok: true });
   } catch (err) {
-    return NextResponse.json(
-      { error: (err as Error).message },
-      { status: 500 }
-    );
+    return safeErrorJson(err, 'Không thể cập nhật lịch sao lưu.', 500);
   }
 }
 
@@ -190,10 +188,7 @@ export async function POST(
 
     return NextResponse.json({ ok: true, jobIds });
   } catch (err) {
-    return NextResponse.json(
-      { error: (err as Error).message },
-      { status: 500 }
-    );
+    return safeErrorJson(err, 'Không thể cập nhật lịch sao lưu.', 500);
   }
 }
 
@@ -201,12 +196,15 @@ export async function DELETE(
   _req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const guard = await requireRole(['ADMIN']);
-  if (!guard.ok) return guard.response;
+  try {
+    const guard = await requireRole(['ADMIN']);
+    if (!guard.ok) return guard.response;
 
-  const { id } = await params;
-  getDb().prepare('DELETE FROM backup_schedules WHERE id = ?').run(Number(id));
-  reloadCronSchedules();
-  return NextResponse.json({ ok: true });
+    const { id } = await params;
+    getDb().prepare('DELETE FROM backup_schedules WHERE id = ?').run(Number(id));
+    reloadCronSchedules();
+    return NextResponse.json({ ok: true });
+  } catch (err) {
+    return safeErrorJson(err, 'Không thể xóa lịch sao lưu.', 500);
+  }
 }
-

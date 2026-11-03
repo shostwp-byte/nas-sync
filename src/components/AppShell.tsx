@@ -31,7 +31,7 @@ import { useRealtime } from './SocketProvider';
 const NAV_ITEMS = [
   { href: '/', label: 'Tổng quan NOC', icon: LayoutDashboard },
   { href: '/servers', label: 'Máy chủ VPS & SSH', icon: Server },
-  { href: '/volumes', label: 'Phân vùng Synology', icon: HardDrive },
+  { href: '/volumes', label: 'Phân vùng Lưu trữ', icon: HardDrive },
   { href: '/jobs', label: 'Tiến trình & Lịch sử', icon: Activity },
   { href: '/schedules', label: 'Lập lịch & GFS', icon: CalendarClock },
   { href: '/restore', label: 'Khôi phục & Di chuyển', icon: RotateCcw },
@@ -214,7 +214,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                 </span>
               </div>
               <div className="text-[11px] text-slate-400 truncate">
-                Synology Agentless Pull
+                Multi-NAS Agentless Pull
               </div>
             </div>
           </Link>
@@ -384,7 +384,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                 </span>
               </h1>
               <p className="text-xs text-slate-400 hidden md:block truncate">
-                DirectAdmin • cPanel • Plesk • aaPanel • CyberPanel • HestiaCP • CloudPanel ➔ Synology NAS
+                DirectAdmin • cPanel • Plesk • aaPanel • CyberPanel • HestiaCP • CloudPanel ➔ Multi-NAS &amp; Docker Storage
               </p>
             </div>
           </div>

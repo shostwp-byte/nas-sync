@@ -1,6 +1,8 @@
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import type { Readable, Transform } from 'node:stream';
+import zlib from 'node:zlib';
 import { getDataDir, getDb } from '@/lib/db';
 import { emitJobLog, emitJobProgress, emitJobUpdated } from '@/lib/events';
 import { createSystemAlert } from '@/lib/notifications';
@@ -23,6 +25,7 @@ import type {
 } from '@/types';
 import { getPanelAdapter } from './adapters';
 import {
+  buildJailedRsyncPath,
   buildMysqlAuthFlags,
   buildRemoteMysqlEnvPrelude,
   verifyRemoteWebrootSafety,
@@ -37,7 +40,9 @@ import {
   isSafeSystemUser,
   isSafeWebroot,
 } from './safe-names';
+import { acquireSnapshotReadPin } from './snapshot-pins';
 import {
+  DETACHED_PROCESS_GROUP,
   clearCancelledJob,
   isJobCancelled,
   registerJobChildProcess,
@@ -45,6 +50,7 @@ import {
 } from './worker-state';
 
 const RESTORE_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
+const RESTORE_PERMISSION_FIX_TIMEOUT_MS = 15 * 60 * 1000;
 
 function pushFilesViaRsync(params: {
   jobId: number;
@@ -69,6 +75,7 @@ function pushFilesViaRsync(params: {
     '--no-devices',
     '--no-specials',
     '--safe-links',
+    '--no-keep-dirlinks',
     '--info=progress2',
     '--timeout=60',
   ];
@@ -84,16 +91,18 @@ function pushFilesViaRsync(params: {
     args.push(`--bwlimit=${targetServer.bw_limit_kbps}`);
   }
   args.push('-e', buildRsyncSshTransport(targetServer));
-  args.push('--rsync-path=ionice -c2 -n7 nice -n19 rsync');
+  // S3 Security Fix: Ghim inode thư mục webroot đích bằng realpath + cd -P + pwd -P ngay trong phiên rsync
+  args.push(`--rsync-path=${buildJailedRsyncPath(targetWebroot)}`);
   args.push(
     `${localPublicHtmlDir.replace(/\/+$/, '')}/`,
-    `${targetServer.ssh_user || 'root'}@${
-      targetServer.ip_address
-    }:${targetWebroot.replace(/\/+$/, '')}/`
+    `${targetServer.ssh_user || 'root'}@${targetServer.ip_address}:./`
   );
 
   return new Promise((resolve, reject) => {
-    const child = spawn('rsync', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn('rsync', args, {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      detached: DETACHED_PROCESS_GROUP,
+    });
     registerJobChildProcess(jobId, child);
     let stderr = '';
     let lastActivityAt = Date.now();
@@ -159,80 +168,179 @@ function streamRestoreDatabaseOverSsh(params: {
 
   return new Promise((resolve, reject) => {
     const ext = path.extname(dumpFilePath).toLowerCase();
-    const decompCmd =
-      ext === '.zst' ? 'zstd -dc' : ext === '.gz' ? 'gzip -dc' : 'cat';
-
     const authFlags = buildMysqlAuthFlags(creds);
     const envPrelude = buildRemoteMysqlEnvPrelude(creds);
 
-    const remoteInner = `${envPrelude}mysql ${authFlags} ${shellSingleQuote(targetDbName)}`;
+    // S1 Security Fix: --binary-mode chặn đứng 100% meta-command `\! <shell>` thực thi lệnh root trên VPS đích
+    const remoteInner = `${envPrelude}mysql --binary-mode ${authFlags} ${shellSingleQuote(targetDbName)}`;
     const remoteMysqlCmd = `bash -o pipefail -c ${shellSingleQuote(remoteInner)}`;
-    const pipeline = `set -o pipefail; dump="$1"; shift; ${decompCmd} -- "$dump" | ssh "$@"`;
 
-    const child = spawn(
-      'bash',
+    // N2 & N5 Fix: Không dùng `bash -c "... | ssh"`, nối trực tiếp stream giải nén trong Node sang ssh.stdin
+    // và ghi nhận từng khối byte đọc từ file dump là hoạt động sống (tránh Idle Timeout giả khi import > 30 phút)
+    const sshChild = spawn(
+      'ssh',
       [
-        '-c',
-        pipeline,
-        'restore-db',
-        dumpFilePath,
         ...buildSshBaseArgs(targetServer),
         '--',
         `${targetServer.ssh_user || 'root'}@${targetServer.ip_address}`,
         remoteMysqlCmd,
       ],
       {
-        stdio: ['ignore', 'pipe', 'pipe'],
+        stdio: ['pipe', 'pipe', 'pipe'],
+        detached: DETACHED_PROCESS_GROUP,
       }
     );
-    registerJobChildProcess(jobId, child);
+    registerJobChildProcess(jobId, sshChild);
 
+    const zlibWithZstd = zlib as typeof zlib & {
+      createZstdDecompress?: () => Transform;
+    };
+
+    let sourceStream: Readable | null = null;
+    let zstdFallbackChild: ReturnType<typeof spawn> | null = null;
+    let decompError: Error | null = null;
     let stderr = '';
     let lastActivityAt = Date.now();
     let idleTimedOut = false;
+    let settled = false;
+
+    const cleanupStreams = () => {
+      try {
+        sourceStream?.destroy();
+      } catch {
+        // Ignore
+      }
+      if (zstdFallbackChild) {
+        terminateChildGracefully(zstdFallbackChild);
+      }
+    };
+
+    const finish = (err?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearInterval(watcher);
+      cleanupStreams();
+      if (err) reject(err);
+      else resolve();
+    };
 
     const watcher = setInterval(() => {
       if (isJobCancelled(jobId)) {
-        terminateChildGracefully(child);
+        cleanupStreams();
+        terminateChildGracefully(sshChild);
         return;
       }
       if (Date.now() - lastActivityAt > RESTORE_IDLE_TIMEOUT_MS) {
         idleTimedOut = true;
-        terminateChildGracefully(child);
+        cleanupStreams();
+        terminateChildGracefully(sshChild);
       }
     }, 3000);
 
-    child.stdout.on('data', () => {
+    try {
+      if (ext === '.zst' && typeof zlibWithZstd.createZstdDecompress !== 'function') {
+        zstdFallbackChild = spawn('zstd', ['-dc', '--', dumpFilePath], {
+          stdio: ['ignore', 'pipe', 'pipe'],
+          detached: DETACHED_PROCESS_GROUP,
+        });
+        registerJobChildProcess(jobId, zstdFallbackChild);
+        zstdFallbackChild.stderr?.on('data', (d: Buffer) => {
+          stderr += d.toString('utf8');
+        });
+        zstdFallbackChild.on('error', (err) => {
+          decompError = err;
+          terminateChildGracefully(sshChild);
+        });
+        zstdFallbackChild.on('close', (zCode) => {
+          if (zCode !== 0 && !isJobCancelled(jobId) && !idleTimedOut) {
+            decompError = new Error(`Giải nén zstd thất bại (code ${zCode}).`);
+            terminateChildGracefully(sshChild);
+          }
+        });
+        sourceStream = zstdFallbackChild.stdout!;
+      } else {
+        const rawRead = fs.createReadStream(dumpFilePath);
+        rawRead.on('data', () => {
+          lastActivityAt = Date.now();
+        });
+        rawRead.on('error', (err) => {
+          decompError = err;
+          terminateChildGracefully(sshChild);
+        });
+
+        if (ext === '.zst') {
+          const zst = zlibWithZstd.createZstdDecompress!();
+          zst.on('error', (err) => {
+            decompError = err;
+            rawRead.destroy();
+            terminateChildGracefully(sshChild);
+          });
+          rawRead.pipe(zst);
+          sourceStream = zst;
+        } else if (ext === '.gz') {
+          const gunzip = zlib.createGunzip();
+          gunzip.on('error', (err) => {
+            decompError = err;
+            rawRead.destroy();
+            terminateChildGracefully(sshChild);
+          });
+          rawRead.pipe(gunzip);
+          sourceStream = gunzip;
+        } else {
+          sourceStream = rawRead;
+        }
+      }
+
+      sourceStream.on('data', () => {
+        lastActivityAt = Date.now();
+      });
+      sshChild.stdin.on('error', () => {
+        // Sẽ được xử lý ở sự kiện close/error của sshChild
+      });
+      sourceStream.pipe(sshChild.stdin);
+    } catch (initErr) {
+      terminateChildGracefully(sshChild);
+      finish(initErr as Error);
+      return;
+    }
+
+    sshChild.stdout.on('data', () => {
       lastActivityAt = Date.now();
     });
-    child.stderr.on('data', (d: Buffer) => {
+    sshChild.stderr.on('data', (d: Buffer) => {
       lastActivityAt = Date.now();
       stderr += d.toString('utf8');
       if (stderr.length > 65536) {
         stderr = stderr.slice(-32768);
       }
     });
-    child.on('error', (err) => {
-      clearInterval(watcher);
-      reject(err);
+    sshChild.on('error', (err) => {
+      finish(err);
     });
-    child.on('close', (code) => {
-      clearInterval(watcher);
+    sshChild.on('close', (code) => {
       if (isJobCancelled(jobId)) {
-        reject(new Error('Job khôi phục đã bị hủy bởi quản trị viên.'));
+        finish(new Error('Job khôi phục đã bị hủy bởi quản trị viên.'));
         return;
       }
       if (idleTimedOut) {
-        reject(
+        finish(
           new Error(
             `Nạp Database ${targetDbName} quá thời gian chờ 30 phút (Idle Timeout).`
           )
         );
         return;
       }
-      if (code === 0) resolve();
+      if (decompError) {
+        finish(
+          new Error(
+            `Lỗi đọc/giải nén tệp SQL cho "${targetDbName}": ${decompError.message}`
+          )
+        );
+        return;
+      }
+      if (code === 0) finish();
       else
-        reject(
+        finish(
           new Error(
             `Nạp Database ${targetDbName} thất bại (code ${code}): ${stderr.trim()}`
           )
@@ -327,9 +435,14 @@ export async function executeRestoreJob(jobId: number): Promise<void> {
   };
 
   db.prepare(
-    `UPDATE backup_jobs SET status = 'RUNNING', started_at = datetime('now') WHERE id = ?`
+    `UPDATE backup_jobs SET status = 'RUNNING', started_at = COALESCE(started_at, datetime('now')) WHERE id = ?`
   ).run(jobId);
   emitJobUpdated(jobId);
+
+  const releaseSnapshotPin = acquireSnapshotReadPin(
+    item.server_id,
+    item.snapshot_name
+  );
 
   try {
     if (isJobCancelled(jobId)) {
@@ -363,7 +476,7 @@ export async function executeRestoreJob(jobId: number): Promise<void> {
 
     const targetAdapter = getPanelAdapter(targetServer);
 
-    const resolvedWebroot = assertSafe(
+    let resolvedWebroot = assertSafe(
       (v) => isSafeWebroot(v.replace(/\/+$/, '')),
       payload.targetWebrootOverride?.trim() ||
         (await targetAdapter.resolveTargetWebroot(
@@ -410,12 +523,6 @@ export async function executeRestoreJob(jobId: number): Promise<void> {
         : `♻️ Bắt đầu Khôi phục dữ liệu (${payload.mode}) cho ${targetDomain} về ${targetServer.hostname} (${targetServer.panel_type})`
     );
 
-    const permCmd = targetAdapter.buildPermissionFixCommand(
-      targetUser,
-      targetDomain,
-      resolvedWebroot
-    );
-
     const mockRestoreDest = path.join(
       getDataDir(),
       'restored_preview',
@@ -442,6 +549,11 @@ export async function executeRestoreJob(jobId: number): Promise<void> {
       );
 
       if (targetServer.is_mock) {
+        const mockPermCmd = targetAdapter.buildPermissionFixCommand(
+          targetUser,
+          targetDomain,
+          resolvedWebroot
+        );
         await new Promise((r) => setTimeout(r, 450));
         fs.mkdirSync(mockRestoreDest, { recursive: true });
         fs.cpSync(localPublicHtml, mockRestoreDest, {
@@ -451,27 +563,71 @@ export async function executeRestoreJob(jobId: number): Promise<void> {
         setStep(55, `Đang chuẩn hóa phân quyền ${targetServer.panel_type}...`);
         await new Promise((r) => setTimeout(r, 300));
         appendLog(
-          `[Permissions] Đã thực thi chuẩn hóa quyền trên ${targetServer.panel_type}: ${permCmd}`
+          `[Permissions] Đã thực thi chuẩn hóa quyền trên ${targetServer.panel_type}: ${mockPermCmd}`
         );
       } else {
-        const safety = await verifyRemoteWebrootSafety(
+        const preSafety = await verifyRemoteWebrootSafety(
           targetServer,
           targetServer.panel_type,
           targetUser,
           resolvedWebroot,
-          { mustExist: false }
+          {
+            mustExist: false,
+            expectedDomain: targetDomain,
+            parentDomain: item.parent_domain || undefined,
+          }
         );
-        if (!safety.ok) {
+        if (!preSafety.ok) {
           throw new Error(
-            `[SECURITY] Từ chối khôi phục mã nguồn vào đường dẫn không an toàn (${resolvedWebroot}): ${safety.reason}`
+            `[SECURITY] Từ chối khôi phục mã nguồn vào đường dẫn không an toàn (${resolvedWebroot}): ${preSafety.reason}`
           );
         }
 
-        await execRemoteSSH(
+        // Tạo thư mục webroot an toàn: không đi qua symlink ở các thành phần tồn tại và ưu tiên tạo dưới quyền user của site
+        const safeMkdirScript = [
+          'set -e',
+          `TARGET=${shellSingleQuote(resolvedWebroot)}`,
+          `SITE_USER=${shellSingleQuote(targetUser)}`,
+          '[ ! -L "$TARGET" ] || exit 91',
+          'if [ ! -d "$TARGET" ]; then',
+          '  if [ "$SITE_USER" != "root" ] && [ "$(id -u)" = "0" ] && id -u "$SITE_USER" >/dev/null 2>&1; then',
+          '    if command -v runuser >/dev/null 2>&1; then',
+          '      runuser -u "$SITE_USER" -- mkdir -p -- "$TARGET" 2>/dev/null || mkdir -p -- "$TARGET"',
+          '    else',
+          '      su -s /bin/sh "$SITE_USER" -c \'mkdir -p -- "$1"\' sh "$TARGET" 2>/dev/null || mkdir -p -- "$TARGET"',
+          '    fi',
+          '  else',
+          '    mkdir -p -- "$TARGET"',
+          '  fi',
+          'fi',
+        ].join('\n');
+        const mkdirRes = await execRemoteSSH(targetServer, safeMkdirScript, {
+          zeroImpact: true,
+        });
+        if (mkdirRes.code !== 0) {
+          throw new Error(
+            `Không thể tạo hoặc xác minh thư mục webroot đích ${resolvedWebroot} (code ${mkdirRes.code}): ${mkdirRes.stderr.trim()}`
+          );
+        }
+
+        const liveSafety = await verifyRemoteWebrootSafety(
           targetServer,
-          `mkdir -p ${shellSingleQuote(resolvedWebroot)}`,
-          { zeroImpact: true }
+          targetServer.panel_type,
+          targetUser,
+          resolvedWebroot,
+          {
+            mustExist: true,
+            expectedDomain: targetDomain,
+            parentDomain: item.parent_domain || undefined,
+          }
         );
+        if (!liveSafety.ok) {
+          throw new Error(
+            `[SECURITY] Từ chối khôi phục mã nguồn sau khi xác minh đường dẫn thực tế (${resolvedWebroot}): ${liveSafety.reason}`
+          );
+        }
+        resolvedWebroot = liveSafety.resolvedPath;
+
         if (savedExcludedSubpaths.length > 0) {
           appendLog(
             `[Safe Restore] Bảo vệ thư mục Subdomain lồng bên trong (${savedExcludedSubpaths
@@ -491,9 +647,16 @@ export async function executeRestoreJob(jobId: number): Promise<void> {
               `Đang đồng bộ mã nguồn (${p}%)...`
             ),
         });
+        const permCmd = targetAdapter.buildPermissionFixCommand(
+          targetUser,
+          targetDomain,
+          resolvedWebroot
+        );
         setStep(58, `Đang gán quyền chủ sở hữu (${targetServer.panel_type})...`);
+        // N11 Fix: Cấp timeout 15 phút cho chown/chmod trên webroot dung lượng lớn dưới nice/ionice
         const chownRes = await execRemoteSSH(targetServer, permCmd, {
           zeroImpact: true,
+          timeoutMs: RESTORE_PERMISSION_FIX_TIMEOUT_MS,
         });
         if (chownRes.code !== 0) {
           appendLog(
@@ -638,8 +801,14 @@ export async function executeRestoreJob(jobId: number): Promise<void> {
 
       if (patchRes.patchedFiles.length > 0) {
         if (!targetServer.is_mock) {
-          const reChown = await execRemoteSSH(targetServer, permCmd, {
+          const postPatchPermCmd = targetAdapter.buildPermissionFixCommand(
+            targetUser,
+            targetDomain,
+            resolvedWebroot
+          );
+          const reChown = await execRemoteSSH(targetServer, postPatchPermCmd, {
             zeroImpact: true,
+            timeoutMs: RESTORE_PERMISSION_FIX_TIMEOUT_MS,
           });
           if (reChown.code !== 0) {
             appendLog(
@@ -712,6 +881,7 @@ export async function executeRestoreJob(jobId: number): Promise<void> {
     emitJobUpdated(jobId);
     throw err;
   } finally {
+    releaseSnapshotPin();
     clearCancelledJob(jobId);
   }
 }

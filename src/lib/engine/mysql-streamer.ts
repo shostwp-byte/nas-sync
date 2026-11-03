@@ -1,6 +1,7 @@
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcessByStdio } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import type { Readable } from 'node:stream';
 import { buildSshBaseArgs, shellSingleQuote } from '@/lib/ssh';
 import type { MysqlAdminCredentials, ServerRecord } from '@/types';
 import {
@@ -8,6 +9,7 @@ import {
   buildRemoteMysqlEnvPrelude,
 } from './adapters/base';
 import {
+  DETACHED_PROCESS_GROUP,
   RetryableNetworkError,
   STREAM_IDLE_TIMEOUT_MS,
   isJobCancelled,
@@ -43,6 +45,7 @@ export function streamRemoteMysqlDumpToZst(params: {
 
     const probe = spawn('ssh', checkZstdArgs, {
       stdio: ['ignore', 'pipe', 'pipe'],
+      detached: DETACHED_PROCESS_GROUP,
     });
     registerJobChildProcess(jobId, probe);
 
@@ -109,10 +112,24 @@ export function streamRemoteMysqlDumpToZst(params: {
         remoteDumpScript,
       ];
 
-      const outStream = fs.createWriteStream(tmpOutPath);
-      const child = spawn('ssh', sshArgs, {
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
+      // N16 Fix: Bắt lỗi đồng bộ (VD: ENOSPC / EACCES) trong listener 'close' để không làm sập tiến trình Node
+      let outStream: fs.WriteStream;
+      let child: ChildProcessByStdio<null, Readable, Readable>;
+      try {
+        outStream = fs.createWriteStream(tmpOutPath);
+        child = spawn('ssh', sshArgs, {
+          stdio: ['ignore', 'pipe', 'pipe'],
+          detached: DETACHED_PROCESS_GROUP,
+        });
+      } catch (err) {
+        try {
+          fs.rmSync(tmpOutPath, { force: true });
+        } catch {
+          // Ignore cleanup failure
+        }
+        reject(err);
+        return;
+      }
       registerJobChildProcess(jobId, child);
 
       let stderr = '';
@@ -229,17 +246,16 @@ export function streamRemoteMysqlDumpToZst(params: {
         fs.closeSync(fd);
         const validMagic = useZstd
           ? header[0] === 0x28 &&
-            header[1] === 0xb5 &&
-            header[2] === 0x2f &&
-            header[3] === 0xfd
+          header[1] === 0xb5 &&
+          header[2] === 0x2f &&
+          header[3] === 0xfd
           : header[0] === 0x1f && header[1] === 0x8b;
 
         if (!validMagic) {
           fs.rmSync(tmpOutPath, { force: true });
           reject(
             new Error(
-              `Tệp dump DB "${dbName}" không có định dạng nén ${
-                useZstd ? 'Zstandard' : 'Gzip'
+              `Tệp dump DB "${dbName}" không có định dạng nén ${useZstd ? 'Zstandard' : 'Gzip'
               } hợp lệ.`
             )
           );

@@ -911,7 +911,7 @@ export default function DashboardPage() {
             <div className="min-w-0">
               <h3 className="text-sm font-semibold text-white flex items-center gap-2">
                 <HardDrive className="w-4 h-4 text-blue-400 shrink-0" />
-                <span>Trạng thái Đa Phân vùng Synology NAS (Smart Multi-Volume)</span>
+                <span>Trạng thái Đa Phân vùng Lưu trữ NAS (Smart Multi-Volume)</span>
               </h3>
               <p className="text-xs text-slate-400 mt-0.5">
                 Tự động Local Seeding sang Volume kế tiếp khi chạm ngưỡng mà không đứt chuỗi Incremental
@@ -1192,7 +1192,7 @@ export default function DashboardPage() {
           <div className="flex-1 bg-slate-950 border border-slate-800 rounded-xl p-3.5 font-mono text-xs h-56 overflow-y-auto space-y-1">
             {liveLogs.length === 0 ? (
               <div className="text-slate-600 break-words">
-                nas-sync-worker@synology-nas:~$ Đang lắng nghe luồng sự kiện thời gian thực từ Worker...
+                nas-sync-worker@nas-core:~$ Đang lắng nghe luồng sự kiện thời gian thực từ Worker...
               </div>
             ) : (
               liveLogs.map((item, i) => (

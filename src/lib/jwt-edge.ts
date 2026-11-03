@@ -8,6 +8,7 @@ export interface SessionPayload {
   username: string;
   role: UserRole;
   tokenVersion?: number;
+  expiresAtMs?: number;
 }
 
 export function normalizeUserRole(raw: unknown): UserRole {
@@ -55,6 +56,8 @@ export async function verifySessionToken(
       role: normalizeUserRole(payload.role ?? 'ADMIN'),
       tokenVersion:
         typeof payload.tokenVersion === 'number' ? payload.tokenVersion : 1,
+      expiresAtMs:
+        typeof payload.exp === 'number' ? payload.exp * 1000 : undefined,
     };
   } catch {
     return null;

@@ -5,7 +5,7 @@ export default function manifest(): MetadataRoute.Manifest {
     name: 'NAS-Sync — Hệ thống Sao lưu & Khôi phục Đa Máy chủ',
     short_name: 'NAS-Sync',
     description:
-      'Trung tâm điều hành sao lưu VPS Agentless & khôi phục chéo Control Panel trên Synology NAS',
+      'Trung tâm điều hành sao lưu VPS Agentless & khôi phục chéo Control Panel đa nền tảng NAS & Docker',
     start_url: '/',
     scope: '/',
     display: 'standalone',

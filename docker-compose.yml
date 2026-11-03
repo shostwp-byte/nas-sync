@@ -40,8 +40,10 @@ services:
       - NODE_ENV=production
       - TZ=Asia/Ho_Chi_Minh
       - APP_URL=${APP_URL:-http://localhost:3080}
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}
       - DATA_DIR=/app/data
-      - SSH_KEYS_DIR=/root/.ssh
+      - SSH_KEYS_DIR=/app/ssh_keys
       - REDIS_URL=redis://redis:6379
       - SANDBOX_DB_HOST=db_sandbox
       - SANDBOX_DB_PORT=3306
@@ -65,15 +67,19 @@ services:
       - SMTP_PASS=${SMTP_PASS:-}
       - SMTP_FROM=${SMTP_FROM:-noreply@example.com}
       - ALERT_EMAIL_TO=${ALERT_EMAIL_TO:-}
-      - DSM_API_URL=${DSM_API_URL:-}
-      - DSM_USERNAME=${DSM_USERNAME:-}
-      - DSM_PASSWORD=${DSM_PASSWORD:-}
-      - DSM_BACKUP_SHARES=${DSM_BACKUP_SHARES:-VPS_Backups}
+      - WORM_PROVIDER=${WORM_PROVIDER:-NONE}
+      - WORM_API_URL=${WORM_API_URL:-}
+      - WORM_API_KEY=${WORM_API_KEY:-}
+      - WORM_USERNAME=${WORM_USERNAME:-}
+      - WORM_PASSWORD=${WORM_PASSWORD:-}
+      - WORM_TARGET_SHARES=${WORM_TARGET_SHARES:-VPS_Backups}
+      - WORM_WEBHOOK_SECRET=${WORM_WEBHOOK_SECRET:-}
+      - WORM_TLS_VERIFY=${WORM_TLS_VERIFY:-true}
     volumes:
       - ./app_data:/app/data
-      - ./ssh_keys:/root/.ssh
+      - ./ssh_keys:/app/ssh_keys
       - ${NAS_VOL1_PATH:-/volume1/VPS_Backups}:/mnt/vol1
-      # Bỏ dấu # dòng dưới nếu NAS có thêm phân vùng /volume2 thật sự:
+      # Bỏ dấu # dòng dưới nếu NAS có thêm phân vùng lưu trữ thứ 2:
       # - ${NAS_VOL2_PATH:-/volume2/VPS_Backups}:/mnt/vol2
     depends_on:
       redis:

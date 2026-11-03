@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { safeErrorJson } from '@/lib/api-error';
 import { recordAuditLog } from '@/lib/audit';
 import {
   SESSION_COOKIE_NAME,
@@ -83,8 +84,8 @@ export async function PATCH(
       typeof body.password === 'string'
         ? body.password
         : typeof body.newPassword === 'string'
-        ? body.newPassword
-        : '';
+          ? body.newPassword
+          : '';
 
     let nextPasswordHash = String(targetUser.password_hash);
     const passwordChanged = rawNewPassword.length > 0;
@@ -165,10 +166,7 @@ export async function PATCH(
 
     return res;
   } catch (err) {
-    return NextResponse.json(
-      { error: (err as Error).message },
-      { status: 500 }
-    );
+    return safeErrorJson(err, 'Không thể cập nhật tài khoản người dùng.', 500);
   }
 }
 
@@ -235,9 +233,6 @@ export async function DELETE(
 
     return NextResponse.json({ ok: true });
   } catch (err) {
-    return NextResponse.json(
-      { error: (err as Error).message },
-      { status: 500 }
-    );
+    return safeErrorJson(err, 'Không thể cập nhật tài khoản người dùng.', 500);
   }
 }

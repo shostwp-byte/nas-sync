@@ -10,7 +10,11 @@ import {
   isSafeDomain,
   isSafeSystemUser,
 } from '../safe-names';
-import { finalizeDiscoveredDomains, type PanelAdapter } from './base';
+import {
+  buildPinnedCurrentDirPermissionCommand,
+  finalizeDiscoveredDomains,
+  type PanelAdapter,
+} from './base';
 
 export class PleskAdapter implements PanelAdapter {
   readonly panelType = 'PLESK' as const;
@@ -18,19 +22,19 @@ export class PleskAdapter implements PanelAdapter {
   async getMysqlAdminCredentials(
     server: ServerRecord
   ): Promise<MysqlAdminCredentials> {
+    // S11 Security Fix: Chỉ xác minh /etc/psa/.psa.shadow tồn tại, không truyền nội dung shadow về NAS
     const res = await execRemoteSSH(
       server,
-      'if [ -f /etc/psa/.psa.shadow ]; then cat /etc/psa/.psa.shadow; else exit 1; fi',
+      'if [ -f /etc/psa/.psa.shadow ] && [ -r /etc/psa/.psa.shadow ]; then echo OK; else exit 1; fi',
       { zeroImpact: true }
     );
-    if (res.code !== 0) {
+    if (res.code !== 0 || !res.stdout.includes('OK')) {
       throw new Error(
         `Không thể đọc /etc/psa/.psa.shadow trên Plesk ${server.hostname}: ${res.stderr}`
       );
     }
     return {
       user: 'admin',
-      password: res.stdout.trim(),
       remoteAuthPrelude:
         'export MYSQL_PWD="$(tr -d \'\\r\\n\' < /etc/psa/.psa.shadow)"',
     };
@@ -148,10 +152,10 @@ export class PleskAdapter implements PanelAdapter {
   ): string {
     assertSafe(isSafeSystemUser, systemUser, 'systemUser');
     assertSafe(isSafeDomain, domain, 'domain');
-    return `plesk repair fs ${shellSingleQuote(
-      domain
-    )} -y || chown -hR ${shellSingleQuote(`${systemUser}:psacln`)} ${shellSingleQuote(
-      targetWebroot
-    )}`;
+    const pinnedFallback = buildPinnedCurrentDirPermissionCommand(
+      targetWebroot,
+      `chown -hR ${shellSingleQuote(`${systemUser}:psacln`)} .`
+    );
+    return `plesk repair fs ${shellSingleQuote(domain)} -y || (${pinnedFallback})`;
   }
 }

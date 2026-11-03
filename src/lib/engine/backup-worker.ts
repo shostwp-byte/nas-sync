@@ -26,6 +26,7 @@ import { streamRemotePostgresDumpToZst } from './postgres-streamer';
 import { getDirectorySizeAndCount, runRsyncPullDomain } from './rsync-runner';
 import { assertSafe, isSafeDbName, isSafeSnapshotName } from './safe-names';
 import { verifyJobDatabasesInSandbox } from './sandbox-verifier';
+import { acquireSnapshotReadPin } from './snapshot-pins';
 import {
   ensureActiveVolumeForBackup,
   refreshAllVolumes,
@@ -33,7 +34,9 @@ import {
   updateLatestSymlink,
 } from './volume-manager';
 import {
+  MAX_BACKUP_RETRIES,
   RetryableNetworkError,
+  cleanupInProgressSnapshotDirsForJob,
   clearCancelledJob,
   createJobLogger,
   createJobProgressUpdater,
@@ -107,6 +110,8 @@ export async function executeBackupJob(
     server.id
   );
   emitJobUpdated(jobId);
+
+  let snapshotCommitted = false;
 
   try {
     appendLog(
@@ -194,8 +199,7 @@ export async function executeBackupJob(
 
     const subCount = domains.filter((d) => d.isSubdomain).length;
     appendLog(
-      `[Discovery] Tìm thấy ${domains.length} website (${
-        domains.length - subCount
+      `[Discovery] Tìm thấy ${domains.length} website (${domains.length - subCount
       } domain chính/addon, ${subCount} subdomain) trên máy chủ ${server.hostname}.`
     );
 
@@ -321,7 +325,11 @@ export async function executeBackupJob(
               server.panel_type,
               dom.systemUser,
               dom.webroot,
-              { mustExist: true }
+              {
+                mustExist: true,
+                expectedDomain: dom.domain,
+                parentDomain: dom.parentDomain,
+              }
             );
 
             if (!safety.ok) {
@@ -360,12 +368,12 @@ export async function executeBackupJob(
               }
             } else {
               appendLog(
-                `[Rsync] Đồng bộ mã nguồn ${dom.domain} (${dom.webroot})...`
+                `[Rsync] Đồng bộ mã nguồn ${dom.domain} (${safety.resolvedPath})...`
               );
               const syncStats = await runRsyncPullDomain({
                 jobId,
                 server,
-                remoteWebroot: dom.webroot,
+                remoteWebroot: safety.resolvedPath,
                 destPublicHtmlDir,
                 linkDestPublicHtmlDir,
                 excludedSubpaths: dom.excludedSubpaths,
@@ -564,6 +572,7 @@ export async function executeBackupJob(
       fs.rmSync(finalSnapshotDir, { recursive: true, force: true });
     }
     fs.renameSync(inProgressDir, finalSnapshotDir);
+    snapshotCommitted = true;
 
     appendLog(
       `[Atomic Commit] Đã chuyển giao nguyên tử sang ${finalSnapshotDir}.`
@@ -575,58 +584,108 @@ export async function executeBackupJob(
        WHERE id = ?`
     ).run(aggTotalBytes, aggDeltaBytes, aggFilesTotal, aggFilesChanged, jobId);
 
-    // 5. Phân tích bất thường / Ransomware Anomaly Detection (Mục 9.3)
-    const anomalyResult = await evaluateBackupAnomaly({
-      jobId,
-      server,
-      filesTotal: aggFilesTotal,
-      filesChanged: aggFilesChanged,
-      deltaSizeBytes: aggDeltaBytes,
-      isFirstBackup,
-      onLog: appendLog,
-    });
+    // N12 Fix: Mọi bước hậu kiểm sau khi Snapshot đã Atomic Commit đều được cô lập lỗi riêng,
+    // tuyệt đối không đánh FAILED làm ẩn mất bản Snapshot tốt trên đĩa hoặc làm hỏng con trỏ latest.
 
-    // 6. Kiểm thử tính toàn vẹn SQL trên MariaDB Sandbox (Mục 9.2)
+    // 5. Phân tích bất thường / Ransomware Anomaly Detection (Mục 9.3)
+    let anomalyDetected = false;
+    try {
+      const anomalyResult = await evaluateBackupAnomaly({
+        jobId,
+        server,
+        filesTotal: aggFilesTotal,
+        filesChanged: aggFilesChanged,
+        deltaSizeBytes: aggDeltaBytes,
+        isFirstBackup,
+        onLog: appendLog,
+      });
+      anomalyDetected = anomalyResult.anomalyDetected;
+    } catch (anomErr) {
+      appendLog(
+        `[Anomaly Detector] ⚠️ Không thể phân tích bất thường (bản sao lưu vẫn hợp lệ): ${(anomErr as Error).message
+        }`
+      );
+    }
+
+    // 6. Kiểm thử tính toàn vẹn SQL trên MariaDB/PostgreSQL Sandbox (Mục 9.2)
     if (options.verifyDb !== false) {
       updateProgress({
         status: 'VERIFYING',
         progressPercent: 92,
         currentPhase: 'Đang nạp thử kiểm định Database trên Sandbox...',
       });
-      const verifyResults = await verifyJobDatabasesInSandbox(
-        jobId,
-        finalSnapshotDir,
-        appendLog
+      const releaseVerifyPin = acquireSnapshotReadPin(
+        server.id,
+        job.snapshot_name
       );
-      const corruptedDomains = verifyResults.filter(
-        (r) => r.status === 'CORRUPTED'
-      );
-      if (corruptedDomains.length > 0) {
+      try {
+        const verifyResults = await verifyJobDatabasesInSandbox(
+          jobId,
+          finalSnapshotDir,
+          appendLog
+        );
+        const corruptedDomains = verifyResults.filter(
+          (r) => r.status === 'CORRUPTED'
+        );
+        if (corruptedDomains.length > 0) {
+          await createSystemAlert({
+            severity: 'WARNING',
+            category: 'BACKUP',
+            title: `Phát hiện ${corruptedDomains.length} domain lỗi kiểm định trên ${server.hostname}`,
+            message: `Job #${jobId} (${job.snapshot_name}) ghi nhận lỗi kiểm định toàn vẹn: ${corruptedDomains
+              .map((c) => `${c.domainName} (${c.detail})`)
+              .join('; ')}`,
+            serverId: server.id,
+            jobId,
+          });
+        }
+      } catch (verifyErr) {
+        const verifyMsg = (verifyErr as Error).message || 'Lỗi Sandbox không xác định';
+        appendLog(
+          `[Sandbox Verifier] ⚠️ Không thể hoàn tất kiểm định Sandbox (giữ nguyên trạng thái UNTESTED, bản sao lưu đã an toàn): ${verifyMsg}`
+        );
+        db.prepare(
+          `UPDATE backup_items
+           SET verification_detail = COALESCE(verification_detail, ?)
+           WHERE job_id = ? AND verification_status = 'UNTESTED'`
+        ).run(`Sandbox gián đoạn: ${verifyMsg}`, jobId);
         await createSystemAlert({
           severity: 'WARNING',
           category: 'BACKUP',
-          title: `Phát hiện ${corruptedDomains.length} domain lỗi kiểm định trên ${server.hostname}`,
-          message: `Job #${jobId} (${job.snapshot_name}) ghi nhận lỗi kiểm định toàn vẹn: ${corruptedDomains
-            .map((c) => `${c.domainName} (${c.detail})`)
-            .join('; ')}`,
+          title: `Kiểm định Sandbox tạm gián đoạn trên ${server.hostname}`,
+          message: `Bản sao lưu Job #${jobId} (${job.snapshot_name}) đã lưu an toàn nhưng bước kiểm định Sandbox gặp sự cố hạ tầng: ${verifyMsg}`,
           serverId: server.id,
           jobId,
-        });
+        }).catch(() => { });
+      } finally {
+        releaseVerifyPin();
       }
     }
 
-    if (!anomalyResult.anomalyDetected) {
-      await updateLatestSymlink(hostDir, finalSnapshotDir);
-      appendLog(
-        `[Latest Pointer] Đã cập nhật con trỏ symlink latest sang bản sạch ${job.snapshot_name}.`
-      );
+    if (!anomalyDetected) {
+      try {
+        await updateLatestSymlink(hostDir, finalSnapshotDir);
+        appendLog(
+          `[Latest Pointer] Đã cập nhật con trỏ symlink latest sang bản sạch ${job.snapshot_name}.`
+        );
+      } catch (symErr) {
+        appendLog(
+          `[Latest Pointer] ⚠️ Không thể cập nhật con trỏ symlink latest: ${(symErr as Error).message
+          }`
+        );
+      }
     } else {
       appendLog(
         `[Ransomware Guard] ⚠️ Phát hiện dấu hiệu bất thường — Giữ nguyên symlink latest ở bản sạch trước đó (không trỏ sang ${job.snapshot_name}) để bảo vệ chuỗi Incremental Hard-Link & Quick Restore.`
       );
     }
 
-    await refreshAllVolumes();
+    await refreshAllVolumes().catch((volErr) => {
+      appendLog(
+        `[Volume Refresh] ⚠️ Cảnh báo làm mới thống kê dung lượng: ${(volErr as Error).message
+        }`
+      );
+    });
 
     db.prepare(
       `UPDATE backup_jobs
@@ -694,8 +753,7 @@ export async function executeBackupJob(
         );
       } catch (offsiteErr) {
         appendLog(
-          `☁️ [Offsite Cloud] ⚠️ Cảnh báo đồng bộ Cloud (bản sao lưu nội bộ trên NAS vẫn an toàn): ${
-            (offsiteErr as Error).message
+          `☁️ [Offsite Cloud] ⚠️ Cảnh báo đồng bộ Cloud (bản sao lưu nội bộ trên NAS vẫn an toàn): ${(offsiteErr as Error).message
           }`
         );
       }
@@ -713,22 +771,40 @@ export async function executeBackupJob(
       );
     }
 
-    if (err instanceof RetryableNetworkError) {
-      const nextRetry = job.retry_count + 1;
-      appendLog(
-        `⚠️ Gián đoạn kết nối mạng: ${err.message}. Hệ thống lưu trạng thái .state.json và chuyển sang INTERRUPTED để tự động nối tiếp (Lần thử ${nextRetry}/10).`
+    if (err instanceof RetryableNetworkError && !snapshotCommitted) {
+      const freshRetryRow = db
+        .prepare('SELECT retry_count FROM backup_jobs WHERE id = ?')
+        .get(jobId);
+      const currentRetryCount = Number(
+        freshRetryRow?.retry_count ?? job.retry_count ?? 0
       );
-      db.prepare(
-        `UPDATE backup_jobs
-         SET status = 'INTERRUPTED', current_phase = 'Mất kết nối — Đang chờ tự động Resume...',
-             speed_bps = 0, retry_count = ?, error_log = ?
-         WHERE id = ?`
-      ).run(nextRetry, err.message, jobId);
-      db.prepare(`UPDATE servers SET status = 'ONLINE' WHERE id = ?`).run(
-        server.id
+      const nextRetry = currentRetryCount + 1;
+
+      if (nextRetry <= MAX_BACKUP_RETRIES) {
+        appendLog(
+          `⚠️ Gián đoạn kết nối mạng: ${err.message}. Hệ thống lưu trạng thái .state.json và chuyển sang INTERRUPTED để tự động nối tiếp (Lần thử ${nextRetry}/${MAX_BACKUP_RETRIES}).`
+        );
+        db.prepare(
+          `UPDATE backup_jobs
+           SET status = 'INTERRUPTED', current_phase = 'Mất kết nối — Đang chờ tự động Resume...',
+               speed_bps = 0, retry_count = ?, error_log = ?
+           WHERE id = ?`
+        ).run(nextRetry, err.message, jobId);
+        db.prepare(`UPDATE servers SET status = 'ONLINE' WHERE id = ?`).run(
+          server.id
+        );
+        emitJobUpdated(jobId);
+        throw err;
+      }
+
+      // N4 Fix: Đã cạn toàn bộ 10 lượt retry -> chuyển hẳn sang FAILED, dọn .in_progress và phát cảnh báo CRITICAL
+      db.prepare('UPDATE backup_jobs SET retry_count = ? WHERE id = ?').run(
+        nextRetry,
+        jobId
       );
-      emitJobUpdated(jobId);
-      throw err;
+      err = new Error(
+        `Đã vượt quá giới hạn ${MAX_BACKUP_RETRIES} lần tự động thử lại do mất kết nối liên tục: ${err.message}`
+      );
     }
 
     const finalStatus = isJobCancelled(jobId) ? 'CANCELLED' : 'FAILED';
@@ -746,6 +822,11 @@ export async function executeBackupJob(
       errMsg,
       jobId
     );
+
+    // N6 Fix: Dọn dẹp thư mục .in_progress_<snapshot> khi job kết thúc ở trạng thái FAILED hoặc CANCELLED
+    if (!snapshotCommitted) {
+      cleanupInProgressSnapshotDirsForJob(jobId);
+    }
 
     db.prepare(`UPDATE servers SET status = ? WHERE id = ?`).run(
       finalStatus === 'CANCELLED' ? 'ONLINE' : 'ERROR',

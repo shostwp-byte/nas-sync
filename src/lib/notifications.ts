@@ -5,7 +5,7 @@ import type { SystemAlert } from '@/types';
 
 export interface CreateAlertInput {
   severity: 'INFO' | 'WARNING' | 'CRITICAL';
-  category: 'VOLUME' | 'ANOMALY' | 'BACKUP' | 'RESTORE' | 'BTRFS' | 'SYSTEM';
+  category: 'VOLUME' | 'ANOMALY' | 'BACKUP' | 'RESTORE' | 'BTRFS' | 'WORM' | 'SYSTEM';
   title: string;
   message: string;
   serverId?: number | null;
@@ -50,7 +50,20 @@ export async function createSystemAlert(input: CreateAlertInput): Promise<System
   emitNewAlert(alert);
 
   if (input.notifyExternal !== false && input.severity !== 'INFO') {
-    void dispatchExternalNotifications(alert);
+    void dispatchExternalNotifications(alert)
+      .then((res) => {
+        if (res.errors.length > 0) {
+          console.warn(
+            `[Notifications] Gửi cảnh báo ngoại vi gặp lỗi (${alert.category}/${alert.severity}): ${res.errors.join(' | ')}`
+          );
+        }
+      })
+      .catch((err) => {
+        console.warn(
+          '[Notifications] Lỗi không mong đợi khi gửi cảnh báo ngoại vi:',
+          (err as Error).message
+        );
+      });
   }
 
   return alert;
@@ -143,9 +156,8 @@ export async function detectTelegramChatId(rawBotToken: string): Promise<{
       return {
         ok: false,
         botUsername,
-        error: `Không đọc được danh sách hội thoại từ ${botUsername}: ${
-          updJson.description || `HTTP ${updResp.status}`
-        }`,
+        error: `Không đọc được danh sách hội thoại từ ${botUsername}: ${updJson.description || `HTTP ${updResp.status}`
+          }`,
       };
     }
 
@@ -218,8 +230,8 @@ export async function dispatchExternalNotifications(alert: {
     alert.severity === 'CRITICAL'
       ? '🚨'
       : alert.severity === 'WARNING'
-      ? '⚠️'
-      : '✅';
+        ? '⚠️'
+        : '✅';
 
   // 1. Telegram Notification
   const botToken = getSetting('telegram_bot_token').trim().replace(/^bot/i, '');
@@ -234,11 +246,17 @@ export async function dispatchExternalNotifications(alert: {
       );
     } else {
       try {
-        const text = `${icon} <b>[NAS-Sync - ${escapeHtml(
+        const headerHtml = `${icon} <b>[NAS-Sync - ${escapeHtml(
           alert.category
-        )}]</b>\n<b>${escapeHtml(alert.title)}</b>\n\n${escapeHtml(
-          alert.message
-        )}\n\n🕒 ${new Date().toLocaleString('vi-VN')}`;
+        )}]</b>\n<b>${escapeHtml(
+          String(alert.title || '').slice(0, 220)
+        )}</b>\n\n`;
+        const footerHtml = `\n\n🕒 ${new Date().toLocaleString('vi-VN')}`;
+        const text = buildSafeTelegramHtmlPayload(
+          headerHtml,
+          alert.message,
+          footerHtml
+        );
 
         const resp = await fetch(
           `https://api.telegram.org/bot${botToken}/sendMessage`,
@@ -315,8 +333,8 @@ export async function dispatchExternalNotifications(alert: {
               <p style="white-space: pre-line;">${escapeHtml(alert.message)}</p>
               <hr style="border: none; border-top: 1px solid #e2e8f0; margin: 16px 0;" />
               <small style="color: #64748b;">Thời gian: ${escapeHtml(
-                new Date().toLocaleString('vi-VN')
-              )} | Hệ thống: ${safeAppUrl}</small>
+          new Date().toLocaleString('vi-VN')
+        )} | Hệ thống: ${safeAppUrl}</small>
             </div>
           </div>
         `,
@@ -357,6 +375,7 @@ export async function sendDigestNotification(
       );
     } else {
       try {
+        const safeDigestText = clampTelegramPayload(telegramText);
         const resp = await fetch(
           `https://api.telegram.org/bot${botToken}/sendMessage`,
           {
@@ -364,7 +383,7 @@ export async function sendDigestNotification(
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               chat_id: chatId,
-              text: telegramText,
+              text: safeDigestText,
               parse_mode: 'HTML',
               disable_web_page_preview: true,
             }),
@@ -436,6 +455,52 @@ export async function sendDigestNotification(
     emailSent,
     errors,
   };
+}
+
+const TELEGRAM_MAX_SAFE_CHARS = 3900;
+
+export function buildSafeTelegramHtmlPayload(
+  headerHtml: string,
+  rawBodyMessage: string,
+  footerHtml: string
+): string {
+  const raw = String(rawBodyMessage || '');
+  const full = `${headerHtml}${escapeHtml(raw)}${footerHtml}`;
+  if (full.length <= TELEGRAM_MAX_SAFE_CHARS) {
+    return full;
+  }
+
+  const suffix = '\n… [đã rút gọn]';
+  let limit = Math.min(raw.length, 3200);
+  while (limit > 120) {
+    const candidate = `${headerHtml}${escapeHtml(
+      raw.slice(0, limit) + suffix
+    )}${footerHtml}`;
+    if (candidate.length <= TELEGRAM_MAX_SAFE_CHARS) {
+      return candidate;
+    }
+    limit = Math.floor(limit * 0.8);
+  }
+
+  return `${headerHtml}${escapeHtml(raw.slice(0, 120) + suffix)}${footerHtml}`.slice(
+    0,
+    TELEGRAM_MAX_SAFE_CHARS
+  );
+}
+
+function clampTelegramPayload(htmlText: string): string {
+  const str = String(htmlText || '');
+  if (str.length <= TELEGRAM_MAX_SAFE_CHARS) {
+    return str;
+  }
+  const plain = str
+    .replace(/<[^>]+>/g, '')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, '&');
+  return escapeHtml(plain.slice(0, 3200) + '\n… [đã rút gọn]');
 }
 
 function escapeHtml(str: string): string {

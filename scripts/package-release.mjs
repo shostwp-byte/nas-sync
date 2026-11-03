@@ -1,4 +1,5 @@
 import { execFileSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -33,6 +34,7 @@ const INCLUDE_FILES = [
   'package.json',
   'package-lock.json',
   'tsconfig.json',
+  'eslint.config.mjs',
   'next.config.mjs',
   'postcss.config.mjs',
   'tailwind.config.ts',
@@ -45,12 +47,12 @@ const INCLUDE_FILES = [
   '.gitattributes',
   '.editorconfig',
   '.env.example',
-  'install-synology.sh',
-  'update-synology.sh',
+  'install.sh',
+  'update.sh',
   'LICENSE',
   'README.md',
   'CHANGELOG.md',
-  'HUONG-DAN-CAI-DAT-SYNOLOGY.md',
+  'HUONG-DAN-CAI-DAT-NAS.md',
 ];
 
 function isTextFile(filePath) {
@@ -93,7 +95,7 @@ function copyDirectoryRecursive(srcDir, destDir) {
   }
 }
 
-console.log('1. Chuẩn bị thư mục đóng gói sạch NAS-Sync (chuẩn hóa dòng LF cho Linux/Synology)...');
+console.log('1. Chuẩn bị thư mục đóng gói sạch NAS-Sync (chuẩn hóa dòng LF cho đa nền tảng NAS & Linux)...');
 fs.mkdirSync(stageDir, { recursive: true });
 
 for (const relFile of INCLUDE_FILES) {
@@ -103,8 +105,9 @@ for (const relFile of INCLUDE_FILES) {
   }
 }
 
-// Tạo BUILD_INFO.json để ứng dụng biết chính xác phiên bản & commit gốc khi kiểm tra Update từ GitHub
-const pkg = JSON.parse(fs.readFileSync(path.join(projectRoot, 'package.json'), 'utf8'));
+const pkg = JSON.parse(
+  fs.readFileSync(path.join(projectRoot, 'package.json'), 'utf8')
+);
 let gitCommit = null;
 try {
   const headPath = path.join(projectRoot, '.git', 'HEAD');
@@ -128,7 +131,7 @@ fs.writeFileSync(
   JSON.stringify(
     {
       name: 'nas-sync',
-      version: pkg.version || '1.1.0',
+      version: pkg.version || '1.7.0',
       commit: gitCommit,
       builtAt: new Date().toISOString(),
       source: 'https://github.com/shostwp-byte/nas-sync',
@@ -139,13 +142,13 @@ fs.writeFileSync(
   'utf8'
 );
 
-// Tạo sẵn file .env mặc định từ .env.example để Synology Container Manager GUI dùng được ngay sau khi giải nén
+// Tạo sẵn file .env mặc định từ .env.example để trình quản lý Docker GUI trên mọi NAS dùng được ngay sau khi giải nén
 copyFileNormalizedLf(
   path.join(projectRoot, '.env.example'),
   path.join(stageDir, '.env')
 );
 
-// Sao chép toàn bộ thư mục mã nguồn src/ và tài nguyên PWA public/
+// Sao chép toàn bộ thư mục mã nguồn src/, tài nguyên PWA public/ và công cụ giải mã khẩn cấp
 copyDirectoryRecursive(
   path.join(projectRoot, 'src'),
   path.join(stageDir, 'src')
@@ -156,7 +159,11 @@ if (fs.existsSync(path.join(projectRoot, 'public'))) {
     path.join(stageDir, 'public')
   );
 }
-const decryptCliSrc = path.join(projectRoot, 'scripts', 'decrypt-offsite-backup.mjs');
+const decryptCliSrc = path.join(
+  projectRoot,
+  'scripts',
+  'decrypt-offsite-backup.mjs'
+);
 if (fs.existsSync(decryptCliSrc)) {
   copyFileNormalizedLf(
     decryptCliSrc,
@@ -164,7 +171,7 @@ if (fs.existsSync(decryptCliSrc)) {
   );
 }
 
-// Tạo sẵn thư mục bind-mount để Synology Container Manager không báo lỗi "Bind mount folder does not exist"
+// Tạo sẵn thư mục bind-mount để trình quản lý Docker GUI không báo lỗi thiếu thư mục ánh xạ
 for (const emptyDir of ['app_data', 'ssh_keys']) {
   const p = path.join(stageDir, emptyDir);
   fs.mkdirSync(p, { recursive: true });
@@ -173,19 +180,18 @@ for (const emptyDir of ['app_data', 'ssh_keys']) {
 
 fs.mkdirSync(releaseDir, { recursive: true });
 
-// Dọn các gói nén tên cũ nếu còn tồn tại trong thư mục release/ (giữ lại gói prebuilt)
+// Dọn các gói nén cũ trong thư mục release/ (giữ lại gói prebuilt)
 for (const entry of fs.readdirSync(releaseDir)) {
   if (
-    (entry.endsWith('.zip') || entry.endsWith('.tar.gz')) &&
-    !entry.startsWith('nas-sync-synology') &&
+    !entry.startsWith('nas-sync-bundle') &&
     !entry.startsWith('nas-sync-prebuilt')
   ) {
-    fs.unlinkSync(path.join(releaseDir, entry));
+    fs.rmSync(path.join(releaseDir, entry), { force: true });
   }
 }
 
-const zipOut = path.join(releaseDir, 'nas-sync-synology.zip');
-const tarGzOut = path.join(releaseDir, 'nas-sync-synology.tar.gz');
+const zipOut = path.join(releaseDir, 'nas-sync-bundle.zip');
+const tarGzOut = path.join(releaseDir, 'nas-sync-bundle.tar.gz');
 
 if (fs.existsSync(zipOut)) fs.unlinkSync(zipOut);
 if (fs.existsSync(tarGzOut)) fs.unlinkSync(tarGzOut);
@@ -193,24 +199,43 @@ if (fs.existsSync(tarGzOut)) fs.unlinkSync(tarGzOut);
 const tarCmd = process.platform === 'win32' ? 'tar.exe' : 'tar';
 console.log('2. Đang nén gói chuẩn POSIX (.zip & .tar.gz)...');
 if (process.platform === 'win32') {
-  execFileSync(tarCmd, ['-a', '-cf', zipOut, '-C', tempStageBase, bundleFolderName], {
-    stdio: 'inherit',
-  });
+  execFileSync(
+    tarCmd,
+    ['-a', '-cf', zipOut, '-C', tempStageBase, bundleFolderName],
+    { stdio: 'inherit' }
+  );
 } else {
   execFileSync('zip', ['-rq', zipOut, bundleFolderName], {
     cwd: tempStageBase,
     stdio: 'inherit',
   });
 }
-execFileSync(tarCmd, ['-czf', tarGzOut, '-C', tempStageBase, bundleFolderName], {
-  stdio: 'inherit',
-});
+execFileSync(
+  tarCmd,
+  ['-czf', tarGzOut, '-C', tempStageBase, bundleFolderName],
+  { stdio: 'inherit' }
+);
+
+const writeSha256File = (filePath) => {
+  const digest = crypto
+    .createHash('sha256')
+    .update(fs.readFileSync(filePath))
+    .digest('hex');
+  fs.writeFileSync(
+    `${filePath}.sha256`,
+    `${digest}  ${path.basename(filePath)}\n`,
+    'utf8'
+  );
+};
+
+writeSha256File(zipOut);
+writeSha256File(tarGzOut);
 
 fs.rmSync(tempStageBase, { recursive: true, force: true });
 
 const zipSizeKb = (fs.statSync(zipOut).size / 1024).toFixed(1);
 const tarSizeKb = (fs.statSync(tarGzOut).size / 1024).toFixed(1);
 
-console.log('\n✅ ĐÓNG GÓI NAS-SYNC HOÀN TẤT:');
-console.log(`   - File ZIP (Dùng cho File Station GUI): ${zipOut} (${zipSizeKb} KB)`);
-console.log(`   - File TAR.GZ (Dùng cho SSH / Linux):   ${tarGzOut} (${tarSizeKb} KB)`);
+console.log('\n✅ ĐÓNG GÓI ĐA NỀN TẢNG NAS-SYNC HOÀN TẤT:');
+console.log(`   - File ZIP (Dùng cho NAS Web GUI): ${zipOut} (${zipSizeKb} KB)`);
+console.log(`   - File TAR.GZ (Dùng cho SSH CLI):  ${tarGzOut} (${tarSizeKb} KB)`);

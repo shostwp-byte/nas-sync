@@ -1,28 +1,41 @@
-import { Queue, Worker } from 'bullmq';
+import fs from 'node:fs';
+import path from 'node:path';
+import { DelayedError, Queue, UnrecoverableError, Worker } from 'bullmq';
 import IORedis from 'ioredis';
 import cron, { type ScheduledTask } from 'node-cron';
 import { getDb, getSetting } from '@/lib/db';
 import { emitJobUpdated } from '@/lib/events';
-import type { BackupSchedule, RestoreRequestPayload, RetentionPolicy } from '@/types';
+import { createSystemAlert } from '@/lib/notifications';
+import type {
+  BackupSchedule,
+  RestoreRequestPayload,
+  RetentionPolicy,
+} from '@/types';
 import {
   clearCancelledJob,
   executeBackupJob,
   requestCancelJob,
   RetryableNetworkError,
 } from './backup-worker';
-import { triggerSynologyBtrfsImmutableSnapshot } from './btrfs-worm';
+import { triggerImmutableWormSnapshot } from './worm-snapshot';
 import {
   captureDailyStorageSnapshot,
   sendDailyMorningDigest,
 } from './morning-digest';
 import { executeRestoreJob } from './restore-worker';
 import { applyGfsRetentionForServer } from './retention-gfs';
+import {
+  MAX_BACKUP_RETRIES,
+  cleanupInProgressSnapshotDirsForJob,
+  sweepOrphanedInProgressDirsOnStartup,
+} from './worker-state';
 
 export interface QueuedTaskPayload {
   jobId: number;
   jobType: 'BACKUP' | 'RESTORE';
   verifyDb?: boolean;
   retentionPolicy?: RetentionPolicy | null;
+  scheduleBatchId?: string | null;
 }
 
 interface EngineState {
@@ -38,12 +51,15 @@ interface EngineState {
 }
 
 declare global {
-  // eslint-disable-next-line no-var
   var __nasSyncQueueEngine: EngineState | undefined;
-  // eslint-disable-next-line no-var
   var __nasSyncServerLocks: Map<number, Promise<void>> | undefined;
-  // eslint-disable-next-line no-var
+  var __nasSyncServerLockDepths: Map<number, number> | undefined;
   var __nasSyncActiveExecutingJobs: Set<number> | undefined;
+  var __nasSyncLastSnapshotSeq:
+    | Map<number, { base: string; seq: number }>
+    | undefined;
+  var __nasSyncScheduleBtrfsBatches: Map<string, Set<number>> | undefined;
+  var __nasSyncUpdating: boolean | undefined;
 }
 
 function getEngineState(): EngineState {
@@ -68,11 +84,36 @@ function getServerLocksMap(): Map<number, Promise<void>> {
   return globalThis.__nasSyncServerLocks;
 }
 
+function getServerLockDepthsMap(): Map<number, number> {
+  if (!globalThis.__nasSyncServerLockDepths) {
+    globalThis.__nasSyncServerLockDepths = new Map();
+  }
+  return globalThis.__nasSyncServerLockDepths;
+}
+
 function getActiveExecutingJobsSet(): Set<number> {
   if (!globalThis.__nasSyncActiveExecutingJobs) {
     globalThis.__nasSyncActiveExecutingJobs = new Set();
   }
   return globalThis.__nasSyncActiveExecutingJobs;
+}
+
+function getLastSnapshotSeqMap(): Map<number, { base: string; seq: number }> {
+  if (!globalThis.__nasSyncLastSnapshotSeq) {
+    globalThis.__nasSyncLastSnapshotSeq = new Map();
+  }
+  return globalThis.__nasSyncLastSnapshotSeq;
+}
+
+function getScheduleBtrfsBatchesMap(): Map<string, Set<number>> {
+  if (!globalThis.__nasSyncScheduleBtrfsBatches) {
+    globalThis.__nasSyncScheduleBtrfsBatches = new Map();
+  }
+  return globalThis.__nasSyncScheduleBtrfsBatches;
+}
+
+export function isServerLockBusy(serverId: number): boolean {
+  return (getServerLockDepthsMap().get(serverId) || 0) > 0;
 }
 
 /**
@@ -81,6 +122,9 @@ function getActiveExecutingJobsSet(): Set<number> {
  */
 export async function acquireServerLock(serverId: number): Promise<() => void> {
   const locks = getServerLocksMap();
+  const depths = getServerLockDepthsMap();
+  depths.set(serverId, (depths.get(serverId) || 0) + 1);
+
   const prev = locks.get(serverId) ?? Promise.resolve();
   let releaseCurrent!: () => void;
   const current = new Promise<void>((resolve) => {
@@ -95,6 +139,12 @@ export async function acquireServerLock(serverId: number): Promise<() => void> {
   return () => {
     if (released) return;
     released = true;
+    const nextDepth = (depths.get(serverId) || 1) - 1;
+    if (nextDepth <= 0) {
+      depths.delete(serverId);
+    } else {
+      depths.set(serverId, nextDepth);
+    }
     releaseCurrent();
     if (locks.get(serverId) === tail) {
       locks.delete(serverId);
@@ -134,24 +184,58 @@ export function getBackoffDelayMs(attemptNumber: number): number {
   return scheduleMinutes[idx] * 60 * 1000;
 }
 
-export function formatSnapshotTimestamp(serverId?: number): string {
-  const now = new Date();
+/**
+ * N14 Fix: Bao gồm giây (YYYY-MM-DD_HH-mm-ss) kèm bộ đếm chống đụng độ nguyên tử theo từng server,
+ * đảm bảo nhiều lần kích hoạt trong cùng một giây không bao giờ sinh trùng tên thư mục Snapshot.
+ */
+export function formatSnapshotTimestamp(serverId?: number, now = new Date()): string {
   const pad = (n: number) => String(n).padStart(2, '0');
   const base = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(
     now.getDate()
-  )}_${pad(now.getHours())}-${pad(now.getMinutes())}`;
+  )}_${pad(now.getHours())}-${pad(now.getMinutes())}-${pad(now.getSeconds())}`;
 
-  if (serverId) {
-    const existing = getDb()
+  const key = serverId && serverId > 0 ? Number(serverId) : 0;
+  const seqMap = getLastSnapshotSeqMap();
+  const prev = seqMap.get(key);
+  let seq = prev && prev.base === base ? prev.seq + 1 : 1;
+
+  if (serverId && serverId > 0) {
+    const db = getDb();
+    const srvRow = db
       .prepare(
-        'SELECT COUNT(*) AS cnt FROM backup_jobs WHERE server_id = ? AND snapshot_name = ?'
+        `SELECT s.hostname, v.mount_path
+         FROM servers s
+         LEFT JOIN storage_volumes v ON v.id = s.assigned_volume_id
+         WHERE s.id = ?`
       )
-      .get(serverId, base)?.cnt as number;
-    if (existing > 0) {
-      return `${base}-${pad(now.getSeconds())}`;
+      .get(serverId);
+    const checkStmt = db.prepare(
+      'SELECT COUNT(*) AS cnt FROM backup_jobs WHERE server_id = ? AND snapshot_name = ?'
+    );
+
+    while (seq < 10_000) {
+      const candidate = seq === 1 ? base : `${base}-${seq}`;
+      const dbExists = Number(checkStmt.get(serverId, candidate)?.cnt || 0) > 0;
+      let diskExists = false;
+      if (srvRow?.mount_path && srvRow?.hostname) {
+        const hostDir = path.join(
+          String(srvRow.mount_path),
+          String(srvRow.hostname)
+        );
+        diskExists =
+          fs.existsSync(path.join(hostDir, candidate)) ||
+          fs.existsSync(path.join(hostDir, `.in_progress_${candidate}`));
+      }
+      if (!dbExists && !diskExists) {
+        seqMap.set(key, { base, seq });
+        return candidate;
+      }
+      seq++;
     }
   }
-  return base;
+
+  seqMap.set(key, { base, seq });
+  return seq === 1 ? base : `${base}-${seq}`;
 }
 
 async function probeRedisAvailable(redisUrl: string): Promise<boolean> {
@@ -178,44 +262,124 @@ async function probeRedisAvailable(redisUrl: string): Promise<boolean> {
   });
 }
 
-async function processJobPayload(payload: QueuedTaskPayload): Promise<void> {
-  const db = getDb();
-  const initialRow = db
+function getJobServerTargets(jobId: number): {
+  exists: boolean;
+  status: string;
+  lockTargets: number[];
+} {
+  const row = getDb()
     .prepare(
       'SELECT status, server_id, target_server_id FROM backup_jobs WHERE id = ?'
     )
-    .get(payload.jobId);
+    .get(jobId);
+  if (!row) {
+    return { exists: false, status: '', lockTargets: [] };
+  }
+  const targets = [
+    Number(row.server_id),
+    ...(row.target_server_id ? [Number(row.target_server_id)] : []),
+  ].filter((id) => Number.isInteger(id) && id > 0);
+  return {
+    exists: true,
+    status: String(row.status),
+    lockTargets: Array.from(new Set(targets)),
+  };
+}
 
-  if (!initialRow || initialRow.status === 'CANCELLED') {
+function completeScheduleBtrfsBatchTracking(
+  batchId: string | null | undefined,
+  jobId: number
+): void {
+  if (!batchId) return;
+  const batches = getScheduleBtrfsBatchesMap();
+  const pendingSet = batches.get(batchId);
+  if (!pendingSet) return;
+  pendingSet.delete(jobId);
+  if (pendingSet.size === 0) {
+    batches.delete(batchId);
+    void triggerImmutableWormSnapshot().catch((err) => {
+      console.warn(
+        `[WORM Post-Schedule] Cảnh báo chụp Immutable Snapshot sau lịch sao lưu:`,
+        (err as Error).message
+      );
+    });
+  }
+}
+
+async function processJobPayload(payload: QueuedTaskPayload): Promise<void> {
+  const db = getDb();
+  const meta = getJobServerTargets(payload.jobId);
+
+  if (
+    !meta.exists ||
+    (meta.status !== 'QUEUED' && meta.status !== 'INTERRUPTED')
+  ) {
+    completeScheduleBtrfsBatchTracking(payload.scheduleBatchId, payload.jobId);
     return;
   }
 
-  const lockTargets = [
-    Number(initialRow.server_id),
-    ...(initialRow.target_server_id
-      ? [Number(initialRow.target_server_id)]
-      : []),
-  ];
+  // N1 Fix: RESTORE không bao giờ được chạy lại tự động từ trạng thái INTERRUPTED
+  if (payload.jobType === 'RESTORE' && meta.status !== 'QUEUED') {
+    return;
+  }
 
-  const releaseLocks = await acquireMultiServerLocks(lockTargets);
+  const releaseLocks = await acquireMultiServerLocks(meta.lockTargets);
   const executingSet = getActiveExecutingJobsSet();
 
   try {
-    const freshRow = db
-      .prepare('SELECT status, server_id FROM backup_jobs WHERE id = ?')
-      .get(payload.jobId);
-    if (!freshRow || freshRow.status === 'CANCELLED') {
+    // N1 Fix: Claim trạng thái nguyên tử (Atomic CAS) bên trong Server Lock —
+    // chặn tuyệt đối việc job COMPLETED/FAILED/CANCELLED hoặc đang RUNNING bị thực thi lần 2.
+    const allowedStatuses =
+      payload.jobType === 'RESTORE' ? "('QUEUED')" : "('QUEUED', 'INTERRUPTED')";
+    const claimRes = db
+      .prepare(
+        `UPDATE backup_jobs
+         SET status = CASE
+               WHEN retry_count > 0 OR status = 'INTERRUPTED' THEN 'RESUMING'
+               ELSE 'RUNNING'
+             END,
+             started_at = COALESCE(started_at, datetime('now'))
+         WHERE id = ?
+           AND status IN ${allowedStatuses}`
+      )
+      .run(payload.jobId);
+
+    if (claimRes.changes === 0) {
       return;
     }
+    emitJobUpdated(payload.jobId);
 
     executingSet.add(payload.jobId);
     try {
       if (payload.jobType === 'RESTORE') {
-        await executeRestoreJob(payload.jobId);
+        try {
+          await executeRestoreJob(payload.jobId);
+        } catch (restoreErr) {
+          // N1 Fix: Ném UnrecoverableError để BullMQ tuyệt đối không retry lệnh Restore (--delete) vào site production
+          throw new UnrecoverableError(
+            (restoreErr as Error)?.message || 'Khôi phục thất bại.'
+          );
+        }
         return;
       }
 
-      await executeBackupJob(payload.jobId, { verifyDb: payload.verifyDb });
+      try {
+        await executeBackupJob(payload.jobId, { verifyDb: payload.verifyDb });
+      } catch (backupErr) {
+        const afterErrRow = db
+          .prepare('SELECT status, retry_count FROM backup_jobs WHERE id = ?')
+          .get(payload.jobId);
+        const canRetry =
+          backupErr instanceof RetryableNetworkError &&
+          afterErrRow?.status === 'INTERRUPTED' &&
+          Number(afterErrRow?.retry_count || 0) <= MAX_BACKUP_RETRIES;
+        if (canRetry) {
+          throw backupErr;
+        }
+        throw new UnrecoverableError(
+          (backupErr as Error)?.message || 'Sao lưu thất bại.'
+        );
+      }
 
       if (payload.retentionPolicy) {
         const afterRow = db
@@ -234,16 +398,44 @@ async function processJobPayload(payload: QueuedTaskPayload): Promise<void> {
     }
   } finally {
     releaseLocks();
+    completeScheduleBtrfsBatchTracking(payload.scheduleBatchId, payload.jobId);
   }
 }
 
-function drainLocalQueue() {
+export function drainLocalQueue() {
   const state = getEngineState();
+  if (globalThis.__nasSyncUpdating) {
+    return;
+  }
+
   while (
     state.localRunningCount < state.localMaxConcurrency &&
     state.localPending.length > 0
   ) {
-    const nextTask = state.localPending.shift()!;
+    // N8 Fix: Kiểm tra khóa máy chủ trước khi chiếm slot concurrency để các job chờ cùng 1 server bận không làm đói server khác
+    let pickedIndex = -1;
+    for (let i = 0; i < state.localPending.length; i++) {
+      const candidate = state.localPending[i];
+      const meta = getJobServerTargets(candidate.jobId);
+      if (
+        !meta.exists ||
+        (meta.status !== 'QUEUED' && meta.status !== 'INTERRUPTED')
+      ) {
+        pickedIndex = i;
+        break;
+      }
+      const anyBusy = meta.lockTargets.some((sid) => isServerLockBusy(sid));
+      if (!anyBusy) {
+        pickedIndex = i;
+        break;
+      }
+    }
+
+    if (pickedIndex < 0) {
+      break;
+    }
+
+    const [nextTask] = state.localPending.splice(pickedIndex, 1);
     state.localRunningCount++;
 
     void (async () => {
@@ -252,15 +444,28 @@ function drainLocalQueue() {
       } catch (err) {
         if (err instanceof RetryableNetworkError) {
           const row = getDb()
-            .prepare('SELECT retry_count FROM backup_jobs WHERE id = ?')
+            .prepare('SELECT status, retry_count FROM backup_jobs WHERE id = ?')
             .get(nextTask.jobId);
           const retryCount = Number(row?.retry_count || 1);
-          if (retryCount <= 10) {
+          if (
+            row?.status === 'INTERRUPTED' &&
+            retryCount <= MAX_BACKUP_RETRIES
+          ) {
             const delayMs = getBackoffDelayMs(retryCount);
-            setTimeout(() => {
-              state.localPending.push(nextTask);
-              drainLocalQueue();
+            const timer = setTimeout(() => {
+              const latest = getDb()
+                .prepare('SELECT status FROM backup_jobs WHERE id = ?')
+                .get(nextTask.jobId);
+              if (
+                latest?.status === 'INTERRUPTED' &&
+                !state.localPending.some((p) => p.jobId === nextTask.jobId) &&
+                !getActiveExecutingJobsSet().has(nextTask.jobId)
+              ) {
+                state.localPending.push(nextTask);
+                drainLocalQueue();
+              }
             }, delayMs);
+            timer.unref();
           }
         }
       } finally {
@@ -280,18 +485,128 @@ export async function initializeQueueAndScheduler(): Promise<{
   }
   state.initialized = true;
 
-  // Khôi phục trạng thái các job bị treo dở nếu container vừa khởi động lại
   const db = getDb();
+
+  // N7 Fix: Đưa các máy chủ bị kẹt trạng thái BACKUP_RUNNING từ phiên crash trước về ONLINE
+  db.prepare(
+    `UPDATE servers SET status = 'ONLINE' WHERE status = 'BACKUP_RUNNING'`
+  ).run();
+
+  // U4 Fix: Dọn dẹp các phiên đồng bộ Offsite bị kẹt ở UPLOADING/QUEUED do tiến trình cũ tắt đột ngột
+  db.prepare(
+    `UPDATE offsite_sync_jobs
+     SET status = 'FAILED',
+         error_message = 'Tiến trình đồng bộ đám mây bị ngắt do dịch vụ khởi động lại.',
+         completed_at = datetime('now')
+     WHERE status IN ('UPLOADING', 'QUEUED')`
+  ).run();
+
+  // N1, N4, N7 Fix: Phục hồi an toàn các job đang chạy dở khi container khởi động lại
   const danglingJobs = db
     .prepare(
-      `SELECT id, job_type FROM backup_jobs WHERE status IN ('RUNNING', 'RESUMING', 'VERIFYING')`
+      `SELECT j.id, j.job_type, j.server_id, j.snapshot_name, j.retry_count, s.hostname
+       FROM backup_jobs j
+       LEFT JOIN servers s ON s.id = j.server_id
+       WHERE j.status IN ('RUNNING', 'RESUMING', 'VERIFYING')`
     )
     .all();
+
   for (const dj of danglingJobs) {
-    db.prepare(
-      `UPDATE backup_jobs SET status = 'INTERRUPTED', current_phase = 'Container khởi động lại — Chờ tự động Resume...' WHERE id = ?`
-    ).run(Number(dj.id));
+    const jid = Number(dj.id);
+    const jtype = String(dj.job_type);
+    const sid = Number(dj.server_id);
+    const host = String(dj.hostname || `Server #${sid}`);
+
+    if (jtype === 'RESTORE') {
+      const msg =
+        'Phiên khôi phục bị ngắt giữa chừng do dịch vụ khởi động lại — đã dừng an toàn để không ghi đè tự động.';
+      db.prepare(
+        `UPDATE backup_jobs
+         SET status = 'FAILED', current_phase = 'Gián đoạn khi khởi động lại',
+             completed_at = datetime('now'), error_log = ?
+         WHERE id = ?`
+      ).run(msg, jid);
+      await createSystemAlert({
+        severity: 'CRITICAL',
+        category: 'RESTORE',
+        title: `Khôi phục bị ngắt khi khởi động lại (${host})`,
+        message: `Restore Job #${jid} bị dừng khi container khởi động lại. Vui lòng kiểm tra máy chủ đích trước khi chạy lại.`,
+        serverId: sid || null,
+        jobId: jid,
+      }).catch(() => {});
+      continue;
+    }
+
+    const nextRetry = Number(dj.retry_count || 0) + 1;
+    if (nextRetry > MAX_BACKUP_RETRIES) {
+      const exhaustedMsg = `Đã vượt quá giới hạn ${MAX_BACKUP_RETRIES} lần thử lại (tiến trình liên tục bị ngắt/khởi động lại).`;
+      db.prepare(
+        `UPDATE backup_jobs
+         SET status = 'FAILED', current_phase = 'Thất bại (Quá số lần thử lại)',
+             retry_count = ?, completed_at = datetime('now'), error_log = ?
+         WHERE id = ?`
+      ).run(nextRetry, exhaustedMsg, jid);
+      cleanupInProgressSnapshotDirsForJob(jid);
+      if (sid > 0) {
+        db.prepare(`UPDATE servers SET status = 'ERROR' WHERE id = ?`).run(sid);
+      }
+      await createSystemAlert({
+        severity: 'CRITICAL',
+        category: 'BACKUP',
+        title: `Sao lưu thất bại sau ${MAX_BACKUP_RETRIES} lần thử trên ${host}`,
+        message: `Job #${jid} (${String(dj.snapshot_name || '')}) đã hết lượt tự động Resume: ${exhaustedMsg}`,
+        serverId: sid || null,
+        jobId: jid,
+      }).catch(() => {});
+    } else {
+      db.prepare(
+        `UPDATE backup_jobs
+         SET status = 'INTERRUPTED', retry_count = ?,
+             current_phase = 'Container khởi động lại — Chờ tự động Resume...'
+         WHERE id = ?`
+      ).run(nextRetry, jid);
+    }
   }
+
+  // N4 Fix: Các job INTERRUPTED đã chạm ngưỡng >= MAX_BACKUP_RETRIES từ trước cũng chuyển sang FAILED kèm cảnh báo CRITICAL
+  const exhaustedInterrupted = db
+    .prepare(
+      `SELECT j.id, j.server_id, j.snapshot_name, j.error_log, s.hostname
+       FROM backup_jobs j
+       LEFT JOIN servers s ON s.id = j.server_id
+       WHERE j.status = 'INTERRUPTED' AND j.retry_count >= ?`
+    )
+    .all(MAX_BACKUP_RETRIES);
+
+  for (const ex of exhaustedInterrupted) {
+    const jid = Number(ex.id);
+    const sid = Number(ex.server_id);
+    const host = String(ex.hostname || `Server #${sid}`);
+    const msg = `Đã hết ${MAX_BACKUP_RETRIES} lần tự động thử lại: ${String(
+      ex.error_log || 'Không thể kết nối máy chủ.'
+    )}`;
+    db.prepare(
+      `UPDATE backup_jobs
+       SET status = 'FAILED', current_phase = 'Thất bại (Hết lượt Resume)',
+           completed_at = datetime('now'), error_log = ?
+       WHERE id = ?`
+    ).run(msg, jid);
+    cleanupInProgressSnapshotDirsForJob(jid);
+    if (sid > 0) {
+      db.prepare(`UPDATE servers SET status = 'ERROR' WHERE id = ?`).run(sid);
+    }
+    await createSystemAlert({
+      severity: 'CRITICAL',
+      category: 'BACKUP',
+      title: `Sao lưu thất bại trên ${host} (hết lượt thử lại)`,
+      message: `Job #${jid} (${String(ex.snapshot_name || '')}) dừng vĩnh viễn: ${msg}`,
+      serverId: sid || null,
+      jobId: jid,
+    }).catch(() => {});
+  }
+
+  // N6 Fix: Dọn dẹp toàn bộ các thư mục .in_progress_* mồ côi trên đĩa
+  sweepOrphanedInProgressDirsOnStartup();
 
   const redisUrl = process.env.REDIS_URL?.trim() || '';
   if (redisUrl && (await probeRedisAvailable(redisUrl))) {
@@ -302,7 +617,7 @@ export async function initializeQueueAndScheduler(): Promise<{
     state.bullQueue = new Queue<QueuedTaskPayload>('nas-sync-backup-jobs', {
       connection,
       defaultJobOptions: {
-        attempts: 10,
+        attempts: MAX_BACKUP_RETRIES,
         backoff: {
           type: 'nas-sync-exponential',
         },
@@ -317,7 +632,22 @@ export async function initializeQueueAndScheduler(): Promise<{
 
     state.bullWorker = new Worker<QueuedTaskPayload>(
       'nas-sync-backup-jobs',
-      async (bullJob) => {
+      async (bullJob, token) => {
+        if (globalThis.__nasSyncUpdating && token) {
+          await bullJob.moveToDelayed(Date.now() + 10_000, token);
+          throw new DelayedError();
+        }
+        // N8 Fix: Giải phóng ngay worker slot BullMQ nếu server đích của job này đang bận
+        const meta = getJobServerTargets(bullJob.data.jobId);
+        if (
+          token &&
+          meta.exists &&
+          (meta.status === 'QUEUED' || meta.status === 'INTERRUPTED') &&
+          meta.lockTargets.some((sid) => isServerLockBusy(sid))
+        ) {
+          await bullJob.moveToDelayed(Date.now() + 3_000, token);
+          throw new DelayedError();
+        }
         await processJobPayload(bullJob.data);
       },
       {
@@ -343,13 +673,18 @@ export async function initializeQueueAndScheduler(): Promise<{
 
   reloadCronSchedules();
 
-  // Tự động Resume các Job INTERRUPTED trước đó
-  const interrupted = db
+  // N7 Fix: Nạp lại cả các Job QUEUED bị mất khỏi RAM khi restart VÀ các Job BACKUP INTERRUPTED còn lượt retry
+  const recoverable = db
     .prepare(
-      `SELECT id, job_type FROM backup_jobs WHERE status = 'INTERRUPTED' AND retry_count < 10`
+      `SELECT id, job_type, status
+       FROM backup_jobs
+       WHERE status = 'QUEUED'
+          OR (status = 'INTERRUPTED' AND job_type = 'BACKUP' AND retry_count < ?)
+       ORDER BY id ASC`
     )
-    .all();
-  for (const row of interrupted) {
+    .all(MAX_BACKUP_RETRIES);
+
+  for (const row of recoverable) {
     await dispatchExistingJob(
       Number(row.id),
       String(row.job_type) === 'RESTORE' ? 'RESTORE' : 'BACKUP'
@@ -374,6 +709,7 @@ export async function enqueueServerBackup(params: {
   scheduleId?: number | null;
   verifyDb?: boolean;
   retentionPolicy?: RetentionPolicy | null;
+  scheduleBatchId?: string | null;
 }): Promise<number> {
   const db = getDb();
   const server = db
@@ -384,26 +720,47 @@ export async function enqueueServerBackup(params: {
     throw new Error(`Không tìm thấy máy chủ ID=${params.serverId}`);
   }
 
-  const snapshotName = formatSnapshotTimestamp(params.serverId);
-  const res = db
-    .prepare(
-      `INSERT INTO backup_jobs
-       (job_type, server_id, schedule_id, volume_id, snapshot_name, status, progress_percent, current_phase)
-       VALUES ('BACKUP', ?, ?, ?, ?, 'QUEUED', 0, 'Đang xếp hàng đợi...')`
-    )
-    .run(
-      params.serverId,
-      params.scheduleId ?? null,
-      (server.assigned_volume_id as number | null) ?? null,
-      snapshotName
-    );
+  // N14 Fix: Cấp phát tên Snapshot và INSERT trong cùng giao dịch SQLite để triệt tiêu hoàn toàn race trùng tên
+  let jobId: number;
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const snapshotName = formatSnapshotTimestamp(params.serverId);
+    const res = db
+      .prepare(
+        `INSERT INTO backup_jobs
+         (job_type, server_id, schedule_id, volume_id, snapshot_name, status, progress_percent, current_phase)
+         VALUES ('BACKUP', ?, ?, ?, ?, 'QUEUED', 0, 'Đang xếp hàng đợi...')`
+      )
+      .run(
+        params.serverId,
+        params.scheduleId ?? null,
+        (server.assigned_volume_id as number | null) ?? null,
+        snapshotName
+      );
+    jobId = Number(res.lastInsertRowid);
+    db.exec('COMMIT');
+  } catch (err) {
+    try {
+      db.exec('ROLLBACK');
+    } catch {
+      // Ignore rollback error
+    }
+    throw err;
+  }
 
-  const jobId = Number(res.lastInsertRowid);
+  if (params.scheduleBatchId) {
+    const batches = getScheduleBtrfsBatchesMap();
+    const set = batches.get(params.scheduleBatchId) || new Set<number>();
+    set.add(jobId);
+    batches.set(params.scheduleBatchId, set);
+  }
+
   emitJobUpdated(jobId);
 
   await dispatchExistingJob(jobId, 'BACKUP', {
     verifyDb: params.verifyDb ?? true,
     retentionPolicy: params.retentionPolicy ?? null,
+    scheduleBatchId: params.scheduleBatchId ?? null,
   });
 
   return jobId;
@@ -450,7 +807,11 @@ export async function enqueueRestoreOperation(
 export async function dispatchExistingJob(
   jobId: number,
   jobType: 'BACKUP' | 'RESTORE',
-  extra: { verifyDb?: boolean; retentionPolicy?: RetentionPolicy | null } = {}
+  extra: {
+    verifyDb?: boolean;
+    retentionPolicy?: RetentionPolicy | null;
+    scheduleBatchId?: string | null;
+  } = {}
 ): Promise<void> {
   clearCancelledJob(jobId);
   await initializeQueueAndScheduler();
@@ -461,14 +822,34 @@ export async function dispatchExistingJob(
     jobType,
     verifyDb: extra.verifyDb ?? true,
     retentionPolicy: extra.retentionPolicy ?? null,
+    scheduleBatchId: extra.scheduleBatchId ?? null,
   };
 
   if (state.mode === 'BULLMQ_REDIS' && state.bullQueue) {
+    // N1 Fix: Sử dụng jobId cố định (deterministic) trên BullMQ và attempts=1 cho RESTORE
+    const deterministicId = `nas-sync-job-${jobId}`;
+    const existingBullJob = await state.bullQueue
+      .getJob(deterministicId)
+      .catch(() => null);
+    if (existingBullJob) {
+      const bullState = await existingBullJob.getState().catch(() => '');
+      if (bullState === 'active') {
+        return;
+      }
+      await existingBullJob.remove().catch(() => {});
+    }
+
     await state.bullQueue.add(`job-${jobId}`, payload, {
-      jobId: `nas-sync-job-${jobId}-${Date.now()}`,
+      jobId: deterministicId,
+      attempts: jobType === 'RESTORE' ? 1 : MAX_BACKUP_RETRIES,
     });
   } else {
-    state.localPending.push(payload);
+    if (
+      !state.localPending.some((p) => p.jobId === jobId) &&
+      !getActiveExecutingJobsSet().has(jobId)
+    ) {
+      state.localPending.push(payload);
+    }
     drainLocalQueue();
   }
 }
@@ -480,6 +861,19 @@ export function cancelRunningOrQueuedJob(jobId: number) {
   requestCancelJob(jobId);
 
   if (state.bullQueue) {
+    const deterministicId = `nas-sync-job-${jobId}`;
+    void state.bullQueue
+      .getJob(deterministicId)
+      .then(async (bj) => {
+        if (bj) {
+          const st = await bj.getState().catch(() => '');
+          if (st !== 'active') {
+            await bj.remove().catch(() => {});
+          }
+        }
+      })
+      .catch(() => {});
+
     void state.bullQueue
       .getJobs(['waiting', 'delayed'])
       .then(async (waitingJobs) => {
@@ -512,6 +906,8 @@ export function cancelRunningOrQueuedJob(jobId: number) {
     db.prepare(
       `UPDATE backup_jobs SET status = 'CANCELLED', current_phase = 'Đã hủy bởi quản trị viên', completed_at = datetime('now') WHERE id = ?`
     ).run(jobId);
+    // N6 Fix: Dọn ngay thư mục .in_progress_<snapshot> khi hủy job đang QUEUED/INTERRUPTED
+    cleanupInProgressSnapshotDirsForJob(jobId);
     if (job.server_id && String(job.job_type) === 'BACKUP') {
       db.prepare(
         `UPDATE servers SET status = 'ONLINE' WHERE id = ? AND status = 'BACKUP_RUNNING'`
@@ -567,9 +963,23 @@ export function reloadCronSchedules() {
     );
 
     const task = cron.schedule(sched.cron_expression, async () => {
+      // U4 Fix: Không kích hoạt lịch sao lưu mới khi hệ thống đang trong tiến trình cập nhật phiên bản
+      if (globalThis.__nasSyncUpdating) {
+        console.warn(
+          `[Cron Schedule #${sched.id}] Hệ thống đang cập nhật phiên bản — tạm hoãn lịch "${sched.name}".`
+        );
+        return;
+      }
+
       db.prepare(
         `UPDATE backup_schedules SET last_run_at = datetime('now') WHERE id = ?`
       ).run(sched.id);
+
+      // N17 Fix: Theo dõi đúng tập Job thuộc đợt chạy lịch này để chụp Btrfs WORM ngay khi tất cả Job thực sự kết thúc
+      const batchId =
+        sched.btrfs_snapshot_after && sched.server_ids.length > 0
+          ? `sched-${sched.id}-${Date.now()}`
+          : null;
 
       for (let i = 0; i < sched.server_ids.length; i++) {
         const srvId = sched.server_ids[i];
@@ -582,6 +992,7 @@ export function reloadCronSchedules() {
             scheduleId: sched.id,
             verifyDb: sched.verify_db_sandbox,
             retentionPolicy: sched.retention_policy,
+            scheduleBatchId: batchId,
           });
         } catch (err) {
           console.error(
@@ -590,25 +1001,24 @@ export function reloadCronSchedules() {
           );
         }
       }
-
-      if (sched.btrfs_snapshot_after) {
-        setTimeout(() => {
-          void triggerSynologyBtrfsImmutableSnapshot(7);
-        }, 15 * 60 * 1000);
-      }
     });
 
     state.cronTasks.set(`schedule-${sched.id}`, task);
   }
 
-  // Lịch chụp Btrfs WORM cố định lúc 06:00 sáng (Mục 9.1) nếu bật tự động
-  const btrfsAuto = getSetting('btrfs_auto_enabled', 'false') === 'true';
-  const btrfsCron = getSetting('btrfs_cron_time', '0 6 * * *');
-  if (btrfsAuto && cron.validate(btrfsCron)) {
-    const wormTask = cron.schedule(btrfsCron, () => {
-      void triggerSynologyBtrfsImmutableSnapshot(7);
+  // Lịch chụp OS-Level Immutable WORM Snapshot cố định lúc 06:00 sáng (Mục 9.1) nếu bật tự động
+  const wormAuto =
+    getSetting('worm_auto_enabled', '') === 'true' ||
+    getSetting('btrfs_auto_enabled', 'false') === 'true';
+  const wormCron =
+    getSetting('worm_cron_time', '') ||
+    getSetting('btrfs_cron_time', '0 6 * * *');
+  if (wormAuto && cron.validate(wormCron)) {
+    const wormTask = cron.schedule(wormCron, () => {
+      if (globalThis.__nasSyncUpdating) return;
+      void triggerImmutableWormSnapshot();
     });
-    state.cronTasks.set('btrfs-worm-daily', wormTask);
+    state.cronTasks.set('worm-snapshot-daily', wormTask);
   }
 
   // Lịch chụp thống kê dung lượng ngày cố định lúc 23:55 hằng đêm (v1.4.0 30-Day Storage Trend)
@@ -639,4 +1049,3 @@ export function reloadCronSchedules() {
     state.cronTasks.set('morning-digest-daily', digestTask);
   }
 }
-

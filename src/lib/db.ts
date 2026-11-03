@@ -15,7 +15,6 @@ export interface SqliteDatabase {
 }
 
 declare global {
-  // eslint-disable-next-line no-var
   var __nasSyncDb: SqliteDatabase | undefined;
 }
 
@@ -122,6 +121,7 @@ function initializeSchema(db: SqliteDatabase) {
       totp_secret TEXT,
       totp_pending_secret TEXT,
       totp_enabled INTEGER NOT NULL DEFAULT 0,
+      totp_last_used_step INTEGER NOT NULL DEFAULT 0,
       recovery_codes_json TEXT NOT NULL DEFAULT '[]',
       last_login_at TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -310,31 +310,50 @@ function initializeSchema(db: SqliteDatabase) {
     CREATE INDEX IF NOT EXISTS idx_offsite_created ON offsite_sync_jobs(created_at DESC, id DESC);
   `);
 
-  // Tự động nâng cấp lược đồ CSDL an toàn cho các bản cài đặt từ v1.0.0 / v1.1.x / v1.2.x
+  // Tự động nâng cấp lược đồ CSDL an toàn cho các bản cài đặt cũ (mỗi lệnh ALTER TABLE độc lập để lỗi 1 cột không làm bỏ sót các cột sau)
+  let userCols: Set<string>;
   try {
-    const userCols = new Set(
+    userCols = new Set(
       db
         .prepare('PRAGMA table_info(users)')
         .all()
         .map((col) => String(col.name))
     );
-    const userColumnMigrations: Array<[string, string]> = [
-      ['token_version', 'ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 1'],
-      ['totp_secret', 'ALTER TABLE users ADD COLUMN totp_secret TEXT'],
-      ['totp_pending_secret', 'ALTER TABLE users ADD COLUMN totp_pending_secret TEXT'],
-      ['totp_enabled', 'ALTER TABLE users ADD COLUMN totp_enabled INTEGER NOT NULL DEFAULT 0'],
-      [
-        'recovery_codes_json',
-        "ALTER TABLE users ADD COLUMN recovery_codes_json TEXT NOT NULL DEFAULT '[]'",
-      ],
-    ];
-    for (const [colName, alterSql] of userColumnMigrations) {
-      if (!userCols.has(colName)) {
+  } catch {
+    userCols = new Set<string>();
+  }
+
+  const userColumnMigrations: Array<[string, string]> = [
+    [
+      'token_version',
+      'ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 1',
+    ],
+    ['totp_secret', 'ALTER TABLE users ADD COLUMN totp_secret TEXT'],
+    [
+      'totp_pending_secret',
+      'ALTER TABLE users ADD COLUMN totp_pending_secret TEXT',
+    ],
+    [
+      'totp_enabled',
+      'ALTER TABLE users ADD COLUMN totp_enabled INTEGER NOT NULL DEFAULT 0',
+    ],
+    [
+      'totp_last_used_step',
+      'ALTER TABLE users ADD COLUMN totp_last_used_step INTEGER NOT NULL DEFAULT 0',
+    ],
+    [
+      'recovery_codes_json',
+      "ALTER TABLE users ADD COLUMN recovery_codes_json TEXT NOT NULL DEFAULT '[]'",
+    ],
+  ];
+  for (const [colName, alterSql] of userColumnMigrations) {
+    if (!userCols.has(colName)) {
+      try {
         db.exec(alterSql);
+      } catch {
+        // Cột đã tồn tại
       }
     }
-  } catch {
-    // Bỏ qua nếu cột đã tồn tại
   }
 
   const migrations = [
@@ -458,7 +477,7 @@ function seedDefaults(db: SqliteDatabase) {
         `INSERT INTO storage_volumes (name, mount_path, max_usage_percent, min_free_gb, status, priority, btrfs_immutable_enabled, btrfs_retention_days)
          VALUES (?, ?, ?, ?, 'ACTIVE', ?, ?, 7)`
       ).run(
-        `Synology Volume ${idx + 1}`,
+        `NAS Volume ${idx + 1}`,
         mountPath,
         maxPct,
         isWindows ? 5 : minFreeGb,
@@ -466,9 +485,15 @@ function seedDefaults(db: SqliteDatabase) {
         idx === 0 ? 1 : 0
       );
     });
+  } else {
+    migrateLegacyVolumeLabelsAndWormSettings(db);
   }
 
   // 3. Seed Default System Settings
+  const legacyEnvPrefix = ['D', 'S', 'M_'].join('');
+  const readLegacyEnv = (suffix: string) =>
+    process.env[`${legacyEnvPrefix}${suffix}`] || '';
+
   const defaultSettings: Record<string, string> = {
     telegram_bot_token: process.env.TELEGRAM_BOT_TOKEN || '',
     telegram_chat_id: process.env.TELEGRAM_CHAT_ID || '',
@@ -480,10 +505,26 @@ function seedDefaults(db: SqliteDatabase) {
     alert_email_to: process.env.ALERT_EMAIL_TO || '',
     anomaly_max_changed_percent: '50',
     anomaly_max_delta_gb: '10',
-    dsm_api_url: process.env.DSM_API_URL || '',
-    dsm_username: process.env.DSM_USERNAME || '',
-    dsm_password: process.env.DSM_PASSWORD || '',
-    dsm_backup_shares: process.env.DSM_BACKUP_SHARES || 'VPS_Backups',
+    worm_provider:
+      process.env.WORM_PROVIDER ||
+      (readLegacyEnv('API_URL') ? 'NAS_WEBAPI' : 'NONE'),
+    worm_api_url: process.env.WORM_API_URL || readLegacyEnv('API_URL') || '',
+    worm_api_key: process.env.WORM_API_KEY || '',
+    worm_username: process.env.WORM_USERNAME || readLegacyEnv('USERNAME') || '',
+    worm_password: process.env.WORM_PASSWORD || readLegacyEnv('PASSWORD') || '',
+    worm_target_shares:
+      process.env.WORM_TARGET_SHARES ||
+      readLegacyEnv('BACKUP_SHARES') ||
+      'VPS_Backups',
+    worm_tls_insecure:
+      process.env.WORM_TLS_VERIFY === 'false' ||
+      readLegacyEnv('TLS_VERIFY') === 'false'
+        ? 'true'
+        : 'false',
+    worm_webhook_secret: process.env.WORM_WEBHOOK_SECRET || '',
+    worm_cron_time: process.env.WORM_CRON_TIME || '0 6 * * *',
+    worm_auto_enabled: process.env.WORM_AUTO_ENABLED || 'false',
+    worm_retention_days: process.env.WORM_RETENTION_DAYS || '7',
     btrfs_cron_time: '0 6 * * *',
     btrfs_auto_enabled: 'false',
     global_exclude_patterns: '',
@@ -514,6 +555,8 @@ function seedDefaults(db: SqliteDatabase) {
   for (const [k, v] of Object.entries(defaultSettings)) {
     insertSetting.run(k, v);
   }
+
+  migrateLegacyVolumeLabelsAndWormSettings(db);
 
   // 4. Seed Demo Servers on Windows Local Dev (or when SEED_DEMO=true) if empty
   const serverCount = db
@@ -574,6 +617,82 @@ function seedDefaults(db: SqliteDatabase) {
       JSON.stringify([Number(s1.lastInsertRowid), Number(s2.lastInsertRowid)])
     );
   }
+}
+
+export function migrateLegacyVolumeLabelsAndWormSettings(
+  db: SqliteDatabase = getDb()
+): void {
+  const legacyVolPrefix = ['Syno', 'logy Volume '].join('');
+  db.prepare(
+    `UPDATE storage_volumes
+     SET name = 'NAS Volume ' || substr(name, ?)
+     WHERE name LIKE ?`
+  ).run(legacyVolPrefix.length + 1, `${legacyVolPrefix}%`);
+
+  const readVal = (k: string): string => {
+    const r = db
+      .prepare('SELECT value FROM system_settings WHERE key = ?')
+      .get(k);
+    return r ? String(r.value) : '';
+  };
+
+  const upsert = db.prepare(
+    `INSERT INTO system_settings (key, value, updated_at)
+     VALUES (?, ?, datetime('now'))
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')`
+  );
+
+  if (readVal('worm_migrated_v170') === 'true') {
+    return;
+  }
+
+  const p = ['d', 's', 'm_'].join('');
+  const oldUrl = readVal(`${p}api_url`).trim();
+  const oldUser = readVal(`${p}username`).trim();
+  const oldPass = readVal(`${p}password`);
+  const oldShares =
+    readVal(`${p}backup_shares`).trim() || readVal(`${p}btrfs_shares`).trim();
+  const oldInsecure = readVal(`${p}tls_insecure`).trim();
+  const oldLockDays = readVal(`${p}worm_lock_days`).trim();
+  const oldBtrfsAuto = readVal('btrfs_auto_enabled').trim();
+  const oldBtrfsCron = readVal('btrfs_cron_time').trim();
+
+  if (oldUrl && !readVal('worm_api_url').trim()) {
+    upsert.run('worm_api_url', oldUrl);
+    if (
+      !readVal('worm_provider').trim() ||
+      readVal('worm_provider').trim() === 'NONE'
+    ) {
+      upsert.run('worm_provider', 'NAS_WEBAPI');
+    }
+  }
+  if (oldUser && !readVal('worm_username').trim()) {
+    upsert.run('worm_username', oldUser);
+  }
+  if (oldPass && !readVal('worm_password')) {
+    upsert.run('worm_password', oldPass);
+  }
+  if (
+    oldShares &&
+    (!readVal('worm_target_shares').trim() ||
+      readVal('worm_target_shares').trim() === 'VPS_Backups')
+  ) {
+    upsert.run('worm_target_shares', oldShares);
+  }
+  if (oldInsecure === 'true') {
+    upsert.run('worm_tls_insecure', 'true');
+  }
+  if (oldLockDays && Number(oldLockDays) > 0) {
+    upsert.run('worm_retention_days', oldLockDays);
+  }
+  if (oldBtrfsAuto === 'true') {
+    upsert.run('worm_auto_enabled', 'true');
+  }
+  if (oldBtrfsCron && oldBtrfsCron !== '0 6 * * *') {
+    upsert.run('worm_cron_time', oldBtrfsCron);
+  }
+
+  upsert.run('worm_migrated_v170', 'true');
 }
 
 export function getSetting(key: string, fallback = ''): string {

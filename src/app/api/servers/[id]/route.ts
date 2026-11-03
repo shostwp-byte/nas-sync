@@ -48,6 +48,36 @@ export async function PATCH(
     const nextBwLimit = Number(body.bw_limit_kbps ?? curr.bw_limit_kbps);
     const nextIsMock =
       body.is_mock !== undefined ? (body.is_mock ? 1 : 0) : Number(curr.is_mock || 0);
+    if (
+      nextIsMock === 1 &&
+      Number(curr.is_mock || 0) !== 1 &&
+      process.env.NODE_ENV === 'production' &&
+      process.env.ALLOW_MOCK_SERVERS !== 'true'
+    ) {
+      return NextResponse.json(
+        {
+          error:
+            'Không thể chuyển máy chủ sang chế độ Demo Mô phỏng (is_mock) trên môi trường Production khi chưa bật ALLOW_MOCK_SERVERS=true.',
+        },
+        { status: 403 }
+      );
+    }
+    if (nextHostname !== String(curr.hostname)) {
+      const existingJobCount = Number(
+        db
+          .prepare('SELECT COUNT(*) AS cnt FROM backup_jobs WHERE server_id = ?')
+          .get(serverId)?.cnt || 0
+      );
+      if (existingJobCount > 0) {
+        return NextResponse.json(
+          {
+            error:
+              'Không thể đổi Hostname của máy chủ đã có lịch sử Snapshot sao lưu (tránh làm mồ côi cây thư mục Hardlink trên NAS). Bạn vẫn có thể đổi IP, cổng SSH, SSH Key và ghi chú bình thường.',
+          },
+          { status: 400 }
+        );
+      }
+    }
     const nextBackupMailboxes = toBitFlag(
       body.backup_mailboxes,
       Number(curr.backup_mailboxes || 0)

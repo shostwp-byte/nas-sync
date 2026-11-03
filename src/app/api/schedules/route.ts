@@ -1,26 +1,34 @@
 import cron from 'node-cron';
 import { NextRequest, NextResponse } from 'next/server';
+import { safeErrorJson } from '@/lib/api-error';
 import { requireRole } from '@/lib/auth';
 import { getDb } from '@/lib/db';
 import { reloadCronSchedules } from '@/lib/engine/queue';
 
 export async function GET() {
-  const rows = getDb()
-    .prepare('SELECT * FROM backup_schedules ORDER BY id DESC')
-    .all();
+  try {
+    const guard = await requireRole(['ADMIN', 'OPERATOR', 'VIEWER']);
+    if (!guard.ok) return guard.response;
 
-  const schedules = rows.map((r) => ({
-    ...r,
-    server_ids: JSON.parse(String(r.server_ids || '[]')),
-    retention_policy: JSON.parse(
-      String(r.retention_policy || '{"daily":7,"weekly":4,"monthly":6}')
-    ),
-    verify_db_sandbox: Number(r.verify_db_sandbox) === 1,
-    btrfs_snapshot_after: Number(r.btrfs_snapshot_after) === 1,
-    enabled: Number(r.enabled) === 1,
-  }));
+    const rows = getDb()
+      .prepare('SELECT * FROM backup_schedules ORDER BY id DESC')
+      .all();
 
-  return NextResponse.json({ schedules });
+    const schedules = rows.map((r) => ({
+      ...r,
+      server_ids: JSON.parse(String(r.server_ids || '[]')),
+      retention_policy: JSON.parse(
+        String(r.retention_policy || '{"daily":7,"weekly":4,"monthly":6}')
+      ),
+      verify_db_sandbox: Number(r.verify_db_sandbox) === 1,
+      btrfs_snapshot_after: Number(r.btrfs_snapshot_after) === 1,
+      enabled: Number(r.enabled) === 1,
+    }));
+
+    return NextResponse.json({ schedules });
+  } catch (err) {
+    return safeErrorJson(err, 'Không thể tải danh sách lịch sao lưu.', 500);
+  }
 }
 
 export async function POST(req: NextRequest) {
@@ -130,10 +138,7 @@ export async function POST(req: NextRequest) {
     reloadCronSchedules();
     return NextResponse.json({ ok: true });
   } catch (err) {
-    return NextResponse.json(
-      { error: (err as Error).message },
-      { status: 500 }
-    );
+    return safeErrorJson(err, 'Không thể tạo lịch sao lưu mới.', 500);
   }
 }
 

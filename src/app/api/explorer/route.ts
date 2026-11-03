@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { safeErrorJson } from '@/lib/api-error';
 import { requireRole } from '@/lib/auth';
 import {
   listSnapshotDirectory,
@@ -30,9 +31,6 @@ export async function GET(req: NextRequest) {
     const listing = listSnapshotDirectory(jobId, relPath);
     return NextResponse.json({ ok: true, ...listing });
   } catch (err) {
-    return NextResponse.json(
-      { error: (err as Error).message },
-      { status: 400 }
-    );
+    return safeErrorJson(err, 'Không thể đọc thư mục hoặc tệp Snapshot.', 400);
   }
 }

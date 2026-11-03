@@ -2,12 +2,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import { NextRequest, NextResponse } from 'next/server';
+import { safeErrorJson } from '@/lib/api-error';
 import { recordAuditLog } from '@/lib/audit';
 import { requireRole } from '@/lib/auth';
 import {
   resolveSafeSnapshotRoot,
   resolveSafeSubPath,
 } from '@/lib/engine/explorer';
+import { acquireSnapshotReadPin } from '@/lib/engine/snapshot-pins';
 
 export async function GET(req: NextRequest) {
   try {
@@ -28,7 +30,7 @@ export async function GET(req: NextRequest) {
       );
     }
 
-    const { snapshotRoot, hostname, snapshotName } =
+    const { serverId, snapshotRoot, hostname, snapshotName } =
       resolveSafeSnapshotRoot(jobId);
     const fullPath = resolveSafeSubPath(snapshotRoot, relPath);
 
@@ -62,11 +64,29 @@ export async function GET(req: NextRequest) {
       req,
     });
 
-    // Stream thay vì readFileSync: file backup (SQL dump, archive) có thể nhiều GB — đọc
-    // toàn bộ vào RAM sẽ làm sập tiến trình Node trên NAS (Buffer tối đa ~2-4 GB).
-    const body = Readable.toWeb(
-      fs.createReadStream(fullPath)
-    ) as ReadableStream<Uint8Array>;
+    const releasePin = acquireSnapshotReadPin(serverId, snapshotName);
+    let pinReleased = false;
+    const releasePinOnce = () => {
+      if (pinReleased) return;
+      pinReleased = true;
+      releasePin();
+    };
+
+    const fileStream = fs.createReadStream(fullPath, {
+      highWaterMark: 256 * 1024,
+    });
+    fileStream.once('close', releasePinOnce);
+    fileStream.once('error', releasePinOnce);
+    req.signal.addEventListener(
+      'abort',
+      () => {
+        fileStream.destroy();
+        releasePinOnce();
+      },
+      { once: true }
+    );
+
+    const body = Readable.toWeb(fileStream) as ReadableStream<Uint8Array>;
 
     return new NextResponse(body, {
       status: 200,
@@ -76,12 +96,14 @@ export async function GET(req: NextRequest) {
           fileName
         )}`,
         'Content-Length': String(size),
+        'Cache-Control': 'no-store',
       },
     });
   } catch (err) {
-    return NextResponse.json(
-      { error: (err as Error).message },
-      { status: 400 }
+    return safeErrorJson(
+      err,
+      'Không thể tải xuống tập tin sao lưu.',
+      400
     );
   }
 }

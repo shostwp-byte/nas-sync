@@ -12,6 +12,7 @@ const VALID_CATEGORIES = new Set([
   'BACKUP',
   'RESTORE',
   'BTRFS',
+  'WORM',
   'SYSTEM',
 ]);
 
@@ -35,8 +36,12 @@ export async function GET(req: NextRequest) {
       params.push(severity);
     }
     if (category && VALID_CATEGORIES.has(category)) {
-      conditions.push('category = ?');
-      params.push(category);
+      if (category === 'WORM' || category === 'BTRFS') {
+        conditions.push("category IN ('WORM', 'BTRFS')");
+      } else {
+        conditions.push('category = ?');
+        params.push(category);
+      }
     }
     if (unreadOnly) {
       conditions.push('is_read = 0');
@@ -174,4 +179,3 @@ export async function POST(req: NextRequest) {
     return safeErrorJson(err, 'Không thể cập nhật trạng thái cảnh báo.');
   }
 }
-

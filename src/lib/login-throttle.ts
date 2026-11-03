@@ -13,7 +13,6 @@ interface FailureRecord {
 }
 
 declare global {
-  // eslint-disable-next-line no-var
   var __nasSyncLoginFailures: Map<string, FailureRecord> | undefined;
 }
 

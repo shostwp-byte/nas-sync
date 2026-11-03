@@ -30,7 +30,7 @@ const HOST_ADDRESS_RE = /^[A-Za-z0-9._:-]{1,253}$/;
 // Tên thư mục snapshot chuẩn (VD: 2026-11-02_01-00 hoặc seed_base)
 const SNAPSHOT_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 // Đường dẫn tuyệt đối POSIX, chỉ ký tự an toàn, không có segment "." / ".."
-const POSIX_PATH_RE = /^\/[A-Za-z0-9._@+\/-]*$/;
+const POSIX_PATH_RE = /^\/[A-Za-z0-9._@+/-]*$/;
 
 export function isValidPanelType(value: string): value is PanelType {
   return VALID_PANEL_TYPES.has(value);

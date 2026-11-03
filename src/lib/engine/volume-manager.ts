@@ -4,10 +4,242 @@ import { getDb } from '@/lib/db';
 import { emitVolumeUpdated } from '@/lib/events';
 import { createSystemAlert } from '@/lib/notifications';
 import { execLocalCommand } from '@/lib/ssh';
-import type { ServerRecord, StorageVolume } from '@/types';
+import type {
+  ServerRecord,
+  StorageVolume,
+  VolumeCapabilities,
+} from '@/types';
+
+const CAPABILITY_CACHE_TTL_MS = 5 * 60 * 1000;
+const capabilityCache = new Map<
+  string,
+  { checkedAt: number; capabilities: VolumeCapabilities }
+>();
+
+function unescapeProcMountPath(escaped: string): string {
+  return escaped
+    .replace(/\\040/g, ' ')
+    .replace(/\\011/g, '\t')
+    .replace(/\\012/g, '\n')
+    .replace(/\\134/g, '\\');
+}
 
 /**
- * Tạo/cập nhật con trỏ latest an toàn trên cả Linux (ln -snf) và Windows (Directory Junction).
+ * Phân tích nội dung /proc/mounts để tìm hệ thống tệp khớp dài nhất với đường dẫn đích.
+ */
+export function parseProcMountsFsType(
+  procMountsContent: string,
+  targetPath: string
+): string | null {
+  const normalizedTarget =
+    path.posix.normalize(targetPath).replace(/\/+$/, '') || '/';
+  let bestMountLen = -1;
+  let bestFsType: string | null = null;
+
+  for (const rawLine of procMountsContent.split('\n')) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const parts = line.split(/\s+/);
+    if (parts.length < 3) continue;
+    const mountPoint =
+      path.posix.normalize(unescapeProcMountPath(parts[1])).replace(/\/+$/, '') ||
+      '/';
+    const fsType = parts[2].toLowerCase();
+    if (fsType === 'rootfs' || fsType === 'autofs') continue;
+
+    const matches =
+      mountPoint === '/' ||
+      normalizedTarget === mountPoint ||
+      normalizedTarget.startsWith(`${mountPoint}/`);
+    if (matches && mountPoint.length >= bestMountLen) {
+      bestMountLen = mountPoint.length;
+      bestFsType = fsType;
+    }
+  }
+
+  return bestFsType;
+}
+
+async function detectMountFsType(mountPath: string): Promise<string> {
+  if (process.platform === 'win32') {
+    return 'ntfs';
+  }
+
+  let resolvedTarget = mountPath;
+  try {
+    resolvedTarget = fs.realpathSync(mountPath);
+  } catch {
+    // Giữ nguyên mountPath nếu chưa tồn tại
+  }
+
+  try {
+    if (fs.existsSync('/proc/mounts')) {
+      const content = fs.readFileSync('/proc/mounts', 'utf8');
+      const detected = parseProcMountsFsType(content, resolvedTarget);
+      if (detected) return detected;
+    }
+  } catch {
+    // Fallback sang df -PT
+  }
+
+  try {
+    const dfRes = await execLocalCommand('df', ['-P', '-T', resolvedTarget], 5000);
+    if (dfRes.code === 0) {
+      const lines = dfRes.stdout
+        .trim()
+        .split('\n')
+        .map((l) => l.trim())
+        .filter(Boolean);
+      if (lines.length >= 2) {
+        const cols = lines[lines.length - 1].split(/\s+/);
+        if (cols.length >= 2 && cols[1]) {
+          return cols[1].toLowerCase();
+        }
+      }
+    }
+  } catch {
+    // Ignore fallback failure
+  }
+
+  return 'unknown';
+}
+
+/**
+ * Kiểm định thực tế năng lực phân vùng lưu trữ NAS (Filesystem, quyền ghi, POSIX Hard-Link, Symlink).
+ * Đảm bảo cơ chế Incremental Hard-Link (rsync --link-dest) vận hành chuẩn xác trên mọi hãng NAS & Docker Host.
+ */
+export async function probeVolumeCapabilities(
+  mountPath: string,
+  forceRefresh = false
+): Promise<VolumeCapabilities> {
+  const cacheKey = path.resolve(mountPath);
+  const now = Date.now();
+  if (!forceRefresh) {
+    const cached = capabilityCache.get(cacheKey);
+    if (cached && now - cached.checkedAt < CAPABILITY_CACHE_TTL_MS) {
+      return cached.capabilities;
+    }
+  }
+
+  const fsType = await detectMountFsType(mountPath);
+  let writable: boolean;
+  let hardlinkSupported = false;
+  let symlinkSupported = false;
+
+  const probeDir = path.join(mountPath, '.nas-sync-probe');
+  const token = `${process.pid}-${now}-${Math.random().toString(36).slice(2, 8)}`;
+  const srcFile = path.join(probeDir, `probe-${token}.src`);
+  const hardlinkFile = path.join(probeDir, `probe-${token}.hl`);
+  const symlinkPath = path.join(probeDir, `probe-${token}.sym`);
+  const junctionTargetDir = path.join(probeDir, `probe-${token}.dir`);
+
+  try {
+    fs.mkdirSync(probeDir, { recursive: true });
+    fs.writeFileSync(srcFile, 'nas-sync-capability-probe', { mode: 0o600 });
+    writable = true;
+
+    try {
+      fs.linkSync(srcFile, hardlinkFile);
+      hardlinkSupported = true;
+    } catch {
+      hardlinkSupported = false;
+    } finally {
+      try {
+        fs.rmSync(hardlinkFile, { force: true });
+      } catch {
+        // Ignore cleanup error
+      }
+    }
+
+    try {
+      if (process.platform === 'win32') {
+        fs.mkdirSync(junctionTargetDir, { recursive: true });
+        fs.symlinkSync(junctionTargetDir, symlinkPath, 'junction');
+      } else {
+        fs.symlinkSync(path.basename(srcFile), symlinkPath);
+      }
+      symlinkSupported = true;
+    } catch {
+      symlinkSupported = false;
+    } finally {
+      try {
+        const st = fs.lstatSync(symlinkPath, { throwIfNoEntry: false });
+        if (st) {
+          if (st.isSymbolicLink() || st.isFile()) {
+            fs.unlinkSync(symlinkPath);
+          } else if (st.isDirectory()) {
+            fs.rmdirSync(symlinkPath);
+          }
+        }
+      } catch {
+        // Ignore cleanup error
+      }
+      try {
+        fs.rmSync(junctionTargetDir, { recursive: true, force: true });
+      } catch {
+        // Ignore cleanup error
+      }
+    }
+  } catch {
+    writable = false;
+  } finally {
+    try {
+      fs.rmSync(srcFile, { force: true });
+    } catch {
+      // Ignore cleanup error
+    }
+    try {
+      const remaining = fs.readdirSync(probeDir);
+      if (remaining.length === 0) {
+        fs.rmdirSync(probeDir);
+      }
+    } catch {
+      // Ignore if probeDir missing or busy
+    }
+  }
+
+  let warning: string | undefined;
+  if (!writable) {
+    warning =
+      'Phân vùng chưa có quyền ghi — vui lòng kiểm tra PUID/PGID hoặc quyền thư mục bind-mount trên NAS.';
+  } else if (!hardlinkSupported) {
+    warning = `Hệ thống tệp (${fsType}) không hỗ trợ POSIX Hard-Link — rsync --link-dest sẽ sao chép toàn bộ tệp thay vì tiết kiệm dung lượng. Khuyến nghị dùng ZFS, Btrfs, Ext4 hoặc XFS.`;
+  } else if (!symlinkSupported) {
+    warning = `Hệ thống tệp (${fsType}) chặn tạo Symlink — con trỏ bản sao lưu mới nhất (latest) không thể cập nhật nguyên tử.`;
+  } else if (fsType === 'fuse.shfs') {
+    warning =
+      'Phát hiện FUSE User Share (/mnt/user). Để đạt tốc độ I/O Hard-Link tối ưu cho hàng trăm nghìn tệp nhỏ, khuyến nghị gắn trực tiếp /mnt/cache hoặc /mnt/diskX.';
+  } else if (fsType === 'cifs' || fsType === 'smb3' || fsType === 'smbfs') {
+    warning =
+      'Phát hiện gắn kết mạng SMB/CIFS — nên ưu tiên gắn kết trực tiếp phân vùng nội bộ (ZFS / Btrfs / Ext4 / XFS) trên thiết bị NAS.';
+  }
+
+  const capabilities: VolumeCapabilities = {
+    fs_type: fsType,
+    hardlink_supported: hardlinkSupported,
+    symlink_supported: symlinkSupported,
+    writable,
+    ...(warning ? { warning } : {}),
+  };
+
+  capabilityCache.set(cacheKey, { checkedAt: now, capabilities });
+  return capabilities;
+}
+
+export async function attachCapabilitiesToVolumes(
+  volumes: StorageVolume[],
+  forceRefresh = false
+): Promise<StorageVolume[]> {
+  return Promise.all(
+    volumes.map(async (vol) => ({
+      ...vol,
+      capabilities: await probeVolumeCapabilities(vol.mount_path, forceRefresh),
+    }))
+  );
+}
+
+/**
+ * Tạo/cập nhật con trỏ latest nguyên tử (atomic symlink + rename trên POSIX, Directory Junction trên Windows).
  */
 export async function updateLatestSymlink(
   hostDir: string,
@@ -16,8 +248,24 @@ export async function updateLatestSymlink(
   const latestPath = path.join(hostDir, 'latest');
 
   if (process.platform !== 'win32') {
-    await execLocalCommand('ln', ['-snf', targetSnapshotDir, latestPath], 10000);
-    return;
+    fs.mkdirSync(hostDir, { recursive: true });
+    const relTarget =
+      path.relative(hostDir, targetSnapshotDir) || targetSnapshotDir;
+    const tmpLink = path.join(
+      hostDir,
+      `.latest.tmp.${process.pid}.${Date.now()}.${Math.random()
+        .toString(36)
+        .slice(2, 8)}`
+    );
+    try {
+      fs.rmSync(tmpLink, { force: true });
+      fs.symlinkSync(relTarget, tmpLink);
+      fs.renameSync(tmpLink, latestPath);
+      return;
+    } catch (err) {
+      fs.rmSync(tmpLink, { force: true });
+      throw err;
+    }
   }
 
   try {
@@ -126,8 +374,8 @@ function evaluateVolumeFullState(
 }
 
 /**
- * Quét dung lượng thực tế của một Volume trên Synology NAS / Linux / Windows.
- * Hỗ trợ đa tầng fallback (BusyBox df -k -P tránh lỗi statx seccomp trên kernel Synology cũ -> GNU df -B1 -P -> fs.statfsSync).
+ * Quét dung lượng thực tế của một phân vùng lưu trữ trên NAS / Linux / Windows.
+ * Hỗ trợ đa tầng fallback (BusyBox df -k -P tránh lỗi statx seccomp trên nhân Linux cũ -> POSIX df -k -P -> GNU df -B1 -P -> fs.statfsSync).
  */
 export async function inspectVolumeDiskSpace(mountPath: string): Promise<{
   totalBytes: number;
@@ -141,7 +389,7 @@ export async function inspectVolumeDiskSpace(mountPath: string): Promise<{
   }
 
   if (process.platform !== 'win32') {
-    // Ưu tiên 1: BusyBox df -k -P (dùng syscall statfs cổ điển, tương thích 100% với mọi Kernel Synology DSM kể cả khi seccomp chặn statx)
+    // Ưu tiên 1: BusyBox df -k -P (dùng syscall statfs cổ điển, tương thích mọi nhân Linux NAS kể cả khi seccomp chặn statx)
     try {
       const bbRes = await execLocalCommand(
         '/bin/busybox',
@@ -228,9 +476,10 @@ export async function refreshAllVolumes(): Promise<StorageVolume[]> {
   }
 
   emitVolumeUpdated();
-  return db
+  const updated = db
     .prepare('SELECT * FROM storage_volumes ORDER BY priority ASC, id ASC')
     .all() as unknown as StorageVolume[];
+  return attachCapabilitiesToVolumes(updated, true);
 }
 
 /**
@@ -243,7 +492,7 @@ export async function ensureActiveVolumeForBackup(
   const volumes = await refreshAllVolumes();
   const db = getDb();
 
-  let currentVol = volumes.find((v) => v.id === server.assigned_volume_id);
+  const currentVol = volumes.find((v) => v.id === server.assigned_volume_id);
 
   if (!currentVol) {
     const firstActive = volumes.find((v) => v.status === 'ACTIVE');
@@ -281,11 +530,17 @@ export async function ensureActiveVolumeForBackup(
     evalState.isFull;
 
   if (!isOverflow) {
+    const caps =
+      currentVol.capabilities ||
+      (await probeVolumeCapabilities(currentVol.mount_path));
     onLog(
-      `[Pre-Flight] Phân vùng ${currentVol.name} (${currentVol.mount_path}) hợp lệ — Đã dùng ${usagePercent.toFixed(
-        1
-      )}%, Trống ${freeGb.toFixed(1)} GB.`
+      `[Pre-Flight] Phân vùng ${currentVol.name} (${currentVol.mount_path}) hợp lệ [FS: ${caps.fs_type.toUpperCase()}, Hard-Link: ${
+        caps.hardlink_supported ? 'OK' : 'KHÔNG HỖ TRỢ'
+      }] — Đã dùng ${usagePercent.toFixed(1)}%, Trống ${freeGb.toFixed(1)} GB.`
     );
+    if (caps.warning) {
+      onLog(`[Pre-Flight Cảnh báo] ${caps.warning}`);
+    }
     return currentVol;
   }
 
@@ -321,9 +576,8 @@ export async function ensureActiveVolumeForBackup(
     severity: 'WARNING',
     category: 'VOLUME',
     title: `Tự động chuyển đổi Volume: ${currentVol.name} ➔ ${targetVol.name}`,
-    message: `Phân vùng ${currentVol.name} ${fullReasonText}. Hệ thống tự động thực hiện Local Seeding bản latest của ${
-      server.hostname
-    } sang ${targetVol.name} (${targetVol.mount_path}) để bảo toàn chuỗi Incremental Hard-Link.`,
+    message: `Phân vùng ${currentVol.name} ${fullReasonText}. Hệ thống tự động thực hiện Local Seeding bản latest của ${server.hostname
+      } sang ${targetVol.name} (${targetVol.mount_path}) để bảo toàn chuỗi Incremental Hard-Link.`,
     serverId: server.id,
   });
 

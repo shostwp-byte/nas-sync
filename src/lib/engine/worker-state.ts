@@ -1,10 +1,14 @@
 import type { ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
+import path from 'node:path';
 import { getDb } from '@/lib/db';
 import { emitJobLog, emitJobProgress } from '@/lib/events';
 import type { BackupJob, InProgressState } from '@/types';
+import { isSafeServerLabel, isSafeSnapshotName } from './safe-names';
 
 export const STREAM_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
+export const MAX_BACKUP_RETRIES = 10;
+export const DETACHED_PROCESS_GROUP = process.platform !== 'win32';
 
 export class RetryableNetworkError extends Error {
   readonly rsyncExitCode: number;
@@ -16,9 +20,7 @@ export class RetryableNetworkError extends Error {
 }
 
 declare global {
-  // eslint-disable-next-line no-var
   var __nasSyncCancelledJobIds: Set<number> | undefined;
-  // eslint-disable-next-line no-var
   var __nasSyncJobChildProcesses: Map<number, Set<ChildProcess>> | undefined;
 }
 
@@ -36,19 +38,35 @@ function getJobChildProcessesMap(): Map<number, Set<ChildProcess>> {
   return globalThis.__nasSyncJobChildProcesses;
 }
 
+/**
+ * N2 Fix: Gửi tín hiệu dừng tới toàn bộ Process Group (-pid) trên POSIX khi child được spawn với `detached: true`,
+ * đảm bảo không còn tiến trình con mồ côi (`ssh`, `zstd`, `mariadb`, `psql`, `rsync`) giữ mở pipe.
+ */
 export function terminateChildGracefully(child: ChildProcess): void {
-  try {
-    child.kill('SIGTERM');
-  } catch {
+  const pid = child.pid;
+  const signalProcessTree = (sig: NodeJS.Signals): boolean => {
+    if (pid && pid > 0 && process.platform !== 'win32') {
+      try {
+        process.kill(-pid, sig);
+        return true;
+      } catch {
+        // Fallback nếu tiến trình không phải group leader hoặc đã thoát
+      }
+    }
+    try {
+      return child.kill(sig);
+    } catch {
+      return false;
+    }
+  };
+
+  if (!signalProcessTree('SIGTERM')) {
     return;
   }
+
   const forceTimer = setTimeout(() => {
-    try {
-      if (child.exitCode === null) {
-        child.kill('SIGKILL');
-      }
-    } catch {
-      // Ignore if already exited
+    if (child.exitCode === null) {
+      signalProcessTree('SIGKILL');
     }
   }, 5000);
   forceTimer.unref();
@@ -115,6 +133,139 @@ export function throwIfCancelled(
   if (isJobCancelled(jobId)) {
     throw new Error(message);
   }
+}
+
+/**
+ * N6 Fix: Xóa thư mục tạm `.in_progress_<snapshot>` khi Job chuyển sang trạng thái kết thúc lỗi/hủy
+ * (FAILED / CANCELLED) để không rò rỉ dung lượng ổ đĩa NAS qua nhiều đêm.
+ */
+export function cleanupInProgressSnapshotDirsForJob(jobId: number): void {
+  try {
+    const db = getDb();
+    const row = db
+      .prepare(
+        `SELECT j.server_id, j.snapshot_name, j.job_type, s.hostname
+         FROM backup_jobs j
+         LEFT JOIN servers s ON s.id = j.server_id
+         WHERE j.id = ?`
+      )
+      .get(jobId);
+
+    if (!row || String(row.job_type) !== 'BACKUP') return;
+
+    const serverId = Number(row.server_id);
+    const hostname = String(row.hostname || '').trim();
+    const snapshotName = String(row.snapshot_name || '').trim();
+    if (
+      !hostname ||
+      !snapshotName ||
+      !isSafeServerLabel(hostname) ||
+      !isSafeSnapshotName(snapshotName)
+    ) {
+      return;
+    }
+
+    // Không xóa nếu vẫn còn một Job khác của cùng server đang giữ cùng tên snapshot ở trạng thái hoạt động/chờ resume
+    const otherActive = db
+      .prepare(
+        `SELECT COUNT(*) AS cnt
+         FROM backup_jobs
+         WHERE server_id = ?
+           AND snapshot_name = ?
+           AND id != ?
+           AND status IN ('QUEUED', 'RUNNING', 'RESUMING', 'VERIFYING', 'INTERRUPTED')`
+      )
+      .get(serverId, snapshotName, jobId);
+    if (Number(otherActive?.cnt || 0) > 0) {
+      return;
+    }
+
+    const volumes = db
+      .prepare('SELECT mount_path FROM storage_volumes')
+      .all();
+    for (const vol of volumes) {
+      const mountPath = String(vol.mount_path || '').trim();
+      if (!mountPath) continue;
+      const hostDir = path.resolve(mountPath, hostname);
+      const targetDir = path.resolve(hostDir, `.in_progress_${snapshotName}`);
+      if (path.dirname(targetDir) !== hostDir || !fs.existsSync(targetDir)) {
+        continue;
+      }
+      const lst = fs.lstatSync(targetDir, { throwIfNoEntry: false });
+      if (lst && !lst.isSymbolicLink() && lst.isDirectory()) {
+        fs.rmSync(targetDir, { recursive: true, force: true });
+      }
+    }
+  } catch (err) {
+    console.warn(
+      `[NAS-Sync Cleanup] Không thể dọn thư mục .in_progress cho Job #${jobId}:`,
+      (err as Error).message
+    );
+  }
+}
+
+/**
+ * N6 Fix: Quét dọn các thư mục `.in_progress_*` mồ côi lúc khởi động nếu không còn bất kỳ Job
+ * QUEUED/RUNNING/RESUMING/VERIFYING/INTERRUPTED nào tham chiếu tới.
+ */
+export function sweepOrphanedInProgressDirsOnStartup(): number {
+  let removed = 0;
+  try {
+    const db = getDb();
+    const volumes = db.prepare('SELECT mount_path FROM storage_volumes').all();
+    const servers = db.prepare('SELECT id, hostname FROM servers').all();
+    const activeStmt = db.prepare(
+      `SELECT COUNT(*) AS cnt
+       FROM backup_jobs
+       WHERE server_id = ?
+         AND snapshot_name = ?
+         AND status IN ('QUEUED', 'RUNNING', 'RESUMING', 'VERIFYING', 'INTERRUPTED')`
+    );
+
+    for (const vol of volumes) {
+      const mountPath = String(vol.mount_path || '').trim();
+      if (!mountPath || !fs.existsSync(mountPath)) continue;
+
+      for (const srv of servers) {
+        const serverId = Number(srv.id);
+        const hostname = String(srv.hostname || '').trim();
+        if (!hostname || !isSafeServerLabel(hostname)) continue;
+
+        const hostDir = path.resolve(mountPath, hostname);
+        if (!fs.existsSync(hostDir)) continue;
+
+        let entries: fs.Dirent[] = [];
+        try {
+          entries = fs.readdirSync(hostDir, { withFileTypes: true });
+        } catch {
+          continue;
+        }
+
+        for (const entry of entries) {
+          if (!entry.name.startsWith('.in_progress_')) continue;
+          const snapName = entry.name.slice('.in_progress_'.length);
+          if (!snapName || !isSafeSnapshotName(snapName)) continue;
+
+          const activeCnt = Number(activeStmt.get(serverId, snapName)?.cnt || 0);
+          if (activeCnt > 0) continue;
+
+          const fullDir = path.resolve(hostDir, entry.name);
+          if (path.dirname(fullDir) !== hostDir) continue;
+          const lst = fs.lstatSync(fullDir, { throwIfNoEntry: false });
+          if (lst && !lst.isSymbolicLink() && lst.isDirectory()) {
+            fs.rmSync(fullDir, { recursive: true, force: true });
+            removed++;
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.warn(
+      '[NAS-Sync Cleanup] Lỗi khi quét thư mục .in_progress mồ côi lúc khởi động:',
+      (err as Error).message
+    );
+  }
+  return removed;
 }
 
 export function loadOrCreateState(

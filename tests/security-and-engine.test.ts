@@ -282,7 +282,7 @@ describe('3. config-rewriter (wp-config.php, .env, configuration.php)', () => {
       dbRenameMap: { src_db: 'dst_db' },
       isMock: true,
       mockWebrootDir: mockWebroot,
-      onLog: () => {},
+      onLog: () => { },
     });
 
     assert.deepEqual(res.patchedFiles, ['wp-config.php']);
@@ -312,7 +312,7 @@ describe('4. totp + qr-svg RFC 6238 verification, recovery codes, QR matrix', ()
     assert.equal(verifyTotpCode(secret, '000000', fixedNow) && currentCode !== '000000', false);
 
     const encrypted = encryptTotpSecret(secret);
-    assert.ok(encrypted.startsWith('v1:'));
+    assert.ok(encrypted.startsWith('v2:'));
     assert.equal(decryptTotpSecret(encrypted), secret);
   });
 
@@ -396,7 +396,7 @@ describe('5. anomaly-detector & retention-gfs GFS bucket retention', () => {
       filesChanged: 500,
       deltaSizeBytes: 500 * 1024 * 1024,
       isFirstBackup: true,
-      onLog: () => {},
+      onLog: () => { },
     });
     assert.equal(firstCheck.anomalyDetected, false);
 
@@ -408,7 +408,7 @@ describe('5. anomaly-detector & retention-gfs GFS bucket retention', () => {
       filesChanged: 900,
       deltaSizeBytes: 512 * 1024 * 1024,
       isFirstBackup: false,
-      onLog: () => {},
+      onLog: () => { },
     });
     assert.equal(anomalyCheck.anomalyDetected, true);
     assert.equal(anomalyCheck.pinnedPreviousCount, 1);
@@ -514,15 +514,14 @@ describe('6. SSH TOFU Host Key pinning, API sanitizer & Morning Digest / Top Dom
       .run();
     const serverId = Number(ins.lastInsertRowid);
 
-    // 1. Before pinning: StrictHostKeyChecking=accept-new
+    // 1. Before pinning: fail-closed (no accept-new fallback allowed!)
     const unpinnedSrv = db
       .prepare('SELECT * FROM servers WHERE id = ?')
       .get(serverId) as unknown as ServerRecord;
     assert.equal(unpinnedSrv.host_key_status, 'UNPINNED');
     assert.equal(materializeServerKnownHostsFile(unpinnedSrv), null);
-    assert.ok(
-      buildSshBaseArgs(unpinnedSrv).includes('StrictHostKeyChecking=accept-new')
-    );
+    assert.throws(() => buildSshBaseArgs(unpinnedSrv), /\[SECURITY\]/);
+    assert.throws(() => buildRsyncSshTransport(unpinnedSrv), /\[SECURITY\]/);
 
     // 2. First connection: TOFU pins key A -> VERIFIED + StrictHostKeyChecking=yes
     const firstPin = await ensureServerHostKeyPinned(
@@ -705,7 +704,7 @@ describe('7. v1.5.0 Offsite AES-256-GCM Crypto, Cloud SigV4/GDrive JWT, New Pane
     const pass = 'Strong-Offsite-Passphrase-2026!';
 
     const encChunks: Buffer[] = [];
-    const encStream = createOffsiteEncryptStream(pass, 2048);
+    const encStream = createOffsiteEncryptStream(pass, 2048, { iterations: 10_000 });
     encStream.on('data', (c: Buffer) => encChunks.push(c));
     await pipeline(
       Readable.from([
@@ -717,9 +716,10 @@ describe('7. v1.5.0 Offsite AES-256-GCM Crypto, Cloud SigV4/GDrive JWT, New Pane
     );
 
     const encryptedBlob = Buffer.concat(encChunks);
-    assert.equal(encryptedBlob.subarray(0, 8).toString('ascii'), 'NASSYNC1');
+    assert.equal(encryptedBlob.subarray(0, 8).toString('ascii'), 'NASSYNC2');
     assert.equal(encryptedBlob[8], 0x01);
-    assert.equal(encryptedBlob.readUInt32BE(41), 2048);
+    assert.equal(encryptedBlob.readUInt32BE(9), 10_000);
+    assert.equal(encryptedBlob.readUInt32BE(45), 2048);
 
     // 1. Giải mã hợp lệ qua luồng bị cắt lẻ ngẫu nhiên -> khớp 100% byte-for-byte
     const decChunks: Buffer[] = [];
@@ -728,15 +728,15 @@ describe('7. v1.5.0 Offsite AES-256-GCM Crypto, Cloud SigV4/GDrive JWT, New Pane
     await pipeline(
       Readable.from([
         encryptedBlob.subarray(0, 17),
-        encryptedBlob.subarray(17, 45),
-        encryptedBlob.subarray(45, 3100),
+        encryptedBlob.subarray(17, 49),
+        encryptedBlob.subarray(49, 3100),
         encryptedBlob.subarray(3100),
       ]),
       decStream
     );
     assert.deepEqual(Buffer.concat(decChunks), plainOriginal);
 
-    // 2. Kiểm tra standalone CLI `scripts/decrypt-offsite-backup.mjs`
+    // 2. Kiểm tra standalone CLI `scripts/decrypt-offsite-backup.mjs` (qua biến môi trường NAS_SYNC_PASSPHRASE)
     const encFile = path.join(tempRootDir, 'test-archive.tar.gz.enc');
     const outDecFile = path.join(tempRootDir, 'test-archive.tar.gz');
     fs.writeFileSync(encFile, encryptedBlob);
@@ -746,11 +746,27 @@ describe('7. v1.5.0 Offsite AES-256-GCM Crypto, Cloud SigV4/GDrive JWT, New Pane
         path.resolve(process.cwd(), 'scripts/decrypt-offsite-backup.mjs'),
         encFile,
         outDecFile,
-        pass,
       ],
-      { stdio: 'pipe' }
+      {
+        stdio: 'pipe',
+        env: { ...process.env, NAS_SYNC_PASSPHRASE: pass },
+      }
     );
     assert.deepEqual(fs.readFileSync(outDecFile), plainOriginal);
+
+    // 2b. Đảm bảo CLI từ chối tham số vị trí thứ 3 (chống rò rỉ passphrase qua ps aux)
+    assert.throws(() => {
+      execFileSync(
+        process.execPath,
+        [
+          path.resolve(process.cwd(), 'scripts/decrypt-offsite-backup.mjs'),
+          encFile,
+          outDecFile,
+          pass,
+        ],
+        { stdio: 'pipe' }
+      );
+    });
 
     // 3. Đảo 1 bit trong vùng ciphertext -> bắt buộc ném lỗi xác thực AES-256-GCM
     const tampered = Buffer.from(encryptedBlob);
@@ -1029,10 +1045,10 @@ describe('7. v1.5.0 Offsite AES-256-GCM Crypto, Cloud SigV4/GDrive JWT, New Pane
     const items = db
       .prepare('SELECT domain_name, verification_status, databases_list FROM backup_items WHERE job_id = ?')
       .all(hestiaJobId) as Array<{
-      domain_name: string;
-      verification_status: string;
-      databases_list: string;
-    }>;
+        domain_name: string;
+        verification_status: string;
+        databases_list: string;
+      }>;
     assert.ok(items.length >= 2);
     for (const it of items) {
       assert.equal(it.verification_status, 'PASSED');
@@ -1096,7 +1112,7 @@ describe('7. v1.5.0 Offsite AES-256-GCM Crypto, Cloud SigV4/GDrive JWT, New Pane
       domains: [],
       inProgressDir: tempRootDir,
       latestSnapshotDir: null,
-      appendLog: () => {},
+      appendLog: () => { },
     });
     assert.deepEqual(zeroExtras, { deltaBytes: 0, totalBytes: 0 });
 
@@ -1155,6 +1171,7 @@ describe('7. v1.5.0 Offsite AES-256-GCM Crypto, Cloud SigV4/GDrive JWT, New Pane
     );
     const s3Addr = mockS3Server.address() as { port: number };
 
+    const prevAllowPrivateS3 = process.env.ALLOW_PRIVATE_S3_ENDPOINT;
     try {
       setSettings({
         offsite_provider: 'S3_COMPATIBLE',
@@ -1168,6 +1185,16 @@ describe('7. v1.5.0 Offsite AES-256-GCM Crypto, Cloud SigV4/GDrive JWT, New Pane
         offsite_encryption_passphrase: 'Offsite-Vault-Secret-Passphrase!',
         offsite_keep_count: '1',
       });
+
+      // Mặc định chặn SSRF khi trỏ S3 Endpoint về loopback/private IP
+      delete process.env.ALLOW_PRIVATE_S3_ENDPOINT;
+      await assert.rejects(
+        () => testOffsiteConnection(),
+        /\[SECURITY\]|nội bộ|loopback|metadata/i
+      );
+
+      // Cho phép mock server nội bộ khi bật cờ kiểm thử ALLOW_PRIVATE_S3_ENDPOINT=true
+      process.env.ALLOW_PRIVATE_S3_ENDPOINT = 'true';
 
       const connTest = await testOffsiteConnection({
         offsite_s3_secret_key: '••••••••', // Phải bỏ qua chuỗi mask và lấy secret thật từ DB!
@@ -1198,6 +1225,11 @@ describe('7. v1.5.0 Offsite AES-256-GCM Crypto, Cloud SigV4/GDrive JWT, New Pane
       assert.equal(tarGzBuf[0], 0x1f);
       assert.equal(tarGzBuf[1], 0x8b);
     } finally {
+      if (prevAllowPrivateS3 === undefined) {
+        delete process.env.ALLOW_PRIVATE_S3_ENDPOINT;
+      } else {
+        process.env.ALLOW_PRIVATE_S3_ENDPOINT = prevAllowPrivateS3;
+      }
       setSettings({ offsite_provider: 'NONE' });
       await new Promise<void>((resolve) => mockS3Server.close(() => resolve()));
     }
@@ -1210,10 +1242,10 @@ describe('8. v1.5.6 POSIX sh -n syntax validation across all 7 live Panel Adapte
     const shCandidates =
       process.platform === 'win32'
         ? [
-            'C:\\Program Files\\Git\\bin\\sh.exe',
-            'C:\\Program Files\\Git\\usr\\bin\\sh.exe',
-            'sh',
-          ]
+          'C:\\Program Files\\Git\\bin\\sh.exe',
+          'C:\\Program Files\\Git\\usr\\bin\\sh.exe',
+          'sh',
+        ]
         : ['/bin/sh', 'sh'];
 
     const shBin = shCandidates.find((cand) => {
@@ -1313,7 +1345,7 @@ describe('8. v1.5.6 POSIX sh -n syntax validation across all 7 live Panel Adapte
           switch (srv.panel_type) {
             case 'DIRECTADMIN':
               if (remoteCommand.includes('/usr/local/directadmin/conf/mysql.conf') && !remoteCommand.includes('USERDBS|')) {
-                return { code: 0, stdout: 'da_admin\ns3cr3t_da\n', stderr: '' };
+                return { code: 0, stdout: 'OK|da_admin\n', stderr: '' };
               }
               if (remoteCommand.includes('USERDBS|')) {
                 return {
@@ -1335,7 +1367,7 @@ describe('8. v1.5.6 POSIX sh -n syntax validation across all 7 live Panel Adapte
 
             case 'CPANEL':
               if (remoteCommand.includes('ERR_NO_MYCNF')) {
-                return { code: 0, stdout: 'OK|root|cpanel_pw\n', stderr: '' };
+                return { code: 0, stdout: 'OK|root\n', stderr: '' };
               }
               if (remoteCommand.includes('USERDBS|')) {
                 return {
@@ -1351,8 +1383,8 @@ describe('8. v1.5.6 POSIX sh -n syntax validation across all 7 live Panel Adapte
               return { code: 0, stdout: '/home/cpuser/public_html\n', stderr: '' };
 
             case 'PLESK':
-              if (remoteCommand.includes('cat /etc/psa/.psa.shadow')) {
-                return { code: 0, stdout: '$AES-128-CBC$plesk_pw\n', stderr: '' };
+              if (remoteCommand.includes('then echo OK; else exit 1')) {
+                return { code: 0, stdout: 'OK\n', stderr: '' };
               }
               if (remoteCommand.includes('SET SESSION group_concat_max_len')) {
                 return {
@@ -1369,8 +1401,8 @@ describe('8. v1.5.6 POSIX sh -n syntax validation across all 7 live Panel Adapte
               };
 
             case 'AAPANEL':
-              if (remoteCommand.includes('SELECT mysql_root FROM config')) {
-                return { code: 0, stdout: 'aa_pw\n', stderr: '' };
+              if (remoteCommand.includes('FROM config WHERE id=1')) {
+                return { code: 0, stdout: 'OK\n', stderr: '' };
               }
               if (remoteCommand.includes('SELECT id, name, path FROM sites')) {
                 return {
@@ -1392,7 +1424,7 @@ describe('8. v1.5.6 POSIX sh -n syntax validation across all 7 live Panel Adapte
 
             case 'CYBERPANEL':
               if (remoteCommand.includes('ERR_NO_CRED')) {
-                return { code: 0, stdout: 'MYCNF|root|cyber_pw\n', stderr: '' };
+                return { code: 0, stdout: 'MYCNF|root\n', stderr: '' };
               }
               if (remoteCommand.includes('websiteFunctions_websites')) {
                 return {
@@ -1406,7 +1438,7 @@ describe('8. v1.5.6 POSIX sh -n syntax validation across all 7 live Panel Adapte
 
             case 'HESTIACP':
               if (remoteCommand.includes('ERR_NO_CONF')) {
-                return { code: 0, stdout: 'HESTIA|root|hestia_pw\n', stderr: '' };
+                return { code: 0, stdout: 'HESTIA|root\n', stderr: '' };
               }
               if (remoteCommand.includes('parse_hestia_conf')) {
                 return {

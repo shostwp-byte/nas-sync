@@ -1,4 +1,4 @@
-# Chuẩn hóa ký tự xuống dòng LF cho toàn bộ mã nguồn để chạy trực tiếp trên Linux / Synology NAS
+# Chuẩn hóa ký tự xuống dòng LF cho toàn bộ mã nguồn để chạy trực tiếp trên mọi thiết bị NAS & Linux Docker Host
 * text=auto eol=lf
 *.sh text eol=lf
 *.ts text eol=lf

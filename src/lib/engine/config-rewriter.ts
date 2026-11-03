@@ -1,15 +1,26 @@
 import { spawn } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { getDataDir } from '@/lib/db';
-import { buildSshBaseArgs, execRemoteSSH, shellSingleQuote, wrapZeroImpact } from '@/lib/ssh';
+import {
+  buildSshBaseArgs,
+  execRemoteSSH,
+  shellSingleQuote,
+  wrapZeroImpact,
+} from '@/lib/ssh';
 import type { ServerRecord } from '@/types';
 import {
+  assertSafe,
   isSafeDbName,
   isSafeDomain,
   isSafeSystemUser,
   isSafeWebroot,
 } from './safe-names';
+import {
+  DETACHED_PROCESS_GROUP,
+  terminateChildGracefully,
+} from './worker-state';
 
 const CANDIDATE_CONFIG_FILES = [
   'wp-config.php',
@@ -23,6 +34,139 @@ const MAX_CONFIG_FILE_BYTES = 256 * 1024; // 256 KB
 
 function escapeRegExp(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function resolveEffectiveSiteUser(
+  server: ServerRecord,
+  targetUser: string
+): string {
+  const clean = targetUser.trim();
+  if (server.panel_type === 'AAPANEL' && (!clean || clean === 'root')) {
+    return 'www';
+  }
+  return clean || 'root';
+}
+
+function wrapPrivilegeDropToSiteUser(
+  siteUser: string,
+  innerWorkerScript: string
+): string {
+  assertSafe(isSafeSystemUser, siteUser, 'siteUser');
+  const quotedUser = shellSingleQuote(siteUser);
+  const quotedInner = shellSingleQuote(innerWorkerScript);
+  return [
+    `SITE_USER=${quotedUser}`,
+    `INNER_SCRIPT=${quotedInner}`,
+    'if [ "$SITE_USER" != "root" ] && [ "$(id -u)" = "0" ] && id -u "$SITE_USER" >/dev/null 2>&1; then',
+    '  if command -v runuser >/dev/null 2>&1; then',
+    '    exec runuser -u "$SITE_USER" -- sh -c "$INNER_SCRIPT"',
+    '  else',
+    '    exec su -s /bin/sh "$SITE_USER" -c "$INNER_SCRIPT"',
+    '  fi',
+    'else',
+    '  exec sh -c "$INNER_SCRIPT"',
+    'fi',
+  ].join('\n');
+}
+
+/**
+ * S2 Security Fix: Kiểm tra từng thành phần đường dẫn không chứa symlink, hạ quyền xuống user của site,
+ * và dùng `mktemp` (O_CREAT|O_EXCL) kết hợp `mv -f` (rename nguyên tử không đi theo symlink đích) để chặn tuyệt đối
+ * kịch bản tạo sẵn `wp-config.php.nas-sync.bak -> /root/.ssh/authorized_keys`.
+ */
+export function buildSafeConfigWriteScript(
+  cleanTargetWebroot: string,
+  relFile: string,
+  siteUser: string
+): string {
+  assertSafe((v) => isSafeWebroot(v, 2), cleanTargetWebroot, 'cleanTargetWebroot');
+  assertSafe(isSafeSystemUser, siteUser, 'siteUser');
+  if (
+    !CANDIDATE_CONFIG_FILES.includes(
+      relFile as (typeof CANDIDATE_CONFIG_FILES)[number]
+    )
+  ) {
+    throw new Error(`Tệp cấu hình không nằm trong danh sách cho phép: ${relFile}`);
+  }
+
+  const workerBody = [
+    'set -e',
+    `WEBROOT=${shellSingleQuote(cleanTargetWebroot)}`,
+    `REL=${shellSingleQuote(relFile)}`,
+    '[ ! -L "$WEBROOT" ]',
+    'REAL_ROOT=$(realpath -e -- "$WEBROOT")',
+    'CUR="$REAL_ROOT"',
+    'OLD_IFS="$IFS"',
+    'IFS="/"',
+    'for SEG in $REL; do',
+    '  [ -z "$SEG" ] && continue',
+    '  CUR="$CUR/$SEG"',
+    '  [ ! -L "$CUR" ] || exit 92',
+    'done',
+    'IFS="$OLD_IFS"',
+    'F="$CUR"',
+    '[ -f "$F" ] && [ ! -L "$F" ]',
+    'D_DIR=$(dirname -- "$F")',
+    '[ -d "$D_DIR" ] && [ ! -L "$D_DIR" ]',
+    'REAL_F=$(realpath -e -- "$F")',
+    'case "$REAL_F" in "$REAL_ROOT"/*) ;; *) exit 92 ;; esac',
+    'BAK_TMP=$(mktemp "$D_DIR/.nas-sync-bak.XXXXXX")',
+    'TMP_NEW=$(mktemp "$D_DIR/.nas-sync-tmp.XXXXXX")',
+    'trap \'rm -f -- "$BAK_TMP" "$TMP_NEW"\' EXIT',
+    'cp -P -- "$REAL_F" "$BAK_TMP"',
+    'chmod 600 -- "$BAK_TMP"',
+    'cat > "$TMP_NEW"',
+    'chmod --reference="$REAL_F" "$TMP_NEW" 2>/dev/null || chmod 640 "$TMP_NEW"',
+    'if [ "$(id -u)" = "0" ]; then chown --reference="$REAL_F" "$BAK_TMP" "$TMP_NEW" 2>/dev/null || true; fi',
+    'rm -f -- "$REAL_F.nas-sync.bak"',
+    'mv -f -- "$BAK_TMP" "$REAL_F.nas-sync.bak"',
+    'mv -f -- "$TMP_NEW" "$REAL_F"',
+    'trap - EXIT',
+  ].join('\n');
+
+  return wrapPrivilegeDropToSiteUser(siteUser, workerBody);
+}
+
+export function buildSafeConfigReadScript(
+  cleanTargetWebroot: string,
+  relFile: string,
+  siteUser: string
+): string {
+  assertSafe((v) => isSafeWebroot(v, 2), cleanTargetWebroot, 'cleanTargetWebroot');
+  assertSafe(isSafeSystemUser, siteUser, 'siteUser');
+  if (
+    !CANDIDATE_CONFIG_FILES.includes(
+      relFile as (typeof CANDIDATE_CONFIG_FILES)[number]
+    )
+  ) {
+    throw new Error(`Tệp cấu hình không nằm trong danh sách cho phép: ${relFile}`);
+  }
+
+  const workerBody = [
+    'set -e',
+    `WEBROOT=${shellSingleQuote(cleanTargetWebroot)}`,
+    `REL=${shellSingleQuote(relFile)}`,
+    '[ ! -L "$WEBROOT" ]',
+    'REAL_ROOT=$(realpath -e -- "$WEBROOT")',
+    'CUR="$REAL_ROOT"',
+    'OLD_IFS="$IFS"',
+    'IFS="/"',
+    'for SEG in $REL; do',
+    '  [ -z "$SEG" ] && continue',
+    '  CUR="$CUR/$SEG"',
+    '  [ ! -L "$CUR" ] || exit 92',
+    'done',
+    'IFS="$OLD_IFS"',
+    'F="$CUR"',
+    '[ -f "$F" ] && [ ! -L "$F" ]',
+    'REAL_F=$(realpath -e -- "$F")',
+    'case "$REAL_F" in "$REAL_ROOT"/*) ;; *) exit 92 ;; esac',
+    'SZ=$(wc -c < "$REAL_F" | tr -d "[:space:]")',
+    `[ -n "$SZ" ] && [ "$SZ" -gt 0 ] && [ "$SZ" -le ${MAX_CONFIG_FILE_BYTES} ]`,
+    'cat -- "$REAL_F"',
+  ].join('\n');
+
+  return wrapPrivilegeDropToSiteUser(siteUser, workerBody);
 }
 
 export function applyConfigReplacements(
@@ -71,7 +215,6 @@ export function applyConfigReplacements(
         (_m, pre: string, _q: string, post: string) => `${pre}${newDb}${post}`
       );
     } else if (baseName === 'config.php' || normRel === 'app/etc/env.php') {
-      // Hằng số define('DB_DATABASE' | 'DB_NAME', 'oldDb')
       const defineDbRe = new RegExp(
         `define\\(\\s*(['"])(DB_DATABASE|DB_NAME)\\1\\s*,\\s*(['"])${escapedOld}\\3\\s*\\)`,
         'gi'
@@ -82,7 +225,6 @@ export function applyConfigReplacements(
           `define(${q1}${key}${q1}, ${q2}${newDb}${q2})`
       );
 
-      // Mảng cấu hình PHP: 'dbname' => 'oldDb', 'database' => 'oldDb', 'db_name' => 'oldDb'
       const arrayDbRe = new RegExp(
         `((['"])(?:dbname|database|db_name)\\2\\s*=>\\s*(['"]))${escapedOld}(\\3)`,
         'gi'
@@ -93,7 +235,6 @@ export function applyConfigReplacements(
           `${pre}${newDb}${post}`
       );
 
-      // Biến PHP: $dbname = 'oldDb' | $db_name = 'oldDb' | $database = 'oldDb'
       const varDbRe = new RegExp(
         `(\\$(?:dbname|db_name|database)\\s*=\\s*(['"]))${escapedOld}(\\2)`,
         'gi'
@@ -118,31 +259,17 @@ function writeRemoteFileAtomicallyOverSsh(
   server: ServerRecord,
   cleanTargetWebroot: string,
   relFile: string,
+  siteUser: string,
   content: string,
   timeoutMs = 20000
 ): Promise<void> {
   const sshUser = (server.ssh_user || 'root').trim();
   const ipAddr = (server.ip_address || '').trim();
-  const remoteFile = `${cleanTargetWebroot}/${relFile}`;
-
-  const innerScript = [
-    'set -e',
-    `WEBROOT=${shellSingleQuote(cleanTargetWebroot)}`,
-    `F=${shellSingleQuote(remoteFile)}`,
-    'REAL_ROOT=$(realpath -e -- "$WEBROOT")',
-    '[ -f "$F" ] && [ ! -L "$F" ]',
-    'D_DIR=$(dirname -- "$F")',
-    '[ ! -L "$D_DIR" ]',
-    'REAL_F=$(realpath -e -- "$F")',
-    'case "$REAL_F" in "$REAL_ROOT"/*) ;; *) exit 1 ;; esac',
-    'cp -p -- "$F" "$F.nas-sync.bak"',
-    'chmod 600 -- "$F.nas-sync.bak"',
-    'TMP="$F.nas-sync.tmp.$$"',
-    'cat > "$TMP"',
-    'chmod --reference="$F" "$TMP" 2>/dev/null || chmod 640 "$TMP"',
-    'chown --reference="$F" "$TMP" 2>/dev/null || true',
-    'mv -f -- "$TMP" "$F"',
-  ].join('\n');
+  const innerScript = buildSafeConfigWriteScript(
+    cleanTargetWebroot,
+    relFile,
+    siteUser
+  );
 
   const remoteCmd = wrapZeroImpact(innerScript);
   const args = [
@@ -156,6 +283,7 @@ function writeRemoteFileAtomicallyOverSsh(
     const child = spawn('ssh', args, {
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
+      detached: DETACHED_PROCESS_GROUP,
     });
 
     let stderr = '';
@@ -164,11 +292,7 @@ function writeRemoteFileAtomicallyOverSsh(
     const timer = setTimeout(() => {
       if (!settled) {
         settled = true;
-        try {
-          child.kill('SIGKILL');
-        } catch {
-          // Ignore
-        }
+        terminateChildGracefully(child);
         reject(
           new Error(`Quá thời gian chờ khi ghi cấu hình ${relFile} qua SSH.`)
         );
@@ -207,6 +331,22 @@ function writeRemoteFileAtomicallyOverSsh(
     });
     child.stdin.end(Buffer.from(content, 'utf8'));
   });
+}
+
+function hasAnySymlinkAlongRelativePath(
+  rootDir: string,
+  relFile: string
+): boolean {
+  const segments = relFile.split('/').filter(Boolean);
+  let cur = rootDir;
+  for (const seg of segments) {
+    cur = path.join(cur, seg);
+    const lst = fs.lstatSync(cur, { throwIfNoEntry: false });
+    if (!lst || lst.isSymbolicLink()) {
+      return true;
+    }
+  }
+  return false;
 }
 
 export async function patchRestoredWebConfigOverSsh(params: {
@@ -268,10 +408,16 @@ export async function patchRestoredWebConfigOverSsh(params: {
       return { patchedFiles: [] };
     }
 
+    const rootStat = fs.lstatSync(rootDir, { throwIfNoEntry: false });
+    if (!rootStat || rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
+      return { patchedFiles: [] };
+    }
+
     const realRoot = fs.realpathSync(rootDir);
     for (const relFile of CANDIDATE_CONFIG_FILES) {
       const fullPath = path.resolve(rootDir, relFile);
       if (!fs.existsSync(fullPath)) continue;
+      if (hasAnySymlinkAlongRelativePath(rootDir, relFile)) continue;
 
       const lst = fs.lstatSync(fullPath);
       if (
@@ -298,11 +444,29 @@ export async function patchRestoredWebConfigOverSsh(params: {
       });
 
       if (updated !== original) {
+        const parentDir = path.dirname(fullPath);
+        const nonce = crypto.randomBytes(6).toString('hex');
+        const bakTmp = path.join(parentDir, `.nas-sync-bak.${nonce}`);
+        const newTmp = path.join(parentDir, `.nas-sync-tmp.${nonce}`);
         const bakPath = `${fullPath}.nas-sync.bak`;
-        const tmpPath = `${fullPath}.nas-sync.tmp`;
-        fs.copyFileSync(fullPath, bakPath);
-        fs.writeFileSync(tmpPath, updated, 'utf8');
-        fs.renameSync(tmpPath, fullPath);
+        try {
+          fs.writeFileSync(bakTmp, original, {
+            encoding: 'utf8',
+            mode: 0o600,
+            flag: 'wx',
+          });
+          fs.writeFileSync(newTmp, updated, {
+            encoding: 'utf8',
+            mode: 0o640,
+            flag: 'wx',
+          });
+          fs.rmSync(bakPath, { force: true });
+          fs.renameSync(bakTmp, bakPath);
+          fs.renameSync(newTmp, fullPath);
+        } finally {
+          fs.rmSync(bakTmp, { force: true });
+          fs.rmSync(newTmp, { force: true });
+        }
         patchedFiles.push(relFile);
         onLog(
           `[Config Rewriter] Đã tự động cập nhật cấu hình ${relFile} (sao lưu bản gốc tại ${relFile}.nas-sync.bak).`
@@ -321,27 +485,38 @@ export async function patchRestoredWebConfigOverSsh(params: {
     throw new Error('Thông số mục tiêu không hợp lệ để cập nhật file cấu hình.');
   }
 
+  const effectiveSiteUser = resolveEffectiveSiteUser(server, targetUser);
+
   const quotedCandidates = CANDIDATE_CONFIG_FILES.map((c) =>
     shellSingleQuote(c)
   ).join(' ');
   const probeScript = [
     `WEBROOT=${shellSingleQuote(cleanTargetWebroot)}`,
+    '[ ! -L "$WEBROOT" ] || exit 0',
     'REAL_ROOT=$(realpath -e -- "$WEBROOT" 2>/dev/null) || exit 0',
     `for REL in ${quotedCandidates}; do`,
-    '  F="$WEBROOT/$REL"',
+    '  CUR="$REAL_ROOT"',
+    '  BAD_LINK=0',
+    '  OLD_IFS="$IFS"',
+    '  IFS="/"',
+    '  for SEG in $REL; do',
+    '    [ -z "$SEG" ] && continue',
+    '    CUR="$CUR/$SEG"',
+    '    if [ -L "$CUR" ]; then BAD_LINK=1; break; fi',
+    '  done',
+    '  IFS="$OLD_IFS"',
+    '  [ "$BAD_LINK" = "0" ] || continue',
+    '  F="$CUR"',
     '  if [ -f "$F" ] && [ ! -L "$F" ]; then',
-    '    D_DIR=$(dirname -- "$F")',
-    '    if [ ! -L "$D_DIR" ]; then',
-    '      REAL_F=$(realpath -e -- "$F" 2>/dev/null || true)',
-    '      case "$REAL_F" in',
-    '        "$REAL_ROOT"/*)',
-    '          SZ=$(wc -c < "$F" 2>/dev/null | tr -d "[:space:]")',
-    `          if [ -n "$SZ" ] && [ "$SZ" -gt 0 ] && [ "$SZ" -le ${MAX_CONFIG_FILE_BYTES} ]; then`,
-    '            printf "%s\\n" "$REL"',
-    '          fi',
-    '          ;;',
-    '      esac',
-    '    fi',
+    '    REAL_F=$(realpath -e -- "$F" 2>/dev/null || true)',
+    '    case "$REAL_F" in',
+    '      "$REAL_ROOT"/*)',
+    '        SZ=$(wc -c < "$REAL_F" 2>/dev/null | tr -d "[:space:]")',
+    `        if [ -n "$SZ" ] && [ "$SZ" -gt 0 ] && [ "$SZ" -le ${MAX_CONFIG_FILE_BYTES} ]; then`,
+    '          printf "%s\\n" "$REL"',
+    '        fi',
+    '        ;;',
+    '    esac',
     '  fi',
     'done',
   ].join('\n');
@@ -362,12 +537,15 @@ export async function patchRestoredWebConfigOverSsh(params: {
     .filter((s) => allowedSet.has(s));
 
   for (const relFile of foundCandidates) {
-    const remoteFile = `${cleanTargetWebroot}/${relFile}`;
-    const readRes = await execRemoteSSH(
-      server,
-      `cat -- ${shellSingleQuote(remoteFile)}`,
-      { zeroImpact: true, timeoutMs: 20000 }
+    const readScript = buildSafeConfigReadScript(
+      cleanTargetWebroot,
+      relFile,
+      effectiveSiteUser
     );
+    const readRes = await execRemoteSSH(server, readScript, {
+      zeroImpact: true,
+      timeoutMs: 20000,
+    });
     if (readRes.code !== 0 || !readRes.stdout || readRes.stdout.includes('\0')) {
       continue;
     }
@@ -383,6 +561,7 @@ export async function patchRestoredWebConfigOverSsh(params: {
         server,
         cleanTargetWebroot,
         relFile,
+        effectiveSiteUser,
         updated
       );
       patchedFiles.push(relFile);
