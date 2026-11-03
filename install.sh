@@ -1,23 +1,27 @@
 #!/usr/bin/env bash
-set -euo pipefail
+if [ -z "${BASH_VERSION:-}" ] && command -v bash >/dev/null 2>&1; then
+  exec bash "$0" "$@"
+fi
+set -eu
+if (set -o pipefail) 2>/dev/null; then
+  set -o pipefail
+fi
 
 echo "======================================================================"
 echo "  TRÌNH CÀI ĐẶT TỰ ĐỘNG ĐA NỀN TẢNG NAS-SYNC (MULTI-NAS & DOCKER)"
 echo "  GitHub: https://github.com/shostwp-byte/nas-sync (MIT License)"
 echo "======================================================================"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 # 1. Tự động dò tìm đường dẫn Docker trên mọi dòng thiết bị NAS & Linux
-EXTRA_DOCKER_PATHS=(
-  "/usr/local/bin"
-  "/share/CACHEDEV1_DATA/.qpkg/container-station/bin"
-  "/share/CACHEDEV2_DATA/.qpkg/container-station/bin"
-  "/usr/local/AppCentral/docker-ce/bin"
-  "/opt/bin"
-)
-for p in "${EXTRA_DOCKER_PATHS[@]}"; do
+for p in \
+  "/usr/local/bin" \
+  "/share/CACHEDEV1_DATA/.qpkg/container-station/bin" \
+  "/share/CACHEDEV2_DATA/.qpkg/container-station/bin" \
+  "/usr/local/AppCentral/docker-ce/bin" \
+  "/opt/bin"; do
   if [ -d "$p" ]; then
     export PATH="$p:$PATH"
   fi
@@ -69,7 +73,7 @@ elif [ -d /Volume1 ]; then
 elif [ -d /volume1 ]; then
   NAS_PLATFORM="NAS Storage (/volume1)"
   SUGGESTED_VOL1="/volume1/VPS_Backups"
-elif compgen -G "/srv/dev-disk-by-*" >/dev/null 2>&1; then
+elif command -v compgen >/dev/null 2>&1 && compgen -G "/srv/dev-disk-by-*" >/dev/null 2>&1; then
   NAS_PLATFORM="OpenMediaVault (OMV)"
   FIRST_OMV_DISK="$(compgen -G "/srv/dev-disk-by-*" | sort | head -n 1)"
   SUGGESTED_VOL1="${FIRST_OMV_DISK}/vps_backups"

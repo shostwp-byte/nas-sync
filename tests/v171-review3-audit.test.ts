@@ -37,6 +37,28 @@ function resolveShBinary(): string | null {
   return null;
 }
 
+function resolveBashBinary(): string | null {
+  const candidates =
+    process.platform === 'win32'
+      ? [
+          'bash',
+          'C:\\Users\\ADMIN\\AppData\\Local\\GitHubDesktop\\app-3.6.10\\resources\\app\\git\\usr\\bin\\bash.exe',
+          'C:\\Program Files\\Git\\bin\\bash.exe',
+          'C:\\Program Files\\Git\\usr\\bin\\bash.exe',
+          'sh',
+        ]
+      : ['bash', '/bin/bash', '/usr/bin/bash', '/bin/sh', 'sh'];
+  for (const bin of candidates) {
+    try {
+      const r = spawnSync(bin, ['-c', 'exit 0'], { stdio: 'ignore' });
+      if (r.status === 0) return bin;
+    } catch {
+      // Try next candidate
+    }
+  }
+  return null;
+}
+
 async function runSqlThroughGuard(
   sql: string,
   byteByByte = false
@@ -500,8 +522,8 @@ test('4. [Wave 5 & 7 — U6..U16] Khóa công khai Ed25519 dùng chung, ký số
   );
 
   // U9: Kiểm tra thực thi trực tiếp update.sh ở chế độ NAS_SYNC_UPDATE_VERIFY_ONLY=1 qua local HTTP server
-  const shBin = resolveShBinary();
-  if (shBin) {
+  const bashBin = resolveBashBinary();
+  if (bashBin) {
     let activeServeDir = relDir;
     const srv = http.createServer((req, res) => {
       const cleanName = path.basename(String(req.url || '').split('?')[0]);
@@ -523,11 +545,15 @@ test('4. [Wave 5 & 7 — U6..U16] Khóa công khai Ed25519 dùng chung, ký số
       envVars: NodeJS.ProcessEnv
     ): Promise<{ status: number | null; stdout: string; stderr: string }> =>
       new Promise((resolve, reject) => {
-        const child = spawn(shBin, [path.join(process.cwd(), 'update.sh')], {
-          cwd: updateWorkCwd,
-          env: envVars,
-          windowsHide: true,
-        });
+        const child = spawn(
+          bashBin,
+          [path.join(process.cwd(), 'update.sh')],
+          {
+            cwd: updateWorkCwd,
+            env: envVars,
+            windowsHide: true,
+          }
+        );
         let stdout = '';
         let stderr = '';
         child.stdout.on('data', (d: Buffer) => {

@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
-set -euo pipefail
+if [ -z "${BASH_VERSION:-}" ] && command -v bash >/dev/null 2>&1; then
+  exec bash "$0" "$@"
+fi
+set -eu
+if (set -o pipefail) 2>/dev/null; then
+  set -o pipefail
+fi
 
 REPO_OWNER="${GITHUB_REPO_OWNER:-shostwp-byte}"
 REPO_NAME="${GITHUB_REPO_NAME:-nas-sync}"
@@ -20,14 +26,12 @@ echo "================================================================"
 echo "  NAS-SYNC — CẬP NHẬT HỆ THỐNG TỪ GITHUB RELEASES ($REPO_URL)"
 echo "================================================================"
 
-EXTRA_DOCKER_PATHS=(
-  "/usr/local/bin"
-  "/share/CACHEDEV1_DATA/.qpkg/container-station/bin"
-  "/share/CACHEDEV2_DATA/.qpkg/container-station/bin"
-  "/usr/local/AppCentral/docker-ce/bin"
-  "/opt/bin"
-)
-for p in "${EXTRA_DOCKER_PATHS[@]}"; do
+for p in \
+  "/usr/local/bin" \
+  "/share/CACHEDEV1_DATA/.qpkg/container-station/bin" \
+  "/share/CACHEDEV2_DATA/.qpkg/container-station/bin" \
+  "/usr/local/AppCentral/docker-ce/bin" \
+  "/opt/bin"; do
   if [ -d "$p" ]; then
     export PATH="$p:$PATH"
   fi
