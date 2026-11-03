@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import { NextRequest, NextResponse } from 'next/server';
-import { safeErrorJson } from '@/lib/api-error';
+import { safeErrorJson, sanitizeErrorMessage } from '@/lib/api-error';
 import { recordAuditLog } from '@/lib/audit';
 import { requireRole } from '@/lib/auth';
 import { getSetting, setSettings } from '@/lib/db';
@@ -249,7 +249,7 @@ export async function GET(req: NextRequest) {
     return NextResponse.redirect(new URL('/settings?gdrive=connected', origin));
   } catch (err) {
     return redirectWithError(
-      (err as Error).message || 'Lỗi xử lý callback Google Drive OAuth2.'
+      sanitizeErrorMessage(err, 'Lỗi xử lý callback Google Drive OAuth2.')
     );
   }
 }

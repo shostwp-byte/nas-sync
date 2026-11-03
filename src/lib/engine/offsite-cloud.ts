@@ -1,16 +1,28 @@
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
+import dns from 'node:dns';
 import fs from 'node:fs';
+import net from 'node:net';
 import path from 'node:path';
 import { getAllSettings, getDb } from '@/lib/db';
 import { createSystemAlert } from '@/lib/notifications';
 import type { OffsiteProviderType, OffsiteSyncJob } from '@/types';
 import { resolveSafeSnapshotRoot } from './explorer';
 import { createOffsiteEncryptStream } from './offsite-crypto';
-import { assertSafe, isSafeServerLabel, isSafeSnapshotName } from './safe-names';
+import {
+  assertSafe,
+  isSafeServerLabel,
+  isSafeSnapshotName,
+} from './safe-names';
+import { acquireSnapshotReadPin } from './snapshot-pins';
 
 const SECRET_MASK = '••••••••';
-const MULTIPART_CHUNK_BYTES = 8 * 1024 * 1024; // 8 MiB (>= 5 MiB S3 min AND 32 * 256 KiB Google Drive multiple)
+const MIN_MULTIPART_CHUNK_BYTES = 8 * 1024 * 1024; // 8 MiB (>= 5 MiB S3 min AND 32 * 256 KiB Google Drive multiple)
+const MAX_MULTIPART_CHUNK_BYTES = 512 * 1024 * 1024; // 512 MiB * 10.000 = 5 TiB (giới hạn tối đa S3)
+const MAX_S3_PARTS = 10_000;
+const MAX_CONCURRENT_OFFSITE_GLOBAL = 2;
+
+const activeOffsiteServerIds = new Set<number>();
 
 export interface S3OffsiteConfig {
   preset: 'R2' | 'B2' | 'AWS' | 'CUSTOM';
@@ -63,6 +75,191 @@ function hmacSha256(key: Buffer | string, data: string): Buffer {
   return crypto.createHmac('sha256', key).update(data, 'utf8').digest();
 }
 
+function escapeRegExp(str: string): string {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * O1 Fix: Khớp chính xác tên tệp snapshot Offsite của đúng `serverHostname`,
+ * ngăn chặn triệt để lỗi máy chủ `web` xóa nhầm các bản sao lưu của `web-2` hoặc `web-prod`!
+ */
+export function isExactOffsiteArchiveForHostname(
+  fileName: string,
+  serverHostname: string
+): boolean {
+  const base = path.posix.basename(String(fileName || '').trim());
+  const expectedPrefix = `nas-sync-${serverHostname}-`;
+  const expectedSuffix = '.tar.gz.enc';
+  if (!base.startsWith(expectedPrefix) || !base.endsWith(expectedSuffix)) {
+    return false;
+  }
+  const snapPart = base.slice(
+    expectedPrefix.length,
+    base.length - expectedSuffix.length
+  );
+  // Phải là đúng định dạng timestamp snapshot chuẩn (YYYY-MM-DD_HH-mm[-ss][-N]), không chứa phần đuôi của hostname khác
+  return (
+    /^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}(?:-\d{2})?(?:-\d+)?$/.test(snapPart) &&
+    isSafeSnapshotName(snapPart) &&
+    new RegExp(
+      `^nas-sync-${escapeRegExp(
+        serverHostname
+      )}-\\d{4}-\\d{2}-\\d{2}_\\d{2}-\\d{2}(?:-\\d{2})?(?:-\\d+)?\\.tar\\.gz\\.enc$`
+    ).test(base)
+  );
+}
+
+/**
+ * O2 Fix: Tự động tính kích thước part cho S3 Multipart Upload theo dung lượng ước tính của Snapshot,
+ * đảm bảo các bản sao lưu > 78 GiB (tới 4 TiB) luôn giữ tổng số part <= 8.000 (< giới hạn 10.000 part của S3/R2/B2).
+ */
+export function computeS3MultipartChunkSize(estimatedBytes: number): number {
+  const safeEst = Math.max(0, Number(estimatedBytes) || 0);
+  // Dự phòng +8% biên độ cho header tar và khung mã hóa AES-256-GCM, chia tối đa 8.000 part
+  const rawNeeded = Math.ceil((safeEst * 1.08) / 8000);
+  const oneMiB = 1024 * 1024;
+  const alignedMiB = Math.ceil(rawNeeded / oneMiB) * oneMiB;
+  return Math.min(
+    MAX_MULTIPART_CHUNK_BYTES,
+    Math.max(MIN_MULTIPART_CHUNK_BYTES, alignedMiB)
+  );
+}
+
+/**
+ * O5 Security Fix: Kiểm tra địa chỉ IP thuộc dải Loopback, RFC1918 nội bộ, Link-Local / Cloud Metadata (169.254.169.254),
+ * CGNAT, Unique-Local IPv6 hoặc Multicast để chặn tấn công SSRF qua cấu hình S3 Endpoint tùy chỉnh.
+ */
+export function isBlockedPrivateOrMetadataIp(rawIp: string): boolean {
+  let ip = String(rawIp || '')
+    .trim()
+    .replace(/^\[|\]$/g, '')
+    .split('%')[0];
+  if (!ip) return true;
+
+  // Chuẩn hóa IPv4-mapped IPv6 (VD: ::ffff:127.0.0.1 hoặc ::ffff:7f00:1)
+  const v4MappedMatch = ip.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/i);
+  if (v4MappedMatch) {
+    ip = v4MappedMatch[1];
+  } else {
+    const v4HexMatch = ip.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i);
+    if (v4HexMatch) {
+      const hi = parseInt(v4HexMatch[1], 16);
+      const lo = parseInt(v4HexMatch[2], 16);
+      ip = `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
+    }
+  }
+
+  const version = net.isIP(ip);
+  if (version === 4) {
+    const parts = ip.split('.').map((n) => Number(n));
+    const [a, b, c] = parts;
+    if (a === 0 || a === 10 || a === 127) return true;
+    if (a === 169 && b === 254) return true; // Link-local & Cloud Metadata (169.254.169.254)
+    if (a === 172 && b >= 16 && b <= 31) return true; // RFC1918 172.16.0.0/12
+    if (a === 192 && b === 168) return true; // RFC1918 192.168.0.0/16
+    if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT 100.64.0.0/10
+    if (a === 192 && b === 0 && (c === 0 || c === 2)) return true;
+    if (a === 198 && (b === 18 || b === 19 || (b === 51 && c === 100))) {
+      return true;
+    }
+    if (a === 203 && b === 0 && c === 113) return true;
+    if (a >= 224) return true; // Multicast & Reserved
+    return false;
+  }
+
+  if (version === 6) {
+    const lower = ip.toLowerCase();
+    if (lower === '::' || lower === '::1') return true;
+    if (lower.startsWith('fe8') || lower.startsWith('fe9') || lower.startsWith('fea') || lower.startsWith('feb')) {
+      return true; // fe80::/10 link-local
+    }
+    if (lower.startsWith('fc') || lower.startsWith('fd')) {
+      return true; // fc00::/7 unique local
+    }
+    if (lower.startsWith('ff')) {
+      return true; // multicast
+    }
+    if (lower.startsWith('2001:db8:')) {
+      return true;
+    }
+    return false;
+  }
+
+  return true;
+}
+
+export async function assertSafeS3EndpointUrl(targetUrl: URL): Promise<void> {
+  if (targetUrl.protocol !== 'https:' && targetUrl.protocol !== 'http:') {
+    throw new Error(
+      `[SECURITY] Giao thức S3 Endpoint không hợp lệ (${targetUrl.protocol}). Chỉ chấp nhận HTTPS/HTTP.`
+    );
+  }
+  if (targetUrl.username || targetUrl.password) {
+    throw new Error(
+      '[SECURITY] S3 Endpoint URL không được nhúng thông tin xác thực trực tiếp.'
+    );
+  }
+
+  if (process.env.ALLOW_PRIVATE_S3_ENDPOINT === 'true') {
+    return;
+  }
+
+  const host = targetUrl.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  if (
+    !host ||
+    host === 'localhost' ||
+    host.endsWith('.localhost') ||
+    host.endsWith('.local') ||
+    host.endsWith('.internal')
+  ) {
+    throw new Error(
+      '[SECURITY] Từ chối kết nối S3 Endpoint tới địa chỉ nội bộ/localhost (đặt ALLOW_PRIVATE_S3_ENDPOINT=true nếu dùng MinIO mạng LAN).'
+    );
+  }
+
+  if (net.isIP(host)) {
+    if (isBlockedPrivateOrMetadataIp(host)) {
+      throw new Error(
+        `[SECURITY] S3 Endpoint trỏ tới dải IP nội bộ hoặc Cloud Metadata bị cấm (${host}). Đặt ALLOW_PRIVATE_S3_ENDPOINT=true nếu chủ đích dùng kho S3 nội bộ.`
+      );
+    }
+    return;
+  }
+
+  let records: Array<{ address: string }>;
+  try {
+    records = await dns.promises.lookup(host, { all: true, verbatim: true });
+  } catch {
+    throw new Error(`Không thể phân giải tên miền S3 Endpoint "${host}".`);
+  }
+
+  if (!records || records.length === 0) {
+    throw new Error(`Tên miền S3 Endpoint "${host}" không có bản ghi IP.`);
+  }
+
+  for (const rec of records) {
+    if (isBlockedPrivateOrMetadataIp(rec.address)) {
+      throw new Error(
+        `[SECURITY] Tên miền S3 Endpoint "${host}" phân giải ra địa chỉ IP nội bộ/metadata bị chặn (${rec.address}).`
+      );
+    }
+  }
+}
+
+function summarizeS3ErrorResponse(status: number, rawBody: string): string {
+  const code = extractXmlTag(rawBody, 'Code')
+    .replace(/[^A-Za-z0-9_.-]/g, '')
+    .slice(0, 64);
+  const msg = extractXmlTag(rawBody, 'Message')
+    .replace(/[\r\n\t\0]+/g, ' ')
+    .trim()
+    .slice(0, 140);
+  if (code && msg) return `${code}: ${msg}`;
+  if (code) return code;
+  if (msg) return msg;
+  return `Mã trạng thái HTTP ${status}`;
+}
+
 export function awsUriEncode(input: string, encodeSlash = true): string {
   const bytes = Buffer.from(input, 'utf8');
   let out = '';
@@ -100,7 +297,9 @@ export function buildAwsSigV4Headers(
 ): AwsSigV4SignedResult {
   const method = input.method.toUpperCase();
   const parsedUrl =
-    typeof input.url === 'string' ? new URL(input.url) : new URL(input.url.toString());
+    typeof input.url === 'string'
+      ? new URL(input.url)
+      : new URL(input.url.toString());
   const region = (input.region || 'auto').trim() || 'auto';
   const service = (input.service || 's3').trim() || 's3';
   const { amzDate, dateStamp } = formatAmzDate(input.now ?? new Date());
@@ -126,7 +325,15 @@ export function buildAwsSigV4Headers(
     queryPairs.push([awsUriEncode(key, true), awsUriEncode(val, true)]);
   });
   queryPairs.sort((a, b) =>
-    a[0] !== b[0] ? (a[0] < b[0] ? -1 : 1) : a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0
+    a[0] !== b[0]
+      ? a[0] < b[0]
+        ? -1
+        : 1
+      : a[1] < b[1]
+      ? -1
+      : a[1] > b[1]
+      ? 1
+      : 0
   );
   const canonicalQuery = queryPairs.map(([k, v]) => `${k}=${v}`).join('&');
 
@@ -180,7 +387,7 @@ export function buildAwsSigV4Headers(
 
   const outHeaders: Record<string, string> = {};
   for (const k of sortedHeaderKeys) {
-    if (k === 'host') continue; // fetch() tự động gán Host header chuẩn từ URL
+    if (k === 'host') continue;
     outHeaders[k] = normalizedHeaders.get(k)!;
   }
   outHeaders.Authorization = authorization;
@@ -240,9 +447,14 @@ function buildS3TargetUrl(
 
   if (isAwsStandardHost) {
     base.hostname = `${bucket}.${base.hostname}`;
-    base.pathname = encodedKeyPath ? `${basePath}/${encodedKeyPath}` : `${basePath}/`;
+    base.pathname = encodedKeyPath
+      ? `${basePath}/${encodedKeyPath}`
+      : `${basePath}/`;
   } else {
-    if (!basePath.endsWith(`/${encodeURIComponent(bucket)}`) && basePath !== `/${bucket}`) {
+    if (
+      !basePath.endsWith(`/${encodeURIComponent(bucket)}`) &&
+      basePath !== `/${bucket}`
+    ) {
       basePath = `${basePath}/${encodeURIComponent(bucket)}`;
     }
     base.pathname = encodedKeyPath ? `${basePath}/${encodedKeyPath}` : basePath;
@@ -258,7 +470,10 @@ function buildS3TargetUrl(
 }
 
 function getS3ProviderLabel(cfg: S3OffsiteConfig): string {
-  if (cfg.preset === 'R2' || cfg.endpoint.includes('r2.cloudflarestorage.com')) {
+  if (
+    cfg.preset === 'R2' ||
+    cfg.endpoint.includes('r2.cloudflarestorage.com')
+  ) {
     return 'Cloudflare R2';
   }
   if (cfg.preset === 'B2' || cfg.endpoint.includes('backblazeb2.com')) {
@@ -315,6 +530,9 @@ async function s3SignedFetch(
   } = {}
 ): Promise<Response> {
   const targetUrl = buildS3TargetUrl(cfg, objectKey, options.queryParams);
+  // O5 Security Fix: Kiểm tra chống SSRF (chặn IP nội bộ / metadata + cấm HTTP redirect sang host khác)
+  await assertSafeS3EndpointUrl(targetUrl);
+
   const bodyBuf =
     options.body === undefined
       ? undefined
@@ -337,6 +555,7 @@ async function s3SignedFetch(
     method,
     headers: signed.headers,
     body: bodyBuf ? new Uint8Array(bodyBuf) : undefined,
+    redirect: 'error',
     cache: 'no-store',
     signal: AbortSignal.timeout(options.timeoutMs ?? 120_000),
   });
@@ -364,9 +583,10 @@ export async function testS3OffsiteConnection(cfg: S3OffsiteConfig): Promise<{
   });
   const xml = await resp.text();
   if (!resp.ok) {
-    const s3Msg = extractXmlTag(xml, 'Message') || extractXmlTag(xml, 'Code') || xml.slice(0, 200);
     throw new Error(
-      `Kết nối ${providerLabel} thất bại (HTTP ${resp.status}): ${s3Msg}`
+      `Kết nối ${providerLabel} thất bại (HTTP ${
+        resp.status
+      }): ${summarizeS3ErrorResponse(resp.status, xml)}`
     );
   }
 
@@ -409,18 +629,30 @@ async function* chunkReadableStream(
 export async function uploadStreamToS3Multipart(
   cfg: S3OffsiteConfig,
   objectKey: string,
-  readableStream: AsyncIterable<Buffer | Uint8Array>
+  readableStream: AsyncIterable<Buffer | Uint8Array>,
+  options?: {
+    estimatedBytes?: number;
+    beforeCommit?: () => Promise<void>;
+  }
 ): Promise<{ totalBytes: number }> {
   validateS3Config(cfg);
+  const chunkSizeBytes = computeS3MultipartChunkSize(
+    options?.estimatedBytes ?? 0
+  );
 
-  const partIterator = chunkReadableStream(readableStream, MULTIPART_CHUNK_BYTES);
+  const partIterator = chunkReadableStream(readableStream, chunkSizeBytes);
   const firstStep = await partIterator.next();
   const firstChunk = firstStep.done ? Buffer.alloc(0) : firstStep.value;
 
-  const secondStep = firstStep.done ? { done: true as const, value: undefined } : await partIterator.next();
+  const secondStep = firstStep.done
+    ? { done: true as const, value: undefined }
+    : await partIterator.next();
 
-  // Nếu toàn bộ gói sao lưu <= 8 MiB (chỉ có duy nhất 1 khối), gửi trực tiếp bằng Single PUT
+  // Nếu toàn bộ gói sao lưu nằm gọn trong 1 khối duy nhất, đợi `tar` kết thúc an toàn (O4) rồi gửi bằng Single PUT
   if (secondStep.done) {
+    if (options?.beforeCommit) {
+      await options.beforeCommit();
+    }
     const putResp = await s3SignedFetch(cfg, 'PUT', objectKey, {
       body: firstChunk,
       headers: {
@@ -432,15 +664,15 @@ export async function uploadStreamToS3Multipart(
     if (!putResp.ok) {
       const errXml = await putResp.text();
       throw new Error(
-        `S3 PUT upload thất bại (HTTP ${putResp.status}): ${
-          extractXmlTag(errXml, 'Message') || errXml.slice(0, 200)
-        }`
+        `S3 PUT upload thất bại (HTTP ${
+          putResp.status
+        }): ${summarizeS3ErrorResponse(putResp.status, errXml)}`
       );
     }
     return { totalBytes: firstChunk.length };
   }
 
-  // Luồng > 8 MiB: Khởi tạo S3 Multipart Upload
+  // Luồng nhiều khối: Khởi tạo S3 Multipart Upload
   const initResp = await s3SignedFetch(cfg, 'POST', objectKey, {
     queryParams: { uploads: '' },
     headers: { 'content-type': 'application/octet-stream' },
@@ -449,9 +681,9 @@ export async function uploadStreamToS3Multipart(
   const initXml = await initResp.text();
   if (!initResp.ok) {
     throw new Error(
-      `Không thể khởi tạo S3 Multipart Upload (HTTP ${initResp.status}): ${
-        extractXmlTag(initXml, 'Message') || initXml.slice(0, 200)
-      }`
+      `Không thể khởi tạo S3 Multipart Upload (HTTP ${
+        initResp.status
+      }): ${summarizeS3ErrorResponse(initResp.status, initXml)}`
     );
   }
 
@@ -464,6 +696,14 @@ export async function uploadStreamToS3Multipart(
   let totalBytes = 0;
 
   const uploadSinglePart = async (partNumber: number, buf: Buffer) => {
+    if (partNumber > MAX_S3_PARTS) {
+      throw new Error(
+        `Snapshot vượt giới hạn ${MAX_S3_PARTS} part của giao thức S3 Multipart Upload (partSize=${Math.round(
+          chunkSizeBytes / (1024 * 1024)
+        )} MiB).`
+      );
+    }
+
     let lastErr: Error | null = null;
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
@@ -481,9 +721,9 @@ export async function uploadStreamToS3Multipart(
         const respBody = await partResp.text();
         if (!partResp.ok) {
           throw new Error(
-            `Upload part #${partNumber} lỗi HTTP ${partResp.status}: ${
-              extractXmlTag(respBody, 'Message') || respBody.slice(0, 200)
-            }`
+            `Upload part #${partNumber} lỗi HTTP ${
+              partResp.status
+            }: ${summarizeS3ErrorResponse(partResp.status, respBody)}`
           );
         }
         const etag =
@@ -513,6 +753,11 @@ export async function uploadStreamToS3Multipart(
       await uploadSinglePart(nextPartNo++, partBuf);
     }
 
+    // O4 Fix: Bắt buộc xác nhận tiến trình `tar` kết thúc thành công (exit 0) TRƯỚC KHI gọi CompleteMultipartUpload!
+    if (options?.beforeCommit) {
+      await options.beforeCommit();
+    }
+
     const completeXml = [
       '<CompleteMultipartUpload>',
       ...completedParts.map(
@@ -533,15 +778,14 @@ export async function uploadStreamToS3Multipart(
     const compBody = await compResp.text();
     if (!compResp.ok || /<Error>/i.test(compBody)) {
       throw new Error(
-        `Hoàn tất S3 Multipart Upload thất bại (HTTP ${compResp.status}): ${
-          extractXmlTag(compBody, 'Message') || compBody.slice(0, 200)
-        }`
+        `Hoàn tất S3 Multipart Upload thất bại (HTTP ${
+          compResp.status
+        }): ${summarizeS3ErrorResponse(compResp.status, compBody)}`
       );
     }
 
     return { totalBytes };
   } catch (err) {
-    // Hủy Multipart Upload dở dang để không phát sinh phí lưu trữ rác trên S3/R2/B2
     await s3SignedFetch(cfg, 'DELETE', objectKey, {
       queryParams: { uploadId },
       timeoutMs: 20_000,
@@ -587,7 +831,11 @@ export async function pruneOldS3Snapshots(
     for (const block of contentsMatches) {
       const key = extractXmlTag(block, 'Key');
       const lastModified = extractXmlTag(block, 'LastModified');
-      if (key && key.endsWith('.tar.gz.enc')) {
+      if (
+        key &&
+        key.startsWith(listPrefix) &&
+        isExactOffsiteArchiveForHostname(key, serverHostname)
+      ) {
         objects.push({ key, lastModified });
       }
     }
@@ -603,7 +851,6 @@ export async function pruneOldS3Snapshots(
     return { deletedCount: 0 };
   }
 
-  // Sắp xếp cũ nhất lên đầu để xóa phần dôi ra ngoài keepCount
   objects.sort((a, b) => {
     const ta = Date.parse(a.lastModified) || 0;
     const tb = Date.parse(b.lastModified) || 0;
@@ -624,9 +871,6 @@ export async function pruneOldS3Snapshots(
   return { deletedCount };
 }
 
-/**
- * Chuẩn hóa Google Drive Folder ID (tự động bóc ID nếu quản trị viên dán nguyên đường dẫn URL)
- */
 export function normalizeGoogleDriveFolderId(raw: string): string {
   const trimmed = String(raw || '').trim();
   if (!trimmed) return '';
@@ -662,9 +906,6 @@ function base64UrlEncode(input: Buffer | string): string {
   return buf.toString('base64url');
 }
 
-/**
- * Sinh JWT RS256 thuần `node:crypto` cho Google Cloud Service Account
- */
 export function createGoogleServiceAccountJwt(
   sa: { client_email: string; private_key: string },
   scope = 'https://www.googleapis.com/auth/drive.file',
@@ -750,7 +991,6 @@ export async function getGoogleDriveAccessToken(
     return data.access_token;
   }
 
-  // Chế độ OAUTH2 (Gmail cá nhân & Google Workspace)
   const clientId = cfg.clientId.trim();
   const clientSecret = cfg.clientSecret.trim();
   const refreshToken = cfg.refreshToken.trim();
@@ -822,7 +1062,9 @@ export async function testGoogleDriveConnection(
   }
 
   const email =
-    aboutJson.user?.emailAddress || aboutJson.user?.displayName || 'Google Drive';
+    aboutJson.user?.emailAddress ||
+    aboutJson.user?.displayName ||
+    'Google Drive';
   const rawLimit = Number(aboutJson.storageQuota?.limit || 0);
   const rawUsage = Number(aboutJson.storageQuota?.usage || 0);
   const freeGb =
@@ -850,7 +1092,9 @@ export async function testGoogleDriveConnection(
     };
     if (!folderResp.ok || !folderJson.id) {
       throw new Error(
-        `Không truy cập được thư mục Google Drive ID "${folderId}" (HTTP ${folderResp.status}): ${
+        `Không truy cập được thư mục Google Drive ID "${folderId}" (HTTP ${
+          folderResp.status
+        }): ${
           folderJson.error?.message ||
           'Hãy kiểm tra Folder ID hoặc chia sẻ quyền Editor thư mục cho tài khoản kết nối.'
         }`
@@ -858,7 +1102,9 @@ export async function testGoogleDriveConnection(
     }
     if (folderJson.trashed) {
       throw new Error(
-        `Thư mục đích "${folderJson.name || folderId}" trên Google Drive đang nằm trong Thùng rác (Trash)!`
+        `Thư mục đích "${
+          folderJson.name || folderId
+        }" trên Google Drive đang nằm trong Thùng rác (Trash)!`
       );
     }
     folderName = folderJson.name || folderId;
@@ -871,10 +1117,60 @@ export async function testGoogleDriveConnection(
   };
 }
 
+/**
+ * O6 Fix: Hỏi offset máy chủ Google Drive đã nhận thực tế trước khi gửi lại khối dữ liệu bị ngắt quãng.
+ */
+async function queryGoogleDriveResumableOffset(
+  sessionUri: string,
+  totalLen: number,
+  isFinal: boolean
+): Promise<{
+  completedFileId?: string;
+  serverReceivedBytes: number | null;
+}> {
+  try {
+    const probeRange = isFinal ? `bytes */${totalLen}` : 'bytes */*';
+    const resp = await fetch(sessionUri, {
+      method: 'PUT',
+      headers: {
+        'Content-Length': '0',
+        'Content-Range': probeRange,
+      },
+      redirect: 'manual',
+      cache: 'no-store',
+      signal: AbortSignal.timeout(30_000),
+    });
+
+    if (resp.status === 200 || resp.status === 201) {
+      const json = (await resp.json().catch(() => ({}))) as { id?: string };
+      return {
+        completedFileId: json.id || '',
+        serverReceivedBytes: totalLen,
+      };
+    }
+
+    if (resp.status === 308) {
+      const rangeHeader = resp.headers.get('range') || '';
+      const m = rangeHeader.match(/bytes=0-(\d+)/i);
+      return {
+        serverReceivedBytes: m ? Number(m[1]) + 1 : 0,
+      };
+    }
+    return { serverReceivedBytes: null };
+  } catch {
+    return { serverReceivedBytes: null };
+  }
+}
+
 export async function uploadStreamToGoogleDriveResumable(
   cfg: GoogleDriveOffsiteConfig,
   fileName: string,
-  readableStream: AsyncIterable<Buffer | Uint8Array>
+  readableStream: AsyncIterable<Buffer | Uint8Array>,
+  options?: {
+    serverHostname?: string;
+    serverId?: number;
+    beforeFinalChunk?: () => Promise<void>;
+  }
 ): Promise<{ totalBytes: number; fileId: string }> {
   const token = await getGoogleDriveAccessToken(cfg);
   const folderId = normalizeGoogleDriveFolderId(cfg.folderId);
@@ -885,6 +1181,12 @@ export async function uploadStreamToGoogleDriveResumable(
   };
   if (folderId) {
     metadata.parents = [folderId];
+  }
+  if (options?.serverHostname) {
+    metadata.appProperties = {
+      nasSyncHostname: options.serverHostname,
+      nasSyncServerId: String(options.serverId ?? ''),
+    };
   }
 
   const initResp = await fetch(
@@ -904,10 +1206,9 @@ export async function uploadStreamToGoogleDriveResumable(
   if (!initResp.ok) {
     const errText = await initResp.text();
     throw new Error(
-      `Không thể khởi tạo phiên Google Drive Resumable Upload (HTTP ${initResp.status}): ${errText.slice(
-        0,
-        240
-      )}`
+      `Không thể khởi tạo phiên Google Drive Resumable Upload (HTTP ${
+        initResp.status
+      }): ${errText.slice(0, 200)}`
     );
   }
 
@@ -924,24 +1225,54 @@ export async function uploadStreamToGoogleDriveResumable(
     isFinal: boolean
   ): Promise<{ fileId?: string }> => {
     const totalLen = offset + chunk.length;
-    const contentRange =
-      isFinal && totalLen === 0
-        ? 'bytes */0'
-        : isFinal
-        ? `bytes ${offset}-${totalLen - 1}/${totalLen}`
-        : `bytes ${offset}-${offset + chunk.length - 1}/*`;
 
     let lastErr: Error | null = null;
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
+        let sendStartOffset = offset;
+        let sendSlice = chunk;
+
+        // O6 Fix: Từ lượt thử lại thứ 2 trở đi, truy vấn offset thực tế Google Drive đã ghi nhận
+        if (attempt > 1) {
+          const statusProbe = await queryGoogleDriveResumableOffset(
+            sessionUri,
+            totalLen,
+            isFinal
+          );
+          if (statusProbe.completedFileId !== undefined) {
+            return { fileId: statusProbe.completedFileId };
+          }
+          if (statusProbe.serverReceivedBytes !== null) {
+            if (!isFinal && statusProbe.serverReceivedBytes >= totalLen) {
+              return {};
+            }
+            if (
+              statusProbe.serverReceivedBytes > offset &&
+              statusProbe.serverReceivedBytes < totalLen
+            ) {
+              sendStartOffset = statusProbe.serverReceivedBytes;
+              sendSlice = chunk.subarray(sendStartOffset - offset);
+            }
+          }
+        }
+
+        const contentRange =
+          isFinal && totalLen === 0
+            ? 'bytes */0'
+            : isFinal
+            ? sendSlice.length === 0
+              ? `bytes */${totalLen}`
+              : `bytes ${sendStartOffset}-${totalLen - 1}/${totalLen}`
+            : `bytes ${sendStartOffset}-${totalLen - 1}/*`;
+
         const putResp = await fetch(sessionUri, {
           method: 'PUT',
           headers: {
-            'Content-Length': String(chunk.length),
+            'Content-Length': String(sendSlice.length),
             'Content-Range': contentRange,
           },
-          body: chunk.length > 0 ? new Uint8Array(chunk) : undefined,
-          redirect: 'manual', // Chặn fetch tự redirect khi nhận HTTP 308 Resume Incomplete!
+          body: sendSlice.length > 0 ? new Uint8Array(sendSlice) : undefined,
+          redirect: 'manual',
           cache: 'no-store',
           signal: AbortSignal.timeout(300_000),
         });
@@ -952,10 +1283,9 @@ export async function uploadStreamToGoogleDriveResumable(
           }
           const txt = await putResp.text();
           throw new Error(
-            `Google Drive Resumable chunk tại offset ${offset} trả về HTTP ${putResp.status} (kỳ vọng 308): ${txt.slice(
-              0,
-              200
-            )}`
+            `Google Drive Resumable chunk tại offset ${sendStartOffset} trả về HTTP ${
+              putResp.status
+            } (kỳ vọng 308): ${txt.slice(0, 180)}`
           );
         }
 
@@ -968,10 +1298,9 @@ export async function uploadStreamToGoogleDriveResumable(
 
         const errTxt = await putResp.text();
         throw new Error(
-          `Google Drive hoàn tất Resumable Upload thất bại (HTTP ${putResp.status}): ${errTxt.slice(
-            0,
-            240
-          )}`
+          `Google Drive hoàn tất Resumable Upload thất bại (HTTP ${
+            putResp.status
+          }): ${errTxt.slice(0, 200)}`
         );
       } catch (err) {
         lastErr = err as Error;
@@ -983,19 +1312,23 @@ export async function uploadStreamToGoogleDriveResumable(
     throw lastErr || new Error('Google Drive Resumable Upload thất bại.');
   };
 
-  // Lookahead 1 khối 8 MiB (bội số của 256 KiB) để luôn biết chính xác đâu là khối cuối cùng
   let pendingChunk: Buffer | null = null;
   let offset = 0;
 
   for await (const nextChunk of chunkReadableStream(
     readableStream,
-    MULTIPART_CHUNK_BYTES
+    MIN_MULTIPART_CHUNK_BYTES
   )) {
     if (pendingChunk !== null) {
       await sendChunk(pendingChunk, offset, false);
       offset += pendingChunk.length;
     }
     pendingChunk = nextChunk;
+  }
+
+  // O4 Fix: Đảm bảo luồng `tar` kết thúc thành công (exit 0) TRƯỚC KHI gửi khối cuối cùng chốt file trên Google Drive!
+  if (options?.beforeFinalChunk) {
+    await options.beforeFinalChunk();
   }
 
   if (pendingChunk === null) {
@@ -1028,34 +1361,67 @@ export async function pruneOldGoogleDriveSnapshots(
     qParts.push(`'${folderId}' in parents`);
   }
 
-  const listUrl = new URL('https://www.googleapis.com/drive/v3/files');
-  listUrl.searchParams.set('q', qParts.join(' and '));
-  listUrl.searchParams.set('orderBy', 'createdTime desc');
-  listUrl.searchParams.set('pageSize', '200');
-  listUrl.searchParams.set('fields', 'files(id,name,createdTime)');
-  listUrl.searchParams.set('supportsAllDrives', 'true');
-  listUrl.searchParams.set('includeItemsFromAllDrives', 'true');
+  const matchedFiles: Array<{
+    id: string;
+    name: string;
+    createdTime?: string;
+    appProperties?: Record<string, string>;
+  }> = [];
 
-  const resp = await fetch(listUrl.toString(), {
-    headers: { Authorization: `Bearer ${token}` },
-    cache: 'no-store',
-    signal: AbortSignal.timeout(25_000),
-  });
-  if (!resp.ok) {
+  let pageToken = '';
+  for (let page = 0; page < 10; page++) {
+    const listUrl = new URL('https://www.googleapis.com/drive/v3/files');
+    listUrl.searchParams.set('q', qParts.join(' and '));
+    listUrl.searchParams.set('orderBy', 'createdTime desc');
+    listUrl.searchParams.set('pageSize', '200');
+    listUrl.searchParams.set(
+      'fields',
+      'nextPageToken,files(id,name,createdTime,appProperties)'
+    );
+    listUrl.searchParams.set('supportsAllDrives', 'true');
+    listUrl.searchParams.set('includeItemsFromAllDrives', 'true');
+    if (pageToken) {
+      listUrl.searchParams.set('pageToken', pageToken);
+    }
+
+    const resp = await fetch(listUrl.toString(), {
+      headers: { Authorization: `Bearer ${token}` },
+      cache: 'no-store',
+      signal: AbortSignal.timeout(25_000),
+    });
+    if (!resp.ok) {
+      return { deletedCount: 0 };
+    }
+
+    const data = (await resp.json().catch(() => ({}))) as {
+      nextPageToken?: string;
+      files?: Array<{
+        id: string;
+        name: string;
+        createdTime?: string;
+        appProperties?: Record<string, string>;
+      }>;
+    };
+
+    for (const f of data.files || []) {
+      const taggedHost = f.appProperties?.nasSyncHostname;
+      if (taggedHost && taggedHost !== serverHostname) {
+        continue;
+      }
+      if (isExactOffsiteArchiveForHostname(f.name, serverHostname)) {
+        matchedFiles.push(f);
+      }
+    }
+
+    if (!data.nextPageToken) break;
+    pageToken = data.nextPageToken;
+  }
+
+  if (matchedFiles.length <= keepCount) {
     return { deletedCount: 0 };
   }
 
-  const data = (await resp.json().catch(() => ({}))) as {
-    files?: Array<{ id: string; name: string; createdTime?: string }>;
-  };
-  const files = (data.files || []).filter((f) =>
-    f.name.endsWith('.tar.gz.enc')
-  );
-  if (files.length <= keepCount) {
-    return { deletedCount: 0 };
-  }
-
-  const excess = files.slice(keepCount);
+  const excess = matchedFiles.slice(keepCount);
   let deletedCount = 0;
   for (const f of excess) {
     const delResp = await fetch(
@@ -1179,6 +1545,40 @@ function getOffsiteJobById(id: number): OffsiteSyncJob {
   return row as unknown as OffsiteSyncJob;
 }
 
+function estimateDirectoryBytesBounded(
+  rootDir: string,
+  maxEntries = 15_000
+): number {
+  let total = 0;
+  let seen = 0;
+  const stack = [rootDir];
+  while (stack.length > 0 && seen < maxEntries) {
+    const dir = stack.pop()!;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const ent of entries) {
+      if (ent.name === '.rsync-partial' || ent.name === '.state.json') continue;
+      seen++;
+      if (seen > maxEntries) break;
+      const full = path.join(dir, ent.name);
+      if (ent.isDirectory()) {
+        stack.push(full);
+      } else if (ent.isFile()) {
+        try {
+          total += fs.statSync(full).size;
+        } catch {
+          // Ignore transient stat error
+        }
+      }
+    }
+  }
+  return total;
+}
+
 /**
  * Khởi tạo tiến trình đẩy Snapshot lên Offsite Cloud (hỗ trợ cả await đồng bộ từ Worker hoặc chạy nền từ API)
  */
@@ -1186,6 +1586,13 @@ export function startSnapshotOffsitePush(
   backupJobId: number,
   opts: { triggerSource?: string } = {}
 ): { offsiteJobId: number; completion: Promise<OffsiteSyncJob> } {
+  // U4 Fix: Không khởi chạy tiến trình đẩy Offsite mới khi hệ thống đang chuẩn bị cập nhật / restart
+  if (globalThis.__nasSyncUpdating) {
+    throw new Error(
+      'Hệ thống đang thực hiện cập nhật phiên bản — vui lòng thử đẩy Offsite lại sau khi hoàn tất.'
+    );
+  }
+
   const cfg = resolveEffectiveOffsiteSettings();
   if (cfg.provider === 'NONE') {
     throw new Error(
@@ -1200,13 +1607,77 @@ export function startSnapshotOffsitePush(
 
   const db = getDb();
   const jobRow = db
-    .prepare('SELECT id, server_id, snapshot_name, status FROM backup_jobs WHERE id = ?')
+    .prepare(
+      'SELECT id, server_id, snapshot_name, status, total_size_bytes FROM backup_jobs WHERE id = ?'
+    )
     .get(backupJobId) as
-    | { id: number; server_id: number; snapshot_name: string; status: string }
+    | {
+        id: number;
+        server_id: number;
+        snapshot_name: string;
+        status: string;
+        total_size_bytes?: number;
+      }
     | undefined;
 
   if (!jobRow) {
     throw new Error(`Không tìm thấy Backup Job #${backupJobId}.`);
+  }
+
+  // O3 Fix: Chỉ cho phép đẩy lên Offsite các Snapshot đã hoàn tất (COMPLETED), cấm đẩy bản dở dang / lỗi
+  if (jobRow.status !== 'COMPLETED') {
+    throw new Error(
+      `Chỉ cho phép đẩy lên Offsite Cloud các bản sao lưu đã hoàn tất (COMPLETED). Trạng thái hiện tại của Job #${backupJobId}: ${jobRow.status}.`
+    );
+  }
+
+  const serverId = Number(jobRow.server_id);
+
+  // Kiểm tra máy chủ không có job BACKUP khác đang ghi dở dang (trừ chính job auto-push ngay sau khi đã COMPLETED)
+  const runningBackupOther = Number(
+    db
+      .prepare(
+        `SELECT COUNT(*) AS cnt FROM backup_jobs
+         WHERE server_id = ? AND id != ? AND job_type = 'BACKUP' AND status IN ('RUNNING', 'RESUMING')`
+      )
+      .get(serverId, backupJobId)?.cnt || 0
+  );
+  if (runningBackupOther > 0) {
+    throw new Error(
+      'Máy chủ đang có tiến trình sao lưu khác đang chạy. Vui lòng đợi hoàn tất trước khi đẩy Offsite.'
+    );
+  }
+
+  // O4 Fix: Giới hạn đồng thời tối đa 1 luồng upload Offsite trên mỗi máy chủ và tối đa 2 luồng toàn hệ thống
+  const activeDbTotal = Number(
+    db
+      .prepare(
+        `SELECT COUNT(*) AS cnt FROM offsite_sync_jobs WHERE status IN ('UPLOADING', 'QUEUED')`
+      )
+      .get()?.cnt || 0
+  );
+  if (
+    activeOffsiteServerIds.has(serverId) ||
+    Number(
+      db
+        .prepare(
+          `SELECT COUNT(*) AS cnt FROM offsite_sync_jobs WHERE server_id = ? AND status IN ('UPLOADING', 'QUEUED')`
+        )
+        .get(serverId)?.cnt || 0
+    ) > 0
+  ) {
+    throw new Error(
+      'Máy chủ này đang có một tiến trình đẩy Offsite Cloud đang chạy. Vui lòng đợi hoàn tất.'
+    );
+  }
+
+  if (
+    activeOffsiteServerIds.size >= MAX_CONCURRENT_OFFSITE_GLOBAL ||
+    activeDbTotal >= MAX_CONCURRENT_OFFSITE_GLOBAL
+  ) {
+    throw new Error(
+      `Hệ thống đang đạt giới hạn tối đa ${MAX_CONCURRENT_OFFSITE_GLOBAL} luồng tải lên Offsite Cloud song song. Vui lòng thử lại sau ít phút.`
+    );
   }
 
   const { snapshotRoot, hostname, snapshotName } =
@@ -1214,7 +1685,10 @@ export function startSnapshotOffsitePush(
   assertSafe(isSafeServerLabel, hostname, 'Server Hostname');
   assertSafe(isSafeSnapshotName, snapshotName, 'Snapshot Name');
 
-  if (!fs.existsSync(snapshotRoot) || !fs.lstatSync(snapshotRoot).isDirectory()) {
+  if (
+    !fs.existsSync(snapshotRoot) ||
+    !fs.lstatSync(snapshotRoot).isDirectory()
+  ) {
     throw new Error(
       `Thư mục Snapshot "${snapshotName}" của ${hostname} không tồn tại trên ổ cứng NAS.`
     );
@@ -1236,22 +1710,30 @@ export function startSnapshotOffsitePush(
       ? `${normalizedFolderId}/${archiveFileName}`
       : archiveFileName;
 
-  const ins = db
-    .prepare(
-      `INSERT INTO offsite_sync_jobs
-       (backup_job_id, server_id, snapshot_name, provider, remote_object_key, status)
-       VALUES (?, ?, ?, ?, ?, 'UPLOADING')`
-    )
-    .run(
-      backupJobId,
-      Number(jobRow.server_id),
-      snapshotName,
-      cfg.provider,
-      remoteObjectKey
-    );
+  activeOffsiteServerIds.add(serverId);
+  const releaseSnapshotPin = acquireSnapshotReadPin(serverId, snapshotName);
 
-  const offsiteJobId = Number(ins.lastInsertRowid);
+  let offsiteJobId = 0;
+  try {
+    const ins = db
+      .prepare(
+        `INSERT INTO offsite_sync_jobs
+         (backup_job_id, server_id, snapshot_name, provider, remote_object_key, status)
+         VALUES (?, ?, ?, ?, ?, 'UPLOADING')`
+      )
+      .run(backupJobId, serverId, snapshotName, cfg.provider, remoteObjectKey);
+    offsiteJobId = Number(ins.lastInsertRowid);
+  } catch (err) {
+    activeOffsiteServerIds.delete(serverId);
+    releaseSnapshotPin();
+    throw err;
+  }
+
   const startedAtMs = Date.now();
+  const estimatedBytes =
+    Number(jobRow.total_size_bytes || 0) > 0
+      ? Number(jobRow.total_size_bytes)
+      : estimateDirectoryBytesBounded(snapshotRoot);
 
   const completion = (async (): Promise<OffsiteSyncJob> => {
     const hostDir = path.dirname(snapshotRoot);
@@ -1308,10 +1790,16 @@ export function startSnapshotOffsitePush(
       let finalRemoteKey = remoteObjectKey;
 
       if (cfg.provider === 'S3_COMPATIBLE') {
-        const [upRes] = await Promise.all([
-          uploadStreamToS3Multipart(cfg.s3, remoteObjectKey, encryptStream),
-          tarExitPromise,
-        ]);
+        const upRes = await uploadStreamToS3Multipart(
+          cfg.s3,
+          remoteObjectKey,
+          encryptStream,
+          {
+            estimatedBytes,
+            beforeCommit: () => tarExitPromise,
+          }
+        );
+        await tarExitPromise;
         uploadedBytes = upRes.totalBytes;
         await pruneOldS3Snapshots(cfg.s3, hostname, cfg.keepCount).catch(
           (err) => {
@@ -1319,14 +1807,17 @@ export function startSnapshotOffsitePush(
           }
         );
       } else {
-        const [upRes] = await Promise.all([
-          uploadStreamToGoogleDriveResumable(
-            cfg.gdrive,
-            archiveFileName,
-            encryptStream
-          ),
-          tarExitPromise,
-        ]);
+        const upRes = await uploadStreamToGoogleDriveResumable(
+          cfg.gdrive,
+          archiveFileName,
+          encryptStream,
+          {
+            serverHostname: hostname,
+            serverId,
+            beforeFinalChunk: () => tarExitPromise,
+          }
+        );
+        await tarExitPromise;
         uploadedBytes = upRes.totalBytes;
         if (upRes.fileId) {
           finalRemoteKey = `${archiveFileName} (${upRes.fileId})`;
@@ -1364,7 +1855,7 @@ export function startSnapshotOffsitePush(
       await createSystemAlert({
         severity: 'INFO',
         category: 'BACKUP',
-        serverId: Number(jobRow.server_id),
+        serverId,
         jobId: backupJobId,
         title: `Đã đẩy bản sao lưu mã hóa Offsite lên ${providerLabel}`,
         message: `Snapshot ${hostname}@${snapshotName} đã được mã hóa AES-256-GCM và tải lên ${providerLabel} thành công (${(
@@ -1390,7 +1881,8 @@ export function startSnapshotOffsitePush(
         1,
         Math.round((Date.now() - startedAtMs) / 1000)
       );
-      const errMsg = (err as Error).message || 'Lỗi đồng bộ Offsite không xác định';
+      const errMsg =
+        (err as Error).message || 'Lỗi đồng bộ Offsite không xác định';
 
       db.prepare(
         `UPDATE offsite_sync_jobs
@@ -1404,13 +1896,16 @@ export function startSnapshotOffsitePush(
       await createSystemAlert({
         severity: 'WARNING',
         category: 'BACKUP',
-        serverId: Number(jobRow.server_id),
+        serverId,
         jobId: backupJobId,
         title: `Đồng bộ Offsite Cloud thất bại (${hostname})`,
         message: `Không thể đẩy bản sao lưu ${snapshotName} lên ${cfg.provider}: ${errMsg}. Bản sao lưu nội bộ trên NAS vẫn an toàn.`,
       });
 
       throw err;
+    } finally {
+      activeOffsiteServerIds.delete(serverId);
+      releaseSnapshotPin();
     }
   })();
 

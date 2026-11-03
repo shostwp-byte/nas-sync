@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { safeErrorJson } from '@/lib/api-error';
 import { recordAuditLog } from '@/lib/audit';
 import { hashPassword, isValidUserRole, requireRole } from '@/lib/auth';
 import { getDb } from '@/lib/db';
@@ -107,9 +108,6 @@ export async function POST(req: NextRequest) {
       userId: newId,
     });
   } catch (err) {
-    return NextResponse.json(
-      { error: (err as Error).message },
-      { status: 500 }
-    );
+    return safeErrorJson(err, 'Không thể tạo tài khoản người dùng.', 500);
   }
 }

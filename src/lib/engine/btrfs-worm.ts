@@ -33,7 +33,10 @@ function postDsmForm<T>(
     const targetUrl = new URL(`${baseUrl}${cgiPath}`);
     const body = params.toString();
     const isHttps = targetUrl.protocol === 'https:';
-    const verifyTls = process.env.DSM_TLS_VERIFY === 'true';
+    const allowInsecure =
+      process.env.DSM_TLS_VERIFY === 'false' ||
+      getSetting('dsm_tls_insecure', 'false') === 'true';
+    const verifyTls = !allowInsecure;
 
     const requestOptions: https.RequestOptions = {
       protocol: targetUrl.protocol,

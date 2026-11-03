@@ -1,14 +1,76 @@
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import type { Readable } from 'node:stream';
 import zlib from 'node:zlib';
 import mysql from 'mysql2/promise';
 import { getDb } from '@/lib/db';
-import { shellSingleQuote } from '@/lib/ssh';
 import type { BackupItem, DatabaseBackupInfo } from '@/types';
+import { createSafePsqlRestoreTransform } from './sql-stream-guard';
+import {
+  DETACHED_PROCESS_GROUP,
+  isJobCancelled,
+  registerJobChildProcess,
+  terminateChildGracefully,
+} from './worker-state';
 
-const SANDBOX_IMPORT_TIMEOUT_MS = 10 * 60 * 1000;
+const SANDBOX_MIN_IMPORT_TIMEOUT_MS = 10 * 60 * 1000; // 10 phút tối thiểu
+const SANDBOX_MAX_IMPORT_TIMEOUT_MS = 90 * 60 * 1000; // 90 phút tối đa
+const SANDBOX_STREAM_IDLE_TIMEOUT_MS = 15 * 60 * 1000; // 15 phút không đọc được byte nào
+
+type Node24ZlibWithZstd = typeof zlib & {
+  createZstdDecompress?: () => NodeJS.ReadWriteStream;
+  zstdDecompressSync?: (buf: Buffer) => Buffer;
+};
+
+/**
+ * N5 Fix: Tự động co giãn thời gian chờ kiểm định Sandbox theo kích thước file dump nén
+ * (10 phút nền + 5 phút cho mỗi 64 MiB dữ liệu nén, tối đa 90 phút).
+ */
+export function computeSandboxImportTimeoutMs(
+  compressedSizeBytes: number
+): number {
+  const safeBytes = Math.max(0, Number(compressedSizeBytes) || 0);
+  const blocks64MiB = Math.ceil(safeBytes / (64 * 1024 * 1024));
+  return Math.min(
+    SANDBOX_MAX_IMPORT_TIMEOUT_MS,
+    SANDBOX_MIN_IMPORT_TIMEOUT_MS + blocks64MiB * 5 * 60 * 1000
+  );
+}
+
+let cachedMariaDbSupportsSandboxFlag: boolean | null = null;
+
+function mariaDbSupportsSandboxFlag(): boolean {
+  if (cachedMariaDbSupportsSandboxFlag !== null) {
+    return cachedMariaDbSupportsSandboxFlag;
+  }
+  if (process.platform === 'win32') {
+    cachedMariaDbSupportsSandboxFlag = false;
+    return false;
+  }
+  try {
+    const res = spawnSync('mariadb', ['--help'], {
+      encoding: 'utf8',
+      timeout: 3000,
+    });
+    const combined = `${res.stdout || ''}\n${res.stderr || ''}`;
+    cachedMariaDbSupportsSandboxFlag = /--sandbox\b/.test(combined);
+  } catch {
+    cachedMariaDbSupportsSandboxFlag = false;
+  }
+  return cachedMariaDbSupportsSandboxFlag;
+}
+
+export function buildSafeMariaDbClientFlags(options?: {
+  includeSandboxIfSupported?: boolean;
+}): string[] {
+  const flags = ['--binary-mode'];
+  if (options?.includeSandboxIfSupported && mariaDbSupportsSandboxFlag()) {
+    flags.push('--sandbox');
+  }
+  return flags;
+}
 
 export interface DbVerificationSummary {
   itemId: number;
@@ -36,87 +98,229 @@ async function tryConnectSandboxMariaDb(): Promise<mysql.Connection | null> {
   }
 }
 
-function streamDumpIntoMariaDb(
-  dumpFilePath: string,
-  tempDbName: string
-): Promise<{ ok: boolean; error?: string }> {
+async function ensureLeastPrivilegeSandboxCredentials(
+  conn: mysql.Connection
+): Promise<{ user: string; pass: string }> {
+  const defaultUser = process.env.SANDBOX_DB_USER || 'root';
+  const defaultPass = process.env.SANDBOX_DB_PASSWORD || 'sandbox_secret_pass';
+  const verifierUser = 'nas_sync_verifier';
+  const verifierPass = crypto.randomBytes(24).toString('hex');
+
+  try {
+    await conn.query(
+      `CREATE USER IF NOT EXISTS '${verifierUser}'@'%' IDENTIFIED BY ?`,
+      [verifierPass]
+    );
+    await conn.query(
+      `ALTER USER '${verifierUser}'@'%' IDENTIFIED BY ?`,
+      [verifierPass]
+    );
+    await conn.query(
+      `GRANT ALL PRIVILEGES ON \`verify_%\`.* TO '${verifierUser}'@'%'`
+    );
+    await conn.query('FLUSH PRIVILEGES');
+    return { user: verifierUser, pass: verifierPass };
+  } catch {
+    return { user: defaultUser, pass: defaultPass };
+  }
+}
+
+function streamDumpIntoMariaDb(params: {
+  jobId: number;
+  dumpFilePath: string;
+  tempDbName: string;
+  dbUser: string;
+  dbPass: string;
+  timeoutMs?: number;
+}): Promise<{ ok: boolean; error?: string }> {
+  const { jobId, dumpFilePath, tempDbName, dbUser, dbPass } = params;
+  const stat = fs.statSync(dumpFilePath, { throwIfNoEntry: false });
+  const effectiveTimeoutMs =
+    params.timeoutMs ?? computeSandboxImportTimeoutMs(stat?.size || 0);
+
   return new Promise((resolve) => {
     const host = process.env.SANDBOX_DB_HOST || 'db_sandbox';
     const port = Number(process.env.SANDBOX_DB_PORT || 3306) || 3306;
-    const user = process.env.SANDBOX_DB_USER || 'root';
-    const pass = process.env.SANDBOX_DB_PASSWORD || 'sandbox_secret_pass';
-
     const ext = path.extname(dumpFilePath).toLowerCase();
-    const decompCmd =
-      ext === '.zst' ? 'zstd -dc' : ext === '.gz' ? 'gzip -dc' : 'cat';
 
-    // Không truyền mật khẩu qua -p trên argv (chống lộ trong `ps aux`); truyền qua biến môi trường MYSQL_PWD.
-    const pipeline = `${decompCmd} -- "$1" | mariadb -h ${shellSingleQuote(
-      host
-    )} -P ${port} -u ${shellSingleQuote(user)} ${shellSingleQuote(tempDbName)}`;
+    // S1 Security Fix: --binary-mode (+ --sandbox nếu hỗ trợ) chặn đứng 100% meta-command `\! <shell>` thực thi lệnh trong container NAS!
+    const safeFlags = buildSafeMariaDbClientFlags({
+      includeSandboxIfSupported: true,
+    });
 
-    const child = spawn(
-      'bash',
-      ['-o', 'pipefail', '-c', pipeline, 'sandbox-verify', dumpFilePath],
+    // N2 & N5 Fix: Khởi chạy trực tiếp `mariadb` (không bọc qua `bash -c`) và nối trực tiếp luồng giải nén Node vào stdin,
+    // ghi nhận từng khối byte đọc từ file dump làm tín hiệu hoạt động sống.
+    const mariaChild = spawn(
+      'mariadb',
+      [...safeFlags, '-h', host, '-P', String(port), '-u', dbUser, tempDbName],
       {
-        env: { ...process.env, MYSQL_PWD: pass },
-        stdio: ['ignore', 'pipe', 'pipe'],
+        env: { ...process.env, MYSQL_PWD: dbPass },
+        stdio: ['pipe', 'pipe', 'pipe'],
+        detached: DETACHED_PROCESS_GROUP,
       }
     );
+    registerJobChildProcess(jobId, mariaChild);
 
+    const zlibExt = zlib as Node24ZlibWithZstd;
+    let fileStream: fs.ReadStream | null = null;
+    let decompStream: NodeJS.ReadableStream | null = null;
+    let zstdFallbackChild: ReturnType<typeof spawn> | null = null;
+    let decompErrMsg = '';
     let stderr = '';
     let settled = false;
-    let timedOut = false;
+    let totalTimedOut = false;
+    let idleTimedOut = false;
+    let lastActivityAt = Date.now();
 
-    const timer = setTimeout(() => {
-      timedOut = true;
+    const cleanupStreams = () => {
       try {
-        child.kill('SIGTERM');
+        fileStream?.destroy();
       } catch {
         // Ignore
       }
-      const forceKill = setTimeout(() => {
+      if (decompStream && decompStream !== fileStream && 'destroy' in decompStream) {
         try {
-          if (child.exitCode === null) child.kill('SIGKILL');
+          (decompStream as Readable).destroy();
         } catch {
           // Ignore
         }
-      }, 5000);
-      forceKill.unref();
-    }, SANDBOX_IMPORT_TIMEOUT_MS);
+      }
+      if (zstdFallbackChild) {
+        terminateChildGracefully(zstdFallbackChild);
+      }
+    };
 
-    child.stderr.on('data', (d: Buffer) => {
+    const finish = (result: { ok: boolean; error?: string }) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(totalTimer);
+      clearInterval(idleWatcher);
+      cleanupStreams();
+      resolve(result);
+    };
+
+    const totalTimer = setTimeout(() => {
+      totalTimedOut = true;
+      cleanupStreams();
+      terminateChildGracefully(mariaChild);
+    }, effectiveTimeoutMs);
+
+    const idleWatcher = setInterval(() => {
+      if (isJobCancelled(jobId)) {
+        cleanupStreams();
+        terminateChildGracefully(mariaChild);
+        return;
+      }
+      if (Date.now() - lastActivityAt > SANDBOX_STREAM_IDLE_TIMEOUT_MS) {
+        idleTimedOut = true;
+        cleanupStreams();
+        terminateChildGracefully(mariaChild);
+      }
+    }, 3000);
+
+    mariaChild.stdout.on('data', () => {
+      lastActivityAt = Date.now();
+    });
+    mariaChild.stderr.on('data', (d: Buffer) => {
+      lastActivityAt = Date.now();
       stderr += d.toString('utf8');
       if (stderr.length > 32768) {
         stderr = stderr.slice(-16384);
       }
     });
-
-    child.on('error', (err) => {
-      clearTimeout(timer);
-      if (!settled) {
-        settled = true;
-        resolve({ ok: false, error: err.message });
-      }
+    mariaChild.stdin.on('error', () => {
+      // EPIPE handled on child close
     });
 
-    child.on('close', (code) => {
-      clearTimeout(timer);
-      if (settled) return;
-      settled = true;
+    if (ext === '.zst' && typeof zlibExt.createZstdDecompress !== 'function') {
+      const zChild = spawn('zstd', ['-dc', '--', dumpFilePath], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        detached: DETACHED_PROCESS_GROUP,
+      });
+      zstdFallbackChild = zChild;
+      registerJobChildProcess(jobId, zChild);
+      zChild.stdout.on('data', () => {
+        lastActivityAt = Date.now();
+      });
+      zChild.stderr.on('data', (d: Buffer) => {
+        decompErrMsg += d.toString('utf8');
+      });
+      zChild.on('error', (err) => {
+        decompErrMsg = err.message;
+        terminateChildGracefully(mariaChild);
+      });
+      zChild.on('close', (zCode) => {
+        if (zCode !== 0 && !isJobCancelled(jobId)) {
+          decompErrMsg =
+            decompErrMsg.trim() || `Giải nén zstd thất bại (code ${zCode})`;
+          mariaChild.stdin.destroy();
+        }
+      });
+      zChild.stdout.pipe(mariaChild.stdin);
+    } else {
+      fileStream = fs.createReadStream(dumpFilePath);
+      fileStream.on('data', () => {
+        lastActivityAt = Date.now();
+      });
+      fileStream.on('error', (err) => {
+        decompErrMsg = err.message;
+        terminateChildGracefully(mariaChild);
+      });
 
-      if (timedOut) {
-        resolve({
+      decompStream =
+        ext === '.zst' && typeof zlibExt.createZstdDecompress === 'function'
+          ? fileStream.pipe(zlibExt.createZstdDecompress())
+          : ext === '.gz'
+          ? fileStream.pipe(zlib.createGunzip())
+          : fileStream;
+
+      if (decompStream !== fileStream) {
+        decompStream.on('error', (err: Error) => {
+          decompErrMsg = `Luồng nén SQL bị hỏng: ${err.message}`;
+          terminateChildGracefully(mariaChild);
+        });
+      }
+      decompStream.pipe(mariaChild.stdin);
+    }
+
+    mariaChild.on('error', (err) => {
+      finish({ ok: false, error: err.message });
+    });
+
+    mariaChild.on('close', (code) => {
+      if (isJobCancelled(jobId)) {
+        finish({
           ok: false,
-          error: 'Quá thời gian chờ (10 phút) khi nạp kiểm định vào MariaDB Sandbox',
+          error:
+            'Tiến trình kiểm định Sandbox đã bị hủy theo yêu cầu quản trị viên',
         });
         return;
       }
-
+      if (totalTimedOut) {
+        finish({
+          ok: false,
+          error: `Quá thời gian chờ tối đa (${Math.round(
+            effectiveTimeoutMs / 60000
+          )} phút) khi nạp kiểm định vào MariaDB Sandbox`,
+        });
+        return;
+      }
+      if (idleTimedOut) {
+        finish({
+          ok: false,
+          error:
+            'Luồng nạp MariaDB Sandbox bị treo quá 15 phút không tiến triển dữ liệu',
+        });
+        return;
+      }
+      if (decompErrMsg) {
+        finish({ ok: false, error: decompErrMsg });
+        return;
+      }
       if (code === 0) {
-        resolve({ ok: true });
+        finish({ ok: true });
       } else {
-        resolve({
+        finish({
           ok: false,
           error: stderr.trim() || `MariaDB exited with code ${code}`,
         });
@@ -125,7 +329,13 @@ function streamDumpIntoMariaDb(
   });
 }
 
-async function verifySqlFileStructureFallback(dumpFilePath: string): Promise<{
+/**
+ * N17 Fix: Giải nén thực sự cả `.sql.zst` và `.sql.gz` theo luồng O(1) RAM (thay vì chỉ kiểm tra 4 magic bytes cho `.zst`),
+ * đối chiếu đầy đủ lệnh `CREATE TABLE` / `INSERT INTO` và phần kết thúc hợp lệ ở cuối file.
+ */
+export async function verifySqlFileStructureFallback(
+  dumpFilePath: string
+): Promise<{
   ok: boolean;
   tablesCount: number;
   rowsCount: number;
@@ -151,7 +361,6 @@ async function verifySqlFileStructureFallback(dumpFilePath: string): Promise<{
 
   const ext = path.extname(dumpFilePath).toLowerCase();
   if (ext === '.zst') {
-    // Kiểm tra magic bytes chuẩn của Zstandard (0xFD2FB528)
     const fd = fs.openSync(dumpFilePath, 'r');
     const magic = Buffer.alloc(4);
     const bytesRead = fs.readSync(fd, magic, 0, 4, 0);
@@ -170,10 +379,10 @@ async function verifySqlFileStructureFallback(dumpFilePath: string): Promise<{
         error: 'Magic header Zstandard (.zst) không hợp lệ',
       };
     }
-    return { ok: true, tablesCount: 1, rowsCount: 1 };
   }
 
-  // Giải nén và kiểm tra theo luồng O(1) RAM (head 8KB + rolling tail 8KB) để hỗ trợ cả file .sql.gz hàng chục GB
+  const zlibExt = zlib as Node24ZlibWithZstd;
+
   return new Promise((resolve) => {
     const WINDOW_BYTES = 8192;
     let headBuf = Buffer.alloc(0);
@@ -183,30 +392,21 @@ async function verifySqlFileStructureFallback(dumpFilePath: string): Promise<{
     let insertCount = 0;
     let carryText = '';
     let finished = false;
+    let cleanupFn: () => void = () => {};
 
-    const fileStream = fs.createReadStream(dumpFilePath);
-    const sourceStream =
-      ext === '.gz' ? fileStream.pipe(zlib.createGunzip()) : fileStream;
-
-    const fail = (err: Error) => {
+    const fail = (err: Error | string) => {
       if (finished) return;
       finished = true;
-      fileStream.destroy();
-      sourceStream.destroy();
+      cleanupFn();
       resolve({
         ok: false,
         tablesCount: 0,
         rowsCount: 0,
-        error: err.message,
+        error: typeof err === 'string' ? err : err.message,
       });
     };
 
-    fileStream.on('error', fail);
-    if (sourceStream !== fileStream) {
-      sourceStream.on('error', fail);
-    }
-
-    sourceStream.on('data', (chunk: Buffer | string) => {
+    const onChunk = (chunk: Buffer | string) => {
       const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, 'utf8');
       totalUncompressedBytes += buf.length;
 
@@ -236,9 +436,9 @@ async function verifySqlFileStructureFallback(dumpFilePath: string): Promise<{
       if (creates) createCount += creates.length;
       const inserts = scanPart.match(/INSERT\s+INTO/gi);
       if (inserts) insertCount += inserts.length;
-    });
+    };
 
-    sourceStream.on('end', () => {
+    const onEnd = () => {
       if (finished) return;
       finished = true;
 
@@ -268,7 +468,8 @@ async function verifySqlFileStructureFallback(dumpFilePath: string): Promise<{
           ok: false,
           tablesCount: 0,
           rowsCount: 0,
-          error: 'Cấu trúc SQL bị ngắt quãng (thiếu dấu kết thúc hợp lệ ở cuối file)',
+          error:
+            'Cấu trúc SQL bị ngắt quãng (thiếu dấu kết thúc hợp lệ ở cuối file)',
         });
         return;
       }
@@ -278,18 +479,68 @@ async function verifySqlFileStructureFallback(dumpFilePath: string): Promise<{
         tablesCount: createCount,
         rowsCount: insertCount * 15,
       });
-    });
+    };
+
+    if (ext === '.zst' && typeof zlibExt.createZstdDecompress !== 'function') {
+      const child = spawn('zstd', ['-dc', '--', dumpFilePath], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+      });
+      let stderr = '';
+      cleanupFn = () => {
+        try {
+          child.kill('SIGTERM');
+        } catch {
+          // Ignore
+        }
+      };
+      child.stdout.on('data', onChunk);
+      child.stderr.on('data', (d: Buffer) => {
+        stderr += d.toString('utf8');
+      });
+      child.on('error', (err) =>
+        fail(`Không thể chạy zstd để giải nén kiểm định: ${err.message}`)
+      );
+      child.on('close', (code) => {
+        if (code !== 0) {
+          fail(
+            stderr.trim() ||
+              `Giải nén zstd thất bại (mã lỗi ${code}) — dữ liệu bị hỏng`
+          );
+        } else {
+          onEnd();
+        }
+      });
+      return;
+    }
+
+    const fileStream = fs.createReadStream(dumpFilePath);
+    const sourceStream: NodeJS.ReadableStream =
+      ext === '.zst' && typeof zlibExt.createZstdDecompress === 'function'
+        ? fileStream.pipe(zlibExt.createZstdDecompress())
+        : ext === '.gz'
+        ? fileStream.pipe(zlib.createGunzip())
+        : fileStream;
+
+    cleanupFn = () => {
+      fileStream.destroy();
+      if (sourceStream !== fileStream && 'destroy' in sourceStream) {
+        (sourceStream as fs.ReadStream).destroy();
+      }
+    };
+
+    fileStream.on('error', fail);
+    if (sourceStream !== fileStream) {
+      sourceStream.on('error', fail);
+    }
+    sourceStream.on('data', onChunk);
+    sourceStream.on('end', onEnd);
   });
 }
 
-type Node24ZlibWithZstd = typeof zlib & {
-  createZstdDecompress?: () => NodeJS.ReadWriteStream;
-  zstdDecompressSync?: (buf: Buffer) => Buffer;
-};
-
 /**
  * Kiểm định toàn vẹn luồng nén Zstandard (.sql.zst) / Gzip (.sql.gz) của PostgreSQL dump
- * bằng Node.js 24 built-in zlib.createZstdDecompress() (kèm fallback CLI `zstd -dc`),
+ * bằng Node.js 24 built-in zlib.createZstdDecompress() (kèm fallback CLI `zstd -dc`) + SQL Stream Guard,
  * đối chiếu header `PostgreSQL database dump` & trailer `PostgreSQL database dump complete`.
  */
 export async function verifyPostgresDumpFile(dumpFilePath: string): Promise<{
@@ -304,7 +555,8 @@ export async function verifyPostgresDumpFile(dumpFilePath: string): Promise<{
       ok: false,
       tablesCount: 0,
       rowsCount: 0,
-      error: 'File PostgreSQL dump không tồn tại hoặc không phải tập tin thông thường',
+      error:
+        'File PostgreSQL dump không tồn tại hoặc không phải tập tin thông thường',
     };
   }
   if (stat.size === 0) {
@@ -450,20 +702,23 @@ export async function verifyPostgresDumpFile(dumpFilePath: string): Promise<{
     };
 
     if (ext === '.zst' && typeof zlibExt.createZstdDecompress !== 'function') {
-      // Fallback sang CLI `zstd -dc` nếu môi trường Node < 22.15 không có createZstdDecompress
       const child = spawn('zstd', ['-dc', '--', dumpFilePath], {
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true,
       });
+      const pgGuard = createSafePsqlRestoreTransform();
       let stderr = '';
       cleanupFn = () => {
+        pgGuard.destroy();
         try {
           child.kill('SIGTERM');
         } catch {
           // Ignore
         }
       };
-      child.stdout.on('data', onDecompressedChunk);
+      pgGuard.on('error', (err) => fail(err));
+      pgGuard.on('data', onDecompressedChunk);
+      child.stdout.pipe(pgGuard);
       child.stderr.on('data', (d: Buffer) => {
         stderr += d.toString('utf8');
       });
@@ -476,9 +731,12 @@ export async function verifyPostgresDumpFile(dumpFilePath: string): Promise<{
             stderr.trim() ||
               `Giải nén zstd thất bại (mã lỗi ${code}) — dữ liệu bị hỏng`
           );
-          return;
         }
-        onDecompressedEnd();
+      });
+      pgGuard.on('end', () => {
+        if (child.exitCode === null || child.exitCode === 0) {
+          onDecompressedEnd();
+        }
       });
       return;
     }
@@ -490,20 +748,24 @@ export async function verifyPostgresDumpFile(dumpFilePath: string): Promise<{
         : ext === '.gz'
         ? fileStream.pipe(zlib.createGunzip())
         : fileStream;
+    const pgGuard = createSafePsqlRestoreTransform();
 
     cleanupFn = () => {
       fileStream.destroy();
       if (decompStream !== fileStream && 'destroy' in decompStream) {
         (decompStream as fs.ReadStream).destroy();
       }
+      pgGuard.destroy();
     };
 
     fileStream.on('error', fail);
     if (decompStream !== fileStream) {
       decompStream.on('error', fail);
     }
-    decompStream.on('data', onDecompressedChunk);
-    decompStream.on('end', onDecompressedEnd);
+    pgGuard.on('error', fail);
+    decompStream.pipe(pgGuard);
+    pgGuard.on('data', onDecompressedChunk);
+    pgGuard.on('end', onDecompressedEnd);
   });
 }
 
@@ -527,6 +789,10 @@ export async function verifyJobDatabasesInSandbox(
 
   const conn = await tryConnectSandboxMariaDb();
   const usingRealSandbox = Boolean(conn && process.platform !== 'win32');
+  const sandboxCreds =
+    usingRealSandbox && conn
+      ? await ensureLeastPrivilegeSandboxCredentials(conn)
+      : null;
 
   if (usingRealSandbox) {
     onLog(
@@ -578,7 +844,9 @@ export async function verifyJobDatabasesInSandbox(
           /[/\\\0]/.test(dbInfo.file)
         ) {
           allPassed = false;
-          const badMsg = `Tên file dump không hợp lệ: ${JSON.stringify(dbInfo.file)}`;
+          const badMsg = `Tên file dump không hợp lệ: ${JSON.stringify(
+            dbInfo.file
+          )}`;
           details.push(`${dbInfo.name}: ${badMsg}`);
           updatedDbs.push({ ...dbInfo, verified: false, error: badMsg });
           continue;
@@ -631,11 +899,21 @@ export async function verifyJobDatabasesInSandbox(
             await conn.query(
               `CREATE DATABASE \`${tempDb}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`
             );
-            const importRes = await streamDumpIntoMariaDb(dumpPath, tempDb);
+            const importRes = await streamDumpIntoMariaDb({
+              jobId,
+              dumpFilePath: dumpPath,
+              tempDbName: tempDb,
+              dbUser: sandboxCreds?.user || 'root',
+              dbPass: sandboxCreds?.pass || '',
+            });
             if (!importRes.ok) {
               allPassed = false;
               details.push(`${dbInfo.name}: Lỗi nạp SQL (${importRes.error})`);
-              updatedDbs.push({ ...dbInfo, verified: false, error: importRes.error });
+              updatedDbs.push({
+                ...dbInfo,
+                verified: false,
+                error: importRes.error,
+              });
             } else {
               const [statRows] = await conn.query<mysql.RowDataPacket[]>(
                 `SELECT COUNT(*) AS tablesCount, IFNULL(SUM(table_rows), 0) AS rowsCount
@@ -659,7 +937,9 @@ export async function verifyJobDatabasesInSandbox(
               });
             }
           } finally {
-            await conn.query(`DROP DATABASE IF EXISTS \`${tempDb}\``).catch(() => {});
+            await conn
+              .query(`DROP DATABASE IF EXISTS \`${tempDb}\``)
+              .catch(() => {});
           }
         } else {
           const check = await verifySqlFileStructureFallback(dumpPath);
@@ -712,4 +992,3 @@ export async function verifyJobDatabasesInSandbox(
 
   return results;
 }
-

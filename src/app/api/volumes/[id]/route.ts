@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { safeErrorJson } from '@/lib/api-error';
 import { requireRole } from '@/lib/auth';
 import { getDb } from '@/lib/db';
 import { refreshAllVolumes } from '@/lib/engine/volume-manager';
@@ -105,10 +106,7 @@ export async function PATCH(
     const volumes = await refreshAllVolumes();
     return NextResponse.json({ ok: true, volumes });
   } catch (err) {
-    return NextResponse.json(
-      { error: (err as Error).message },
-      { status: 500 }
-    );
+    return safeErrorJson(err, 'Không thể cập nhật phân vùng lưu trữ.', 500);
   }
 }
 
@@ -116,12 +114,16 @@ export async function DELETE(
   _req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const guard = await requireRole(['ADMIN']);
-  if (!guard.ok) return guard.response;
+  try {
+    const guard = await requireRole(['ADMIN']);
+    if (!guard.ok) return guard.response;
 
-  const { id } = await params;
-  const db = getDb();
-  db.prepare('DELETE FROM storage_volumes WHERE id = ?').run(Number(id));
-  return NextResponse.json({ ok: true });
+    const { id } = await params;
+    const db = getDb();
+    db.prepare('DELETE FROM storage_volumes WHERE id = ?').run(Number(id));
+    return NextResponse.json({ ok: true });
+  } catch (err) {
+    return safeErrorJson(err, 'Không thể xóa phân vùng lưu trữ.', 500);
+  }
 }
 

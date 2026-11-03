@@ -7,7 +7,7 @@ import { execLocalCommand } from '@/lib/ssh';
 import type { ServerRecord, StorageVolume } from '@/types';
 
 /**
- * Tạo/cập nhật con trỏ latest an toàn trên cả Linux (ln -snf) và Windows (Directory Junction).
+ * Tạo/cập nhật con trỏ latest nguyên tử (atomic symlink + rename trên POSIX, Directory Junction trên Windows).
  */
 export async function updateLatestSymlink(
   hostDir: string,
@@ -16,8 +16,24 @@ export async function updateLatestSymlink(
   const latestPath = path.join(hostDir, 'latest');
 
   if (process.platform !== 'win32') {
-    await execLocalCommand('ln', ['-snf', targetSnapshotDir, latestPath], 10000);
-    return;
+    fs.mkdirSync(hostDir, { recursive: true });
+    const relTarget =
+      path.relative(hostDir, targetSnapshotDir) || targetSnapshotDir;
+    const tmpLink = path.join(
+      hostDir,
+      `.latest.tmp.${process.pid}.${Date.now()}.${Math.random()
+        .toString(36)
+        .slice(2, 8)}`
+    );
+    try {
+      fs.rmSync(tmpLink, { force: true });
+      fs.symlinkSync(relTarget, tmpLink);
+      fs.renameSync(tmpLink, latestPath);
+      return;
+    } catch (err) {
+      fs.rmSync(tmpLink, { force: true });
+      throw err;
+    }
   }
 
   try {
@@ -243,7 +259,7 @@ export async function ensureActiveVolumeForBackup(
   const volumes = await refreshAllVolumes();
   const db = getDb();
 
-  let currentVol = volumes.find((v) => v.id === server.assigned_volume_id);
+  const currentVol = volumes.find((v) => v.id === server.assigned_volume_id);
 
   if (!currentVol) {
     const firstActive = volumes.find((v) => v.status === 'ACTIVE');
@@ -321,9 +337,8 @@ export async function ensureActiveVolumeForBackup(
     severity: 'WARNING',
     category: 'VOLUME',
     title: `Tự động chuyển đổi Volume: ${currentVol.name} ➔ ${targetVol.name}`,
-    message: `Phân vùng ${currentVol.name} ${fullReasonText}. Hệ thống tự động thực hiện Local Seeding bản latest của ${
-      server.hostname
-    } sang ${targetVol.name} (${targetVol.mount_path}) để bảo toàn chuỗi Incremental Hard-Link.`,
+    message: `Phân vùng ${currentVol.name} ${fullReasonText}. Hệ thống tự động thực hiện Local Seeding bản latest của ${server.hostname
+      } sang ${targetVol.name} (${targetVol.mount_path}) để bảo toàn chuỗi Incremental Hard-Link.`,
     serverId: server.id,
   });
 
@@ -378,4 +393,5 @@ export async function performCrossVolumeLocalSeeding(
   onLog(
     `[Local Seeding] Hoàn tất tạo mốc seed_base và cập nhật symlink latest trên ${toVolume.name}.`
   );
+}
 }

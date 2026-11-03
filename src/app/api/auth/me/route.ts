@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { safeErrorJson } from '@/lib/api-error';
 import { recordAuditLog } from '@/lib/audit';
 import {
   SESSION_COOKIE_NAME,
@@ -191,9 +192,6 @@ export async function PATCH(req: NextRequest) {
 
     return res;
   } catch (err) {
-    return NextResponse.json(
-      { error: (err as Error).message || 'Lỗi máy chủ khi cập nhật tài khoản.' },
-      { status: 500 }
-    );
+    return safeErrorJson(err, 'Lỗi máy chủ khi cập nhật tài khoản.', 500);
   }
 }

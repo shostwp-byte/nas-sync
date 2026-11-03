@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_URL="https://github.com/shostwp-byte/nas-sync.git"
-BRANCH="main"
+REPO_OWNER="${GITHUB_REPO_OWNER:-shostwp-byte}"
+REPO_NAME="${GITHUB_REPO_NAME:-nas-sync}"
+REPO_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}.git"
+DEV_MAIN_MODE="false"
+
+if [ "${1:-}" = "--dev-main" ]; then
+  DEV_MAIN_MODE="true"
+fi
 
 echo "================================================================"
-echo "  NAS-SYNC — CẬP NHẬT HỆ THỐNG TỪ GITHUB ($REPO_URL)"
+echo "  NAS-SYNC — CẬP NHẬT HỆ THỐNG TỪ GITHUB RELEASES ($REPO_URL)"
 echo "================================================================"
 
 if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
@@ -27,30 +33,55 @@ for dbf in ./app_data/*.db; do
   fi
 done
 
-# 2. Kéo mã nguồn mới nhất từ GitHub (hỗ trợ cả thư mục cài từ Git lẫn cài từ file ZIP)
-if [ -d .git ]; then
-  echo "🔄 Đang kéo bản cập nhật mới nhất qua git pull..."
-  git fetch origin "$BRANCH"
-  git reset --hard "origin/$BRANCH"
+# R2 Fix: Mặc định chỉ cập nhật theo tag Release chính thức (trừ khi truyền --dev-main tường minh)
+# và KHÔNG BAO GIỜ ghi đè docker-compose.yml / .env người dùng đã tùy chỉnh.
+TMP_UPDATE=$(mktemp -d)
+trap 'rm -rf "${TMP_UPDATE:-}"' EXIT
+
+if [ "$DEV_MAIN_MODE" = "true" ]; then
+  echo "⚠️  [DEV MODE] Đang kéo mã nguồn nhánh main theo yêu cầu tường minh (--dev-main)..."
+  curl -fsSL "https://codeload.github.com/${REPO_OWNER}/${REPO_NAME}/tar.gz/refs/heads/main" | tar -xz --strip-components=1 -C "$TMP_UPDATE"
+  TARGET_LABEL="dev-main"
 else
-  echo "🔄 Thư mục hiện tại được cài từ gói ZIP — Đang tải tarball mới nhất từ GitHub..."
-  TMP_UPDATE=$(mktemp -d)
-  trap 'rm -rf "${TMP_UPDATE:-}"' EXIT
-  curl -fsSL "https://codeload.github.com/shostwp-byte/nas-sync/tar.gz/refs/heads/$BRANCH" | tar -xz --strip-components=1 -C "$TMP_UPDATE"
-  # Bảo toàn file .env, app_data và ssh_keys hiện có của người dùng
-  rm -rf "$TMP_UPDATE/app_data" "$TMP_UPDATE/ssh_keys" "$TMP_UPDATE/.env"
-  cp -rf "$TMP_UPDATE"/. ./
-  rm -rf "$TMP_UPDATE"
-  trap - EXIT
+  echo "🔍 Đang truy vấn phiên bản Release chính thức mới nhất từ GitHub..."
+  REL_JSON=$(curl -fsSL "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest")
+  LATEST_TAG=$(printf '%s' "$REL_JSON" | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')
+  if [ -z "$LATEST_TAG" ]; then
+    echo "[LỖI] Không tìm thấy bản phát hành (Release tag) hợp lệ trên GitHub."
+    exit 1
+  fi
+  echo "📦 Đang tải gói phát hành chính thức ${LATEST_TAG}..."
+  RELEASE_ASSET_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${LATEST_TAG}/nas-sync-synology.tar.gz"
+  if curl -fsSL "$RELEASE_ASSET_URL" -o "$TMP_UPDATE/bundle.tar.gz" 2>/dev/null; then
+    tar -xzf "$TMP_UPDATE/bundle.tar.gz" --strip-components=1 -C "$TMP_UPDATE"
+    rm -f "$TMP_UPDATE/bundle.tar.gz"
+  else
+    curl -fsSL "https://codeload.github.com/${REPO_OWNER}/${REPO_NAME}/tar.gz/refs/tags/${LATEST_TAG}" | tar -xz --strip-components=1 -C "$TMP_UPDATE"
+  fi
+  TARGET_LABEL="$LATEST_TAG"
 fi
+
+# Bảo toàn tuyệt đối dữ liệu vận hành & cấu hình tùy biến của quản trị viên trên NAS
+rm -rf "$TMP_UPDATE/app_data" "$TMP_UPDATE/ssh_keys" "$TMP_UPDATE/.env"
+
+if [ -f "./docker-compose.yml" ] && [ -f "$TMP_UPDATE/docker-compose.yml" ]; then
+  if ! cmp -s "./docker-compose.yml" "$TMP_UPDATE/docker-compose.yml"; then
+    cp -f "$TMP_UPDATE/docker-compose.yml" "./docker-compose.yml.dist"
+    echo "ℹ️  Đã giữ nguyên ./docker-compose.yml hiện tại của bạn (mẫu mới lưu tại ./docker-compose.yml.dist)."
+  fi
+  rm -f "$TMP_UPDATE/docker-compose.yml"
+fi
+
+cp -rf "$TMP_UPDATE"/. ./
+rm -rf "$TMP_UPDATE"
+trap - EXIT
 
 # Dọn bản live_release cũ để ưu tiên Docker Image mới vừa build
 rm -rf ./app_data/live_release/current
 
 # 3. Build lại Docker Image và khởi động không gián đoạn dữ liệu
-echo "🚀 Đang biên dịch lại Docker Image & khởi động dịch vụ NAS-Sync..."
+echo "🚀 Đang biên dịch lại Docker Image (${TARGET_LABEL}) & khởi động dịch vụ NAS-Sync..."
 $COMPOSE_CMD up -d --build
 
 echo ""
-echo "✅ CẬP NHẬT HOÀN TẤT! Phiên bản mới nhất từ $REPO_URL đã sẵn sàng hoạt động."
-
+echo "✅ CẬP NHẬT HOÀN TẤT! Phiên bản ${TARGET_LABEL} từ $REPO_URL đã sẵn sàng hoạt động."

@@ -218,7 +218,6 @@ export interface DiscoveredDomain {
 
 export interface MysqlAdminCredentials {
   user: string;
-  password?: string;
   defaultsFile?: string;
   socket?: string;
   remoteAuthPrelude?: string;
@@ -394,7 +393,3 @@ export interface OffsiteSyncJob {
   created_at: string;
   completed_at: string | null;
 }
-
-
-
-

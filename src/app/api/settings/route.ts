@@ -50,9 +50,9 @@ const ALLOWED_SETTING_KEYS = new Set([
   'dsm_btrfs_shares',
   'btrfs_cron_time',
   'btrfs_auto_enabled',
-  'dsm_worm_Enabled',
   'dsm_worm_enabled',
   'dsm_worm_lock_days',
+  'dsm_tls_insecure',
   'github_token',
   'global_exclude_patterns',
   'digest_enabled',
@@ -164,8 +164,6 @@ function applySettingsDictionary(
       req,
     });
     if (updatedKeys.some((k) => CRON_TRIGGER_KEYS.has(k))) {
-      reloadCronSchedules();
-    } else {
       reloadCronSchedules();
     }
   }

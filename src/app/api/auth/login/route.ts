@@ -1,7 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { safeErrorJson } from '@/lib/api-error';
 import { extractRequestIp, recordAuditLog } from '@/lib/audit';
 import {
   SESSION_COOKIE_NAME,
+  hashPassword,
   normalizeUserRole,
   sessionCookieOptions,
   signSessionToken,
@@ -14,10 +16,16 @@ import {
   recordLoginFailure,
 } from '@/lib/login-throttle';
 import {
+  consumeTotpStepAtomically,
   decryptTotpSecret,
+  encryptTotpSecret,
   verifyAndConsumeRecoveryCode,
-  verifyTotpCode,
+  verifyTotpCodeWithStep,
 } from '@/lib/totp';
+
+const DUMMY_TIMING_PASSWORD_HASH = hashPassword(
+  'nas-sync-constant-time-login-equalizer'
+);
 
 export async function POST(req: NextRequest) {
   try {
@@ -59,7 +67,13 @@ export async function POST(req: NextRequest) {
       .prepare('SELECT * FROM users WHERE username = ?')
       .get(username);
 
-    if (!user || !verifyPassword(password, String(user.password_hash))) {
+    // Luôn chạy scrypt kể cả khi username không tồn tại để chống dò tên tài khoản qua thời gian phản hồi (Timing Attack)
+    const passwordHashToVerify = user
+      ? String(user.password_hash)
+      : DUMMY_TIMING_PASSWORD_HASH;
+    const passwordMatches = verifyPassword(password, passwordHashToVerify);
+
+    if (!user || !passwordMatches) {
       recordLoginFailure(throttleKey);
       recordAuditLog({
         userId: user ? Number(user.id) : null,
@@ -78,7 +92,8 @@ export async function POST(req: NextRequest) {
     const userId = Number(user.id);
     const dbUsername = String(user.username);
     const role = normalizeUserRole(user.role || 'ADMIN');
-    const totpEnabled = Number(user.totp_enabled) === 1 && Boolean(user.totp_secret);
+    const totpEnabled =
+      Number(user.totp_enabled) === 1 && Boolean(user.totp_secret);
 
     let loginDetail = `Đăng nhập thành công (${role})`;
 
@@ -94,8 +109,22 @@ export async function POST(req: NextRequest) {
 
       let isSecondFactorValid = false;
       try {
-        const plainSecret = decryptTotpSecret(String(user.totp_secret));
-        isSecondFactorValid = verifyTotpCode(plainSecret, totpCode);
+        const rawStoredSecret = String(user.totp_secret);
+        const plainSecret = decryptTotpSecret(rawStoredSecret);
+        const stepCheck = verifyTotpCodeWithStep(plainSecret, totpCode);
+        if (
+          stepCheck.valid &&
+          stepCheck.matchedStep !== null &&
+          consumeTotpStepAtomically(userId, stepCheck.matchedStep)
+        ) {
+          isSecondFactorValid = true;
+          if (rawStoredSecret.startsWith('v1:')) {
+            db.prepare('UPDATE users SET totp_secret = ? WHERE id = ?').run(
+              encryptTotpSecret(plainSecret),
+              userId
+            );
+          }
+        }
       } catch {
         isSecondFactorValid = false;
       }
@@ -124,11 +153,15 @@ export async function POST(req: NextRequest) {
           action: 'AUTH_2FA_FAILED',
           resourceType: 'AUTH',
           resourceId: String(userId),
-          detail: 'Xác thực 2 lớp (2FA) thất bại: Mã TOTP hoặc Mã khôi phục không hợp lệ',
+          detail:
+            'Xác thực 2 lớp (2FA) thất bại: Mã TOTP không hợp lệ, đã hết hạn hoặc bị phát lại (replay)',
           ipAddress: clientIp,
         });
         return NextResponse.json(
-          { error: 'Mã xác thực 2 lớp (2FA) không chính xác hoặc đã hết hạn.' },
+          {
+            error:
+              'Mã xác thực 2 lớp (2FA) không chính xác, đã hết hạn hoặc vừa được sử dụng.',
+          },
           { status: 401 }
         );
       }
@@ -171,9 +204,6 @@ export async function POST(req: NextRequest) {
 
     return res;
   } catch (err) {
-    return NextResponse.json(
-      { error: (err as Error).message },
-      { status: 500 }
-    );
+    return safeErrorJson(err, 'Lỗi máy chủ khi đăng nhập.', 500);
   }
 }

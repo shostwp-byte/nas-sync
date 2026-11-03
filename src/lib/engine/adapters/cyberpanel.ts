@@ -9,7 +9,11 @@ import {
   isSafeDomain,
   isSafeSystemUser,
 } from '../safe-names';
-import { finalizeDiscoveredDomains, type PanelAdapter } from './base';
+import {
+  buildPinnedCurrentDirPermissionCommand,
+  finalizeDiscoveredDomains,
+  type PanelAdapter,
+} from './base';
 
 export class CyberPanelAdapter implements PanelAdapter {
   readonly panelType = 'CYBERPANEL' as const;
@@ -17,14 +21,13 @@ export class CyberPanelAdapter implements PanelAdapter {
   async getMysqlAdminCredentials(
     server: ServerRecord
   ): Promise<MysqlAdminCredentials> {
+    // S11 Security Fix: Không kéo mật khẩu MySQL admin từ VPS về bộ nhớ NAS
     const script = `
       if [ -f /etc/cyberpanel/mysqlPassword ]; then
-        P=$(tr -d '\\r\\n' < /etc/cyberpanel/mysqlPassword)
-        printf "CYBER|%s\\n" "$P"
+        echo "CYBER"
       elif [ -f /root/.my.cnf ]; then
         U=$(grep -E '^user[[:space:]]*=' /root/.my.cnf | head -n1 | cut -d= -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
-        P=$(grep -E '^password[[:space:]]*=' /root/.my.cnf | head -n1 | cut -d= -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
-        printf "MYCNF|%s|%s\\n" "\${U:-root}" "$P"
+        printf "MYCNF|%s\\n" "\${U:-root}"
       else
         echo "ERR_NO_CRED"
         exit 1
@@ -37,12 +40,10 @@ export class CyberPanelAdapter implements PanelAdapter {
       );
     }
 
-    const line = res.stdout.split(/\r?\n/)[0] || '';
-    if (line.startsWith('CYBER|')) {
-      const password = line.slice('CYBER|'.length).trim();
+    const line = res.stdout.split(/\r?\n/)[0]?.trim() || '';
+    if (line === 'CYBER') {
       return {
         user: 'root',
-        password,
         remoteAuthPrelude:
           'export MYSQL_PWD="$(tr -d \'\\r\\n\' < /etc/cyberpanel/mysqlPassword)"',
       };
@@ -51,7 +52,6 @@ export class CyberPanelAdapter implements PanelAdapter {
     const parts = line.split('|');
     return {
       user: (parts[1] || 'root').trim() || 'root',
-      password: (parts[2] || '').trim() || undefined,
       defaultsFile: '/root/.my.cnf',
     };
   }
@@ -180,8 +180,9 @@ export class CyberPanelAdapter implements PanelAdapter {
     targetWebroot: string
   ): string {
     assertSafe(isSafeSystemUser, systemUser, 'systemUser');
-    return `chown -hR ${shellSingleQuote(`${systemUser}:${systemUser}`)} ${shellSingleQuote(
-      targetWebroot
-    )}`;
+    return buildPinnedCurrentDirPermissionCommand(
+      targetWebroot,
+      `chown -hR ${shellSingleQuote(`${systemUser}:${systemUser}`)} .`
+    );
   }
 }

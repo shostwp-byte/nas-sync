@@ -9,7 +9,11 @@ import {
   isSafeDomain,
   isSafeSystemUser,
 } from '../safe-names';
-import { finalizeDiscoveredDomains, type PanelAdapter } from './base';
+import {
+  buildPinnedCurrentDirPermissionCommand,
+  finalizeDiscoveredDomains,
+  type PanelAdapter,
+} from './base';
 
 export class CloudPanelAdapter implements PanelAdapter {
   readonly panelType = 'CLOUDPANEL' as const;
@@ -217,8 +221,9 @@ if os.path.isfile(db_path):
     targetWebroot: string
   ): string {
     assertSafe(isSafeSystemUser, systemUser, 'systemUser');
-    return `chown -hR ${shellSingleQuote(`${systemUser}:${systemUser}`)} ${shellSingleQuote(
-      targetWebroot
-    )}`;
+    return buildPinnedCurrentDirPermissionCommand(
+      targetWebroot,
+      `chown -hR ${shellSingleQuote(`${systemUser}:${systemUser}`)} .`
+    );
   }
 }

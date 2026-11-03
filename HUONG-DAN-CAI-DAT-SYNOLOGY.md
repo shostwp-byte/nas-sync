@@ -69,6 +69,7 @@ Phù hợp ngay cả khi mạng đặt NAS dùng **IP động, CGNAT nhà mạng
 3. **Bật WebSocket (Bắt buộc để chạy thanh tiến trình Realtime)**:
    * Chuyển sang tab **Custom Header** -> nhấn mũi tên cạnh **Create** -> chọn **WebSocket** (DSM tự thêm `Upgrade` và `Connection`) -> nhấn **Save**.
 4. Vào **Control Panel** -> **Security** -> **Certificate** -> **Add** -> **Get a certificate from Let's Encrypt** và gán chứng chỉ cho Reverse Proxy vừa tạo.
+5. **Lưu ý bảo mật biến `TRUST_PROXY`**: Nếu bạn đặt `TRUST_PROXY=true` trong `.env` để ghi nhận IP thật của người dùng qua Cloudflare Tunnel / Synology Reverse Proxy, **bắt buộc** chặn truy cập trực tiếp từ mạng ngoài vào cổng nội bộ `3080` của Container (hoặc gắn port `127.0.0.1:3080:3000` trong `docker-compose.yml`) nhằm ngăn giả mạo header `X-Forwarded-For` né giới hạn đăng nhập.
 
 ---
 

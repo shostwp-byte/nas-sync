@@ -21,6 +21,7 @@ export interface DiffChangeChunk {
 }
 
 export function resolveSafeSnapshotRoot(jobId: number): {
+  serverId: number;
   snapshotRoot: string;
   hostname: string;
   snapshotName: string;
@@ -28,7 +29,7 @@ export function resolveSafeSnapshotRoot(jobId: number): {
   const db = getDb();
   const row = db
     .prepare(
-      `SELECT j.snapshot_name, s.hostname, v.mount_path
+      `SELECT j.server_id, j.snapshot_name, s.hostname, v.mount_path
        FROM backup_jobs j
        JOIN servers s ON s.id = j.server_id
        JOIN storage_volumes v ON v.id = j.volume_id
@@ -52,6 +53,7 @@ export function resolveSafeSnapshotRoot(jobId: number): {
   }
 
   return {
+    serverId: Number(row.server_id),
     snapshotRoot,
     hostname: String(row.hostname),
     snapshotName,
@@ -167,7 +169,7 @@ export function listSnapshotDirectory(
 
 const MAX_GZ_PREVIEW_COMPRESSED_BYTES = 5 * 1024 * 1024; // 5 MB
 const MAX_GZ_PREVIEW_UNCOMPRESSED_BYTES = 10 * 1024 * 1024; // 10 MB
-const MAX_DIFF_FILE_BYTES = 5 * 1024 * 1024; // 5 MB
+const MAX_DIFF_FILE_BYTES = 1 * 1024 * 1024; // 1 MiB (N17: tránh chặn Event Loop với diffLines đồng bộ)
 
 export function readSnapshotFilePreview(
   jobId: number,
@@ -250,7 +252,10 @@ export function readSnapshotFilePreview(
             '...Dữ liệu sau giải nén vượt ngưỡng an toàn RAM (10 MB), vui lòng tải file về máy để xem...',
         };
       }
-      throw new Error(`Không thể giải nén tập tin xem trước: ${(err as Error).message}`);
+      throw new Error(
+        `Không thể giải nén tập tin xem trước: ${(err as Error).message}`,
+        { cause: err }
+      );
     }
   }
 
@@ -312,7 +317,7 @@ export function compareSnapshotFilesDiff(
     if (!stat.isFile()) return '';
     if (stat.size > MAX_DIFF_FILE_BYTES) {
       throw new Error(
-        'Tập tin vượt quá giới hạn 5 MB để so sánh Diff trực tiếp.'
+        'Tập tin vượt quá giới hạn 1 MB để so sánh Diff trực tiếp.'
       );
     }
     if (p.endsWith('.gz')) {
@@ -325,7 +330,8 @@ export function compareSnapshotFilesDiff(
       } catch (err) {
         if ((err as NodeJS.ErrnoException)?.code === 'ERR_BUFFER_TOO_LARGE') {
           throw new Error(
-            'Dữ liệu sau giải nén vượt quá giới hạn 5 MB để so sánh Diff trực tiếp.'
+            'Dữ liệu sau giải nén vượt quá giới hạn 1 MB để so sánh Diff trực tiếp.',
+            { cause: err }
           );
         }
         throw err;

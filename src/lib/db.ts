@@ -15,7 +15,6 @@ export interface SqliteDatabase {
 }
 
 declare global {
-  // eslint-disable-next-line no-var
   var __nasSyncDb: SqliteDatabase | undefined;
 }
 
@@ -122,6 +121,7 @@ function initializeSchema(db: SqliteDatabase) {
       totp_secret TEXT,
       totp_pending_secret TEXT,
       totp_enabled INTEGER NOT NULL DEFAULT 0,
+      totp_last_used_step INTEGER NOT NULL DEFAULT 0,
       recovery_codes_json TEXT NOT NULL DEFAULT '[]',
       last_login_at TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -310,31 +310,50 @@ function initializeSchema(db: SqliteDatabase) {
     CREATE INDEX IF NOT EXISTS idx_offsite_created ON offsite_sync_jobs(created_at DESC, id DESC);
   `);
 
-  // Tự động nâng cấp lược đồ CSDL an toàn cho các bản cài đặt từ v1.0.0 / v1.1.x / v1.2.x
+  // Tự động nâng cấp lược đồ CSDL an toàn cho các bản cài đặt cũ (mỗi lệnh ALTER TABLE độc lập để lỗi 1 cột không làm bỏ sót các cột sau)
+  let userCols: Set<string>;
   try {
-    const userCols = new Set(
+    userCols = new Set(
       db
         .prepare('PRAGMA table_info(users)')
         .all()
         .map((col) => String(col.name))
     );
-    const userColumnMigrations: Array<[string, string]> = [
-      ['token_version', 'ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 1'],
-      ['totp_secret', 'ALTER TABLE users ADD COLUMN totp_secret TEXT'],
-      ['totp_pending_secret', 'ALTER TABLE users ADD COLUMN totp_pending_secret TEXT'],
-      ['totp_enabled', 'ALTER TABLE users ADD COLUMN totp_enabled INTEGER NOT NULL DEFAULT 0'],
-      [
-        'recovery_codes_json',
-        "ALTER TABLE users ADD COLUMN recovery_codes_json TEXT NOT NULL DEFAULT '[]'",
-      ],
-    ];
-    for (const [colName, alterSql] of userColumnMigrations) {
-      if (!userCols.has(colName)) {
+  } catch {
+    userCols = new Set<string>();
+  }
+
+  const userColumnMigrations: Array<[string, string]> = [
+    [
+      'token_version',
+      'ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 1',
+    ],
+    ['totp_secret', 'ALTER TABLE users ADD COLUMN totp_secret TEXT'],
+    [
+      'totp_pending_secret',
+      'ALTER TABLE users ADD COLUMN totp_pending_secret TEXT',
+    ],
+    [
+      'totp_enabled',
+      'ALTER TABLE users ADD COLUMN totp_enabled INTEGER NOT NULL DEFAULT 0',
+    ],
+    [
+      'totp_last_used_step',
+      'ALTER TABLE users ADD COLUMN totp_last_used_step INTEGER NOT NULL DEFAULT 0',
+    ],
+    [
+      'recovery_codes_json',
+      "ALTER TABLE users ADD COLUMN recovery_codes_json TEXT NOT NULL DEFAULT '[]'",
+    ],
+  ];
+  for (const [colName, alterSql] of userColumnMigrations) {
+    if (!userCols.has(colName)) {
+      try {
         db.exec(alterSql);
+      } catch {
+        // Cột đã tồn tại
       }
     }
-  } catch {
-    // Bỏ qua nếu cột đã tồn tại
   }
 
   const migrations = [
@@ -484,6 +503,7 @@ function seedDefaults(db: SqliteDatabase) {
     dsm_username: process.env.DSM_USERNAME || '',
     dsm_password: process.env.DSM_PASSWORD || '',
     dsm_backup_shares: process.env.DSM_BACKUP_SHARES || 'VPS_Backups',
+    dsm_tls_insecure: 'false',
     btrfs_cron_time: '0 6 * * *',
     btrfs_auto_enabled: 'false',
     global_exclude_patterns: '',

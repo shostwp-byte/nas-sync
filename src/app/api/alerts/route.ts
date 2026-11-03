@@ -174,4 +174,3 @@ export async function POST(req: NextRequest) {
     return safeErrorJson(err, 'Không thể cập nhật trạng thái cảnh báo.');
   }
 }
-

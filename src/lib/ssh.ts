@@ -59,8 +59,8 @@ function parseSingleOpenSshKeyLine(line: string): ParsedOpenSshKeyLine | null {
 
   const tokens = trimmed.split(/\s+/);
   let hostToken = '';
-  let keyType = '';
-  let keyBase64 = '';
+  let keyType: string;
+  let keyBase64: string;
 
   if (tokens.length >= 2 && OPENSSH_KEY_TYPE_RE.test(tokens[0])) {
     keyType = tokens[0];
@@ -162,7 +162,44 @@ export function getKnownHostsDir(): string {
   return dir;
 }
 
-const SSH_MUX_DIR = '/tmp/.nas_ssh_mux';
+function getSshMuxDir(): string | null {
+  if (process.platform === 'win32') {
+    return null;
+  }
+  const dir = path.join(getDataDir(), '.ssh_mux');
+  try {
+    const existingStat = fs.lstatSync(dir, { throwIfNoEntry: false });
+    if (existingStat) {
+      if (existingStat.isSymbolicLink() || !existingStat.isDirectory()) {
+        return null;
+      }
+    } else {
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    }
+    try {
+      fs.chmodSync(dir, 0o700);
+    } catch {
+      // Bỏ qua trên mount có RichACL
+    }
+    const verifiedStat = fs.lstatSync(dir, { throwIfNoEntry: false });
+    if (
+      !verifiedStat ||
+      verifiedStat.isSymbolicLink() ||
+      !verifiedStat.isDirectory()
+    ) {
+      return null;
+    }
+    if (typeof process.getuid === 'function') {
+      const currentUid = process.getuid();
+      if (verifiedStat.uid !== currentUid || (verifiedStat.mode & 0o077) !== 0) {
+        return null;
+      }
+    }
+    return dir;
+  } catch {
+    return null;
+  }
+}
 
 const PERMANENT_SSH_ERROR_RE =
   /Permission denied|REMOTE HOST IDENTIFICATION HAS CHANGED|Host key verification failed|\[SECURITY\]|Bad configuration option|Identity file .* not accessible/i;
@@ -184,19 +221,19 @@ export function isTransientSshTransportError(
   return code === 255 && text.trim().length > 0;
 }
 
-function getSshControlMuxPath(disableMux?: boolean): string | null {
+export function getSshControlMuxPath(disableMux?: boolean): string | null {
   if (disableMux || process.platform === 'win32') {
     return null;
   }
-  try {
-    if (!fs.existsSync(SSH_MUX_DIR)) {
-      fs.mkdirSync(SSH_MUX_DIR, { recursive: true, mode: 0o700 });
-    }
-    fs.chmodSync(SSH_MUX_DIR, 0o700);
-    return `${SSH_MUX_DIR}/%C`;
-  } catch {
+  const muxDir = getSshMuxDir();
+  if (!muxDir) {
     return null;
   }
+  // OpenSSH %C mở rộng thành 40 ký tự hex; giới hạn UNIX domain socket sun_path ~ 104 bytes
+  if (Buffer.byteLength(muxDir, 'utf8') + 1 + 40 >= 100) {
+    return null;
+  }
+  return `${muxDir}/%C`;
 }
 
 export function removeServerKnownHostsCache(serverId: number): void {
@@ -215,9 +252,10 @@ export function removeServerKnownHostsCache(serverId: number): void {
   }
   if (process.platform !== 'win32') {
     try {
-      if (fs.existsSync(SSH_MUX_DIR)) {
-        for (const entry of fs.readdirSync(SSH_MUX_DIR)) {
-          fs.rmSync(path.join(SSH_MUX_DIR, entry), { force: true });
+      const muxDir = getSshMuxDir();
+      if (muxDir) {
+        for (const entry of fs.readdirSync(muxDir)) {
+          fs.rmSync(path.join(muxDir, entry), { force: true });
         }
       }
     } catch {
@@ -232,7 +270,24 @@ export function materializeServerKnownHostsFile(
   if (server.host_key_status === 'MISMATCH') {
     return null;
   }
-  const entry = (server.known_host_entry || '').trim();
+  let entry = (server.known_host_entry || '').trim();
+  if (!entry && Number(server.id) > 0) {
+    try {
+      const fresh = getDb()
+        .prepare(
+          'SELECT host_key_status, known_host_entry FROM servers WHERE id = ?'
+        )
+        .get(server.id) as
+        | { host_key_status?: string; known_host_entry?: string }
+        | undefined;
+      if (fresh?.host_key_status === 'MISMATCH') {
+        return null;
+      }
+      entry = (fresh?.known_host_entry || '').trim();
+    } catch {
+      // Ignore DB lookup fallback errors
+    }
+  }
   if (!entry) {
     return null;
   }
@@ -374,7 +429,7 @@ export async function ensureServerHostKeyPinned(
     return { status: 'VERIFIED', fingerprint: fp, changed: false };
   }
 
-  let scanStdout = '';
+  let scanStdout: string;
   let scanStderr = '';
   if (injectedScanStdout !== undefined) {
     scanStdout = injectedScanStdout;
@@ -432,30 +487,28 @@ export async function ensureServerHostKeyPinned(
   const storedKeyIdentities = new Set(
     storedEntries.map((e) => `${e.keyType} ${e.keyBase64}`)
   );
-  const anyKeyMatched =
+  const isSubsetOfPinned =
     storedEntries.length > 0 &&
-    scannedEntries.some((s) =>
+    scannedEntries.every((s) =>
       storedKeyIdentities.has(`${s.keyType} ${s.keyBase64}`)
     );
 
-  if (anyKeyMatched) {
+  if (isSubsetOfPinned) {
     const effectiveFp = server.host_key_fingerprint || scannedFingerprint;
     if (
       server.host_key_status !== 'VERIFIED' ||
-      server.known_host_entry !== normalizedScannedBlock ||
       server.host_key_fingerprint !== effectiveFp ||
       server.host_key_pending_entry ||
       server.host_key_pending_fingerprint
     ) {
       db.prepare(
         `UPDATE servers
-         SET known_host_entry = ?,
-             host_key_fingerprint = ?,
+         SET host_key_fingerprint = ?,
              host_key_status = 'VERIFIED',
              host_key_pending_fingerprint = '',
              host_key_pending_entry = ''
          WHERE id = ?`
-      ).run(normalizedScannedBlock, effectiveFp, server.id);
+      ).run(effectiveFp, server.id);
       removeServerKnownHostsCache(server.id);
     }
     return {
@@ -465,10 +518,17 @@ export async function ensureServerHostKeyPinned(
     };
   }
 
-  // PHÁT HIỆN THAY ĐỔI HOST KEY BẤT THƯỜNG (NGUY CƠ MITM HOẶC CÀI LẠI OS VPS)!
+  // PHÁT HIỆN THAY ĐỔI HOST KEY BẤT THƯỜNG HOẶC CHÈN THÊM KHÓA LẠ (NGUY CƠ MITM HOẶC CÀI LẠI OS VPS)!
+  const mismatchedEntry = scannedEntries.find(
+    (s) => !storedKeyIdentities.has(`${s.keyType} ${s.keyBase64}`)
+  );
+  const mismatchFingerprint = mismatchedEntry
+    ? computeOpenSshKeyFingerprint(mismatchedEntry.rawLine)
+    : scannedFingerprint;
+
   const alreadyAlertedSameKey =
     server.host_key_status === 'MISMATCH' &&
-    server.host_key_pending_fingerprint === scannedFingerprint;
+    server.host_key_pending_fingerprint === mismatchFingerprint;
 
   db.prepare(
     `UPDATE servers
@@ -477,7 +537,7 @@ export async function ensureServerHostKeyPinned(
          host_key_pending_entry = ?,
          status = 'ERROR'
      WHERE id = ?`
-  ).run(scannedFingerprint, normalizedScannedBlock, server.id);
+  ).run(mismatchFingerprint, normalizedScannedBlock, server.id);
   removeServerKnownHostsCache(server.id);
 
   if (!alreadyAlertedSameKey) {
@@ -486,12 +546,12 @@ export async function ensureServerHostKeyPinned(
       category: 'SYSTEM',
       serverId: server.id,
       title: `CẢNH BÁO AN NINH: Thay đổi SSH Host Key trên ${server.hostname}`,
-      message: `Phát hiện khóa định danh SSH của VPS ${server.hostname} (${server.ip_address}:${server.ssh_port}) đã thay đổi từ [${server.host_key_fingerprint}] sang [${scannedFingerprint}]! Hệ thống đã tự động khóa mọi kết nối Sao lưu/Khôi phục để phòng chống tấn công MITM.`,
+      message: `Phát hiện khóa định danh SSH của VPS ${server.hostname} (${server.ip_address}:${server.ssh_port}) đã thay đổi hoặc xuất hiện khóa lạ [${mismatchFingerprint}] (trước đó: [${server.host_key_fingerprint}])! Hệ thống đã tự động khóa mọi kết nối Sao lưu/Khôi phục để phòng chống tấn công MITM.`,
     });
   }
 
   throw new Error(
-    `[SECURITY] Phát hiện SSH Host Key của máy chủ "${server.hostname}" (${ipAddr}:${port}) đã thay đổi từ [${server.host_key_fingerprint}] sang [${scannedFingerprint}]! Hệ thống đã tự động khóa kết nối để chống tấn công MITM — Quản trị viên (ADMIN) cần kiểm tra và xác nhận trên trang Máy chủ VPS.`
+    `[SECURITY] Phát hiện SSH Host Key của máy chủ "${server.hostname}" (${ipAddr}:${port}) đã thay đổi hoặc xuất hiện khóa lạ [${mismatchFingerprint}] (trước đó: [${server.host_key_fingerprint}])! Hệ thống đã tự động khóa kết nối để chống tấn công MITM — Quản trị viên (ADMIN) cần kiểm tra và xác nhận trên trang Máy chủ VPS.`
   );
 }
 
@@ -639,6 +699,11 @@ export function buildSshBaseArgs(
   }
 
   const knownHostsFile = materializeServerKnownHostsFile(server);
+  if (!knownHostsFile) {
+    throw new Error(
+      `[SECURITY] Máy chủ "${server.hostname}" chưa có khóa định danh SSH Host Key được ghim (known_hosts). Hệ thống từ chối kết nối chưa xác thực (fail-closed) — vui lòng xác thực TOFU trước.`
+    );
+  }
   const muxPath = getSshControlMuxPath(options.disableMux);
 
   const args: string[] = [
@@ -648,33 +713,14 @@ export function buildSshBaseArgs(
     String(port),
     '-o',
     'BatchMode=yes',
-  ];
-
-  if (knownHostsFile) {
-    args.push(
-      '-o',
-      'StrictHostKeyChecking=yes',
-      '-o',
-      `UserKnownHostsFile=${knownHostsFile}`
-    );
-  } else {
-    args.push(
-      '-o',
-      'StrictHostKeyChecking=accept-new',
-      '-o',
-      'UserKnownHostsFile=/dev/null'
-    );
-  }
-
-  args.push(
     '-o',
-    'IgnoreUnknown=WarnWeakCrypto,PubkeyAcceptedAlgorithms,HostKeyAlgorithms,ControlMaster,ControlPath,ControlPersist',
+    'StrictHostKeyChecking=yes',
+    '-o',
+    `UserKnownHostsFile=${knownHostsFile}`,
+    '-o',
+    'IgnoreUnknown=WarnWeakCrypto,ControlMaster,ControlPath,ControlPersist',
     '-o',
     'WarnWeakCrypto=no',
-    '-o',
-    'PubkeyAcceptedAlgorithms=+ssh-rsa',
-    '-o',
-    'HostKeyAlgorithms=+ssh-rsa',
     '-o',
     'ConnectTimeout=15',
     '-o',
@@ -682,8 +728,8 @@ export function buildSshBaseArgs(
     '-o',
     'ServerAliveInterval=15',
     '-o',
-    'ServerAliveCountMax=3'
-  );
+    'ServerAliveCountMax=3',
+  ];
 
   if (muxPath) {
     args.push(
@@ -717,31 +763,24 @@ export function buildRsyncSshTransport(
 
   const resolvedKey = resolveServerKeyPath(server);
   const knownHostsFile = materializeServerKnownHostsFile(server);
+  if (!knownHostsFile) {
+    throw new Error(
+      `[SECURITY] Máy chủ "${server.hostname}" chưa có khóa định danh SSH Host Key được ghim (known_hosts). Hệ thống từ chối kết nối Rsync chưa xác thực (fail-closed) — vui lòng xác thực TOFU trước.`
+    );
+  }
   const muxPath = getSshControlMuxPath(options.disableMux);
 
   const parts: string[] = ['ssh', '-F /dev/null'];
   if (resolvedKey) {
     parts.push(`-i ${shellSingleQuote(resolvedKey)}`);
   }
-  parts.push(`-p ${port}`, '-o BatchMode=yes');
-
-  if (knownHostsFile) {
-    parts.push(
-      '-o StrictHostKeyChecking=yes',
-      `-o UserKnownHostsFile=${shellSingleQuote(knownHostsFile)}`
-    );
-  } else {
-    parts.push(
-      '-o StrictHostKeyChecking=accept-new',
-      '-o UserKnownHostsFile=/dev/null'
-    );
-  }
-
   parts.push(
-    '-o IgnoreUnknown=WarnWeakCrypto,PubkeyAcceptedAlgorithms,HostKeyAlgorithms,ControlMaster,ControlPath,ControlPersist',
+    `-p ${port}`,
+    '-o BatchMode=yes',
+    '-o StrictHostKeyChecking=yes',
+    `-o UserKnownHostsFile=${shellSingleQuote(knownHostsFile)}`,
+    '-o IgnoreUnknown=WarnWeakCrypto,ControlMaster,ControlPath,ControlPersist',
     '-o WarnWeakCrypto=no',
-    '-o PubkeyAcceptedAlgorithms=+ssh-rsa',
-    '-o HostKeyAlgorithms=+ssh-rsa',
     '-o ConnectTimeout=15',
     '-o ConnectionAttempts=3',
     '-o ServerAliveInterval=15',

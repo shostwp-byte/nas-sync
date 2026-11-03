@@ -2771,6 +2771,23 @@ export default function SettingsPage() {
                         (Khóa chống xóa 7 ngày)
                       </span>
                     </label>
+                    <label className="flex items-start gap-2.5 py-1 text-slate-400 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={settings.dsm_tls_insecure === 'true'}
+                        onChange={(e) =>
+                          updateField(
+                            'dsm_tls_insecure',
+                            e.target.checked ? 'true' : 'false'
+                          )
+                        }
+                        className="w-4 h-4 mt-0.5 rounded accent-amber-500 shrink-0"
+                      />
+                      <span className="leading-relaxed">
+                        Cho phép chứng chỉ HTTPS tự ký (Self-Signed) của DSM nội
+                        bộ LAN (Mặc định tắt — kiểm tra TLS nghiêm ngặt)
+                      </span>
+                    </label>
                   </div>
                 </div>
               </div>
@@ -4046,7 +4063,7 @@ export default function SettingsPage() {
                     ? 'Đang xử lý...'
                     : updateInfo?.hasUpdate
                     ? `Cập nhật ngay lên v${updateInfo.latestVersion}`
-                    : 'Đồng bộ lại từ GitHub (main)'}
+                    : 'Cài lại bản Release đã ký'}
                 </span>
               </button>
             </div>

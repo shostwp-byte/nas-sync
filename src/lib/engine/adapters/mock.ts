@@ -16,17 +16,14 @@ export class MockPanelAdapter implements PanelAdapter {
   async getMysqlAdminCredentials(): Promise<MysqlAdminCredentials> {
     switch (this.panelType) {
       case 'DIRECTADMIN':
-        return { user: 'da_admin', password: 'mock_da_admin_password' };
+        return { user: 'da_admin' };
       case 'CPANEL':
         return { user: 'root', defaultsFile: '/root/.my.cnf' };
       case 'PLESK':
-        return { user: 'admin', password: 'mock_psa_shadow_password' };
+        return { user: 'admin' };
       case 'AAPANEL':
-        return { user: 'root', password: 'mock_aapanel_mysql_root' };
       case 'CYBERPANEL':
-        return { user: 'root', password: 'mock_cyberpanel_mysql_pass' };
       case 'HESTIACP':
-        return { user: 'root', password: 'mock_hestia_mysql_pass' };
       case 'CLOUDPANEL':
         return { user: 'root' };
     }

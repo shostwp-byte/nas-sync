@@ -4,9 +4,16 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
-import { getDataDir, getDb, getDbFilePath, getSetting, setSettings } from './db';
+import {
+  getDataDir,
+  getDb,
+  getDbFilePath,
+  getSetting,
+  setSettings,
+} from './db';
 import { emitSystemUpdateProgress } from './events';
 import { createSystemAlert } from './notifications';
+import { verifyReleaseSignature } from './release-signature';
 import type { SystemUpdateInfo, UpdateProgressEvent } from '@/types';
 
 export const GITHUB_OWNER = process.env.GITHUB_REPO_OWNER || 'shostwp-byte';
@@ -16,6 +23,7 @@ export const GITHUB_REPO_URL = `https://github.com/${GITHUB_OWNER}/${GITHUB_REPO
 
 const PREBUILT_ARCHIVE_NAME = 'nas-sync-prebuilt.tar.gz';
 const PREBUILT_SHA256_NAME = 'nas-sync-prebuilt.tar.gz.sha256';
+const PREBUILT_SIG_NAME = 'nas-sync-prebuilt.tar.gz.sig';
 
 const SYNC_TARGETS = [
   'src',
@@ -32,7 +40,7 @@ const SYNC_TARGETS = [
   'BUILD_INFO.json',
 ] as const;
 
-interface GitHubReleaseAsset {
+export interface GitHubReleaseAsset {
   name?: string;
   browser_download_url?: string;
   url?: string;
@@ -48,8 +56,15 @@ interface GitHubReleaseResponse {
 }
 
 declare global {
-  // eslint-disable-next-line no-var
   var __nasSyncUpdating: boolean | undefined;
+}
+
+export function isSystemUpdateInProgress(): boolean {
+  return Boolean(globalThis.__nasSyncUpdating);
+}
+
+export function isUnverifiedDevMainAllowed(): boolean {
+  return process.env.ALLOW_UNVERIFIED_MAIN_UPDATE === 'true';
 }
 
 export function compareSemver(a: string, b: string): number {
@@ -137,7 +152,11 @@ export function getRollbackMetadata(): {
   rollbackVersion: string | null;
   rollbackUpdatedAt: string | null;
 } {
-  const previousPersistDir = path.join(getDataDir(), 'live_release', 'previous');
+  const previousPersistDir = path.join(
+    getDataDir(),
+    'live_release',
+    'previous'
+  );
   const pkgPath = path.join(previousPersistDir, 'package.json');
   const nextDir = path.join(previousPersistDir, '.next');
 
@@ -207,8 +226,9 @@ export function getActiveBlockingReason(): {
     };
   }
 
+  const db = getDb();
   const activeJobs = Number(
-    getDb()
+    db
       .prepare(
         `SELECT COUNT(*) AS cnt FROM backup_jobs WHERE status IN ('RUNNING', 'RESUMING', 'VERIFYING')`
       )
@@ -222,13 +242,32 @@ export function getActiveBlockingReason(): {
     };
   }
 
+  // U4 Fix: Không cho phép cập nhật / khởi động lại container khi đang đẩy snapshot lên kho Offsite Cloud
+  try {
+    const activeOffsite = Number(
+      db
+        .prepare(
+          `SELECT COUNT(*) AS cnt FROM offsite_sync_jobs WHERE status IN ('UPLOADING', 'QUEUED')`
+        )
+        .get()?.cnt || 0
+    );
+    if (activeOffsite > 0) {
+      return {
+        canUpdateNow: false,
+        blockingReason: `Đang có ${activeOffsite} tiến trình đẩy bản sao lưu Offsite lên đám mây. Vui lòng đợi hoàn tất trước khi cập nhật để tránh lỗi tệp dở dang.`,
+      };
+    }
+  } catch {
+    // Table may not exist in older unit-test fixtures
+  }
+
   return { canUpdateNow: true, blockingReason: null };
 }
 
 function buildGitHubHeaders(): Record<string, string> {
   const headers: Record<string, string> = {
     Accept: 'application/vnd.github+json',
-    'User-Agent': 'nas-sync-self-updater/1.3',
+    'User-Agent': 'nas-sync-self-updater/1.6',
   };
   const token =
     process.env.GITHUB_TOKEN || getSetting('github_token', '').trim();
@@ -238,9 +277,10 @@ function buildGitHubHeaders(): Record<string, string> {
   return headers;
 }
 
-function findPrebuiltAssets(assets?: GitHubReleaseAsset[]): {
+export function findPrebuiltAssets(assets?: GitHubReleaseAsset[]): {
   tarAsset: GitHubReleaseAsset;
   shaAsset: GitHubReleaseAsset;
+  sigAsset: GitHubReleaseAsset;
 } | null {
   if (!Array.isArray(assets)) return null;
   const tarAsset = assets.find(
@@ -249,8 +289,11 @@ function findPrebuiltAssets(assets?: GitHubReleaseAsset[]): {
   const shaAsset = assets.find(
     (a) => a?.name === PREBUILT_SHA256_NAME && (a.browser_download_url || a.url)
   );
-  if (!tarAsset || !shaAsset) return null;
-  return { tarAsset, shaAsset };
+  const sigAsset = assets.find(
+    (a) => a?.name === PREBUILT_SIG_NAME && (a.browser_download_url || a.url)
+  );
+  if (!tarAsset || !shaAsset || !sigAsset) return null;
+  return { tarAsset, shaAsset, sigAsset };
 }
 
 async function fetchReleaseAssetResponse(
@@ -262,7 +305,7 @@ async function fetchReleaseAssetResponse(
 
   if (asset.browser_download_url) {
     const directHeaders: Record<string, string> = {
-      'User-Agent': 'nas-sync-self-updater/1.3',
+      'User-Agent': 'nas-sync-self-updater/1.6',
     };
     if (token) {
       directHeaders.Authorization = `Bearer ${token}`;
@@ -300,11 +343,18 @@ async function fetchReleaseAssetResponse(
   );
 }
 
+/**
+ * U1 & U2 Security Fix:
+ * Mặc định CHỈ kiểm tra bản phát hành chính thức có gắn tag & đính kèm đầy đủ bộ ba chữ ký số
+ * (`nas-sync-prebuilt.tar.gz` + `.sha256` + `.sig`).
+ * Kênh dev (`main` HEAD chưa ký) bị tắt hoàn toàn trừ khi quản trị viên chủ động cấu hình `ALLOW_UNVERIFIED_MAIN_UPDATE=true`.
+ */
 export async function checkGitHubUpdate(): Promise<SystemUpdateInfo> {
   const local = getLocalBuildMetadata();
   const { canUpdateNow, blockingReason } = getActiveBlockingReason();
   const rollbackMeta = getRollbackMetadata();
   const headers = buildGitHubHeaders();
+  const allowDevMain = isUnverifiedDevMainAllowed();
 
   let latestVersion = local.version;
   let latestCommit: string | null = local.commit;
@@ -312,87 +362,132 @@ export async function checkGitHubUpdate(): Promise<SystemUpdateInfo> {
   let releaseTitle: string | null = null;
   let changelog = '';
   let prebuiltAvailable = false;
+  let unsignedReleaseWarning = '';
 
-  const [releaseRes, commitRes, rawPkgRes] = await Promise.allSettled([
-    fetch(
-      `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/releases/latest`,
-      { headers, signal: AbortSignal.timeout(10000), cache: 'no-store' }
-    ),
-    fetch(
-      `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/commits/${GITHUB_BRANCH}`,
-      { headers, signal: AbortSignal.timeout(10000), cache: 'no-store' }
-    ),
-    fetch(
-      `https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/${GITHUB_BRANCH}/package.json`,
-      { headers, signal: AbortSignal.timeout(10000), cache: 'no-store' }
-    ),
-  ]);
+  const releasePromise = fetch(
+    `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/releases/latest`,
+    { headers, signal: AbortSignal.timeout(10000), cache: 'no-store' }
+  );
 
-  if (rawPkgRes.status === 'fulfilled' && rawPkgRes.value.ok) {
-    try {
-      const remotePkg = (await rawPkgRes.value.json()) as { version?: string };
-      if (remotePkg.version) {
-        latestVersion = remotePkg.version.replace(/^v/i, '');
-      }
-    } catch {
-      // Ignore parse error
-    }
-  }
+  if (allowDevMain) {
+    const [releaseRes, commitRes, rawPkgRes] = await Promise.allSettled([
+      releasePromise,
+      fetch(
+        `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/commits/${GITHUB_BRANCH}`,
+        { headers, signal: AbortSignal.timeout(10000), cache: 'no-store' }
+      ),
+      fetch(
+        `https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/${GITHUB_BRANCH}/package.json`,
+        { headers, signal: AbortSignal.timeout(10000), cache: 'no-store' }
+      ),
+    ]);
 
-  if (commitRes.status === 'fulfilled' && commitRes.value.ok) {
-    try {
-      const commitJson = (await commitRes.value.json()) as {
-        sha?: string;
-        commit?: {
-          message?: string;
-          committer?: { date?: string };
-        };
-      };
-      if (commitJson.sha) {
-        latestCommit = commitJson.sha;
-      }
-      if (commitJson.commit?.committer?.date) {
-        latestPublishedAt = commitJson.commit.committer.date;
-      }
-      if (commitJson.commit?.message) {
-        changelog = commitJson.commit.message;
-      }
-    } catch {
-      // Ignore
-    }
-  }
-
-  if (releaseRes.status === 'fulfilled' && releaseRes.value.ok) {
-    try {
-      const relJson = (await releaseRes.value.json()) as GitHubReleaseResponse;
-      let relVer = '';
-      if (relJson.tag_name) {
-        relVer = relJson.tag_name.replace(/^v/i, '');
-        if (compareSemver(relVer, latestVersion) >= 0) {
-          latestVersion = relVer;
+    if (rawPkgRes.status === 'fulfilled' && rawPkgRes.value.ok) {
+      try {
+        const remotePkg = (await rawPkgRes.value.json()) as { version?: string };
+        if (remotePkg.version) {
+          latestVersion = remotePkg.version.replace(/^v/i, '');
         }
+      } catch {
+        // Ignore parse error
+      }
+    }
+
+    if (commitRes.status === 'fulfilled' && commitRes.value.ok) {
+      try {
+        const commitJson = (await commitRes.value.json()) as {
+          sha?: string;
+          commit?: {
+            message?: string;
+            committer?: { date?: string };
+          };
+        };
+        if (commitJson.sha) {
+          latestCommit = commitJson.sha;
+        }
+        if (commitJson.commit?.committer?.date) {
+          latestPublishedAt = commitJson.commit.committer.date;
+        }
+        if (commitJson.commit?.message) {
+          changelog = commitJson.commit.message;
+        }
+      } catch {
+        // Ignore
+      }
+    }
+
+    if (releaseRes.status === 'fulfilled' && releaseRes.value.ok) {
+      try {
+        const relJson = (await releaseRes.value.json()) as GitHubReleaseResponse;
+        const relVer = (relJson.tag_name || '').replace(/^v/i, '');
+        if (relVer && compareSemver(relVer, latestVersion) >= 0) {
+          latestVersion = relVer;
+          if (relJson.name) releaseTitle = relJson.name;
+          if (relJson.published_at) latestPublishedAt = relJson.published_at;
+          if (relJson.body) changelog = relJson.body;
+          if (findPrebuiltAssets(relJson.assets)) {
+            prebuiltAvailable = true;
+          }
+        }
+      } catch {
+        // Ignore
+      }
+    }
+
+    const versionNewer = compareSemver(latestVersion, local.version) > 0;
+    const commitNewer =
+      Boolean(local.commit) &&
+      Boolean(latestCommit) &&
+      local.commit !== latestCommit &&
+      compareSemver(latestVersion, local.version) >= 0;
+
+    return {
+      repoUrl: GITHUB_REPO_URL,
+      currentVersion: local.version,
+      currentCommit: local.commit ? local.commit.slice(0, 7) : null,
+      latestVersion,
+      latestCommit: latestCommit ? latestCommit.slice(0, 7) : null,
+      latestPublishedAt,
+      releaseTitle,
+      changelog:
+        changelog ||
+        '[DEV MODE] Đang bật ALLOW_UNVERIFIED_MAIN_UPDATE=true (kênh nhánh main).',
+      hasUpdate: versionNewer || commitNewer,
+      updateInProgress: Boolean(globalThis.__nasSyncUpdating),
+      canUpdateNow,
+      blockingReason,
+      prebuiltAvailable,
+      canRollback: rollbackMeta.canRollback,
+      rollbackVersion: rollbackMeta.rollbackVersion,
+      rollbackUpdatedAt: rollbackMeta.rollbackUpdatedAt,
+      checkedAt: new Date().toISOString(),
+    };
+  }
+
+  try {
+    const releaseRes = await releasePromise;
+    if (releaseRes.ok) {
+      const relJson = (await releaseRes.json()) as GitHubReleaseResponse;
+      const relVer = (relJson.tag_name || '').replace(/^v/i, '');
+      if (relVer && compareSemver(relVer, local.version) >= 0) {
+        latestVersion = relVer;
       }
       if (relJson.name) releaseTitle = relJson.name;
       if (relJson.published_at) latestPublishedAt = relJson.published_at;
       if (relJson.body) changelog = relJson.body;
-      if (
-        relVer &&
-        compareSemver(relVer, latestVersion) === 0 &&
-        findPrebuiltAssets(relJson.assets)
-      ) {
+
+      if (relVer && findPrebuiltAssets(relJson.assets)) {
         prebuiltAvailable = true;
+      } else if (relVer && compareSemver(relVer, local.version) > 0) {
+        unsignedReleaseWarning = `Bản phát hành v${relVer} trên GitHub chưa đính kèm đầy đủ chữ ký số Ed25519 (.sig) nên bị chặn cập nhật tự động để bảo vệ NAS.`;
       }
-    } catch {
-      // Ignore
     }
+  } catch {
+    // Keep local version info when GitHub API is unreachable
   }
 
-  const versionNewer = compareSemver(latestVersion, local.version) > 0;
-  const commitNewer =
-    Boolean(local.commit) &&
-    Boolean(latestCommit) &&
-    local.commit !== latestCommit &&
-    compareSemver(latestVersion, local.version) >= 0;
+  const hasSignedNewerRelease =
+    compareSemver(latestVersion, local.version) > 0 && prebuiltAvailable;
 
   return {
     repoUrl: GITHUB_REPO_URL,
@@ -403,12 +498,13 @@ export async function checkGitHubUpdate(): Promise<SystemUpdateInfo> {
     latestPublishedAt,
     releaseTitle,
     changelog:
+      unsignedReleaseWarning ||
       changelog ||
-      'Kho lưu trữ GitHub sẵn sàng đồng bộ phiên bản mới nhất trên nhánh main.',
-    hasUpdate: versionNewer || commitNewer,
+      'Chỉ chấp nhận các bản phát hành chính thức đã xác thực chữ ký số Ed25519 & SHA-256 trên GitHub Releases.',
+    hasUpdate: hasSignedNewerRelease,
     updateInProgress: Boolean(globalThis.__nasSyncUpdating),
-    canUpdateNow,
-    blockingReason,
+    canUpdateNow: unsignedReleaseWarning ? false : canUpdateNow,
+    blockingReason: blockingReason || unsignedReleaseWarning || null,
     prebuiltAvailable,
     canRollback: rollbackMeta.canRollback,
     rollbackVersion: rollbackMeta.rollbackVersion,
@@ -542,7 +638,11 @@ function backupSqliteBeforeUpdate(): string {
   return dest;
 }
 
-function haveDependenciesChanged(oldPkgPath: string, newPkgPath: string): boolean {
+function haveDependenciesChanged(
+  oldPkgPath: string,
+  newPkgPath: string,
+  includeDev = false
+): boolean {
   try {
     const oldPkg = JSON.parse(fs.readFileSync(oldPkgPath, 'utf8')) as Record<
       string,
@@ -552,12 +652,19 @@ function haveDependenciesChanged(oldPkgPath: string, newPkgPath: string): boolea
       string,
       unknown
     >;
-    return (
+    if (
       JSON.stringify(oldPkg.dependencies || {}) !==
-        JSON.stringify(newPkg.dependencies || {}) ||
-      JSON.stringify(oldPkg.devDependencies || {}) !==
+      JSON.stringify(newPkg.dependencies || {})
+    ) {
+      return true;
+    }
+    if (includeDev) {
+      return (
+        JSON.stringify(oldPkg.devDependencies || {}) !==
         JSON.stringify(newPkg.devDependencies || {})
-    );
+      );
+    }
+    return false;
   } catch {
     return true;
   }
@@ -671,13 +778,123 @@ function copyTreePosixSafe(
   }
 }
 
+interface NodeModulesDeltaBackup {
+  backupDir: string;
+  addedRelPaths: string[];
+  savedRelPaths: string[];
+}
+
 /**
- * Đồng bộ node_modules sang /app/node_modules an toàn trên Linux/Docker (không bao giờ lỗi ETXTBSY):
- * 1. Bỏ qua tức thì các gói có cùng `name@version` (không chạm vào binary đang thực thi như @esbuild/linux-x64).
- * 2. Luôn `unlink()` file đích trước khi `copyFileSync()` để tạo inode mới thay vì ghi đè O_TRUNC.
- * 3. Nếu kernel/OverlayFS vẫn khóa file thực thi khi nâng cấp chính binary đó, đánh dấu `.needs_npm_sync`
- *    để `docker-entrypoint.sh` hoàn tất đồng bộ sạch trước khi khởi chạy `tsx` ở lần restart kế tiếp.
+ * U3 Security & Reliability Fix:
+ * Chỉ sao lưu các gói bị thay đổi hoặc bị gỡ trong `/app/node_modules` trước khi hoán đổi ở bước kích hoạt cuối cùng,
+ * giúp khôi phục nguyên trạng 100% trong `catch` nếu quá trình kích hoạt gặp sự cố (VD: ENOSPC).
  */
+function createNodeModulesDeltaBackup(
+  srcNodeModules: string,
+  dstNodeModules: string,
+  backupDir: string
+): NodeModulesDeltaBackup {
+  fs.rmSync(backupDir, { recursive: true, force: true });
+  fs.mkdirSync(backupDir, { recursive: true });
+
+  const addedRelPaths: string[] = [];
+  const savedRelPaths: string[] = [];
+
+  if (!fs.existsSync(dstNodeModules)) {
+    return { backupDir, addedRelPaths, savedRelPaths };
+  }
+
+  const listPackageUnits = (nmDir: string): Map<string, string | null> => {
+    const map = new Map<string, string | null>();
+    if (!fs.existsSync(nmDir)) return map;
+    for (const top of fs.readdirSync(nmDir, { withFileTypes: true })) {
+      if (top.name === '.cache') continue;
+      if (top.isDirectory() && top.name.startsWith('@')) {
+        const scopeDir = path.join(nmDir, top.name);
+        for (const scoped of fs.readdirSync(scopeDir, { withFileTypes: true })) {
+          const rel = `${top.name}/${scoped.name}`;
+          map.set(rel, readPackageIdentity(path.join(nmDir, rel)));
+        }
+      } else {
+        map.set(
+          top.name,
+          top.name === '.bin'
+            ? null
+            : readPackageIdentity(path.join(nmDir, top.name))
+        );
+      }
+    }
+    return map;
+  };
+
+  const srcMap = listPackageUnits(srcNodeModules);
+  const dstMap = listPackageUnits(dstNodeModules);
+
+  for (const [rel, srcId] of srcMap.entries()) {
+    if (!dstMap.has(rel)) {
+      addedRelPaths.push(rel);
+      continue;
+    }
+    const dstId = dstMap.get(rel);
+    if (srcId && dstId && srcId === dstId) {
+      continue;
+    }
+    const existingPath = path.join(dstNodeModules, rel);
+    const savedPath = path.join(backupDir, rel);
+    fs.mkdirSync(path.dirname(savedPath), { recursive: true });
+    fs.cpSync(existingPath, savedPath, {
+      recursive: true,
+      force: true,
+      verbatimSymlinks: true,
+    });
+    savedRelPaths.push(rel);
+  }
+
+  for (const [rel] of dstMap.entries()) {
+    if (!srcMap.has(rel) && rel !== '.bin' && rel !== '.cache') {
+      const existingPath = path.join(dstNodeModules, rel);
+      const savedPath = path.join(backupDir, rel);
+      fs.mkdirSync(path.dirname(savedPath), { recursive: true });
+      fs.cpSync(existingPath, savedPath, {
+        recursive: true,
+        force: true,
+        verbatimSymlinks: true,
+      });
+      savedRelPaths.push(rel);
+    }
+  }
+
+  return { backupDir, addedRelPaths, savedRelPaths };
+}
+
+function restoreNodeModulesDeltaBackup(
+  delta: NodeModulesDeltaBackup,
+  dstNodeModules: string
+) {
+  const dummyState = { deferredToRestart: false };
+  for (const rel of delta.addedRelPaths) {
+    try {
+      fs.rmSync(path.join(dstNodeModules, rel), {
+        recursive: true,
+        force: true,
+      });
+    } catch {
+      // Best-effort cleanup
+    }
+  }
+  for (const rel of delta.savedRelPaths) {
+    const savedPath = path.join(delta.backupDir, rel);
+    const dstPath = path.join(dstNodeModules, rel);
+    if (!fs.existsSync(savedPath)) continue;
+    try {
+      fs.rmSync(dstPath, { recursive: true, force: true });
+    } catch {
+      // Ignore busy binary
+    }
+    copyTreePosixSafe(savedPath, dstPath, dummyState);
+  }
+}
+
 export function syncNodeModulesSafe(
   srcNodeModules: string,
   dstNodeModules: string
@@ -784,10 +1001,6 @@ function syncReleaseDirToAppRoot(sourcePersistDir: string, appRoot: string) {
   }
 }
 
-/**
- * Lưu trữ bản đang chạy vào `live_release/previous` trước khi ghi đè `live_release/current`,
- * kể cả lần nâng cấp đầu tiên từ Docker Image gốc (snapshot từ appRoot, bỏ qua .next/cache).
- */
 function preservePreviousReleaseSnapshot(
   appRoot: string,
   currentPersistDir: string,
@@ -872,6 +1085,18 @@ function preservePreviousReleaseSnapshot(
   fs.rmSync(oldPrevBackup, { recursive: true, force: true });
 }
 
+function buildNpmInstallArgs(targetDir: string, includeDev: boolean): string[] {
+  const hasLockfile = fs.existsSync(path.join(targetDir, 'package-lock.json'));
+  const subcommand = hasLockfile ? 'ci' : 'install';
+  return [
+    subcommand,
+    includeDev ? '--include=dev' : '--omit=dev',
+    '--no-audit',
+    '--no-fund',
+    '--ignore-scripts',
+  ];
+}
+
 export async function performGitHubUpdate(
   options: {
     force?: boolean;
@@ -895,23 +1120,28 @@ export async function performGitHubUpdate(
   const stagingDir = path.join(releaseBaseDir, 'staging');
   const currentPersistDir = path.join(releaseBaseDir, 'current');
   const previousPersistDir = path.join(releaseBaseDir, 'previous');
-  const tarballPath = path.join(releaseBaseDir, 'latest-main.tar.gz');
+  const nmRollbackDir = path.join(releaseBaseDir, 'nm_rollback_tmp');
+  const tarballPath = path.join(releaseBaseDir, 'latest-dev-sha.tar.gz');
   const prebuiltTarPath = path.join(releaseBaseDir, PREBUILT_ARCHIVE_NAME);
 
   const shouldSyncAppRoot =
     process.platform !== 'win32' ||
     process.env.ALLOW_LOCAL_SELF_OVERWRITE === 'true';
+  const allowDevMain = isUnverifiedDevMainAllowed();
+
+  let nmDeltaBackup: NodeModulesDeltaBackup | null = null;
+  let snapshotRotated = false;
 
   try {
     broadcastStep(
       'CHECKING',
       5,
-      'Đang kiểm tra thông tin bản phát hành từ GitHub...',
-      `Kết nối tới ${GITHUB_REPO_URL} (nhánh ${GITHUB_BRANCH})...`
+      'Đang kiểm tra bản phát hành đã ký số từ GitHub Releases...',
+      `Kết nối tới ${GITHUB_REPO_URL}...`
     );
 
     const checkInfo = await checkGitHubUpdate();
-    const targetVer = checkInfo.latestVersion;
+    let targetVer = checkInfo.latestVersion;
 
     if (!checkInfo.hasUpdate && !options.force) {
       globalThis.__nasSyncUpdating = false;
@@ -919,7 +1149,7 @@ export async function performGitHubUpdate(
         'COMPLETED',
         100,
         `Hệ thống đang ở phiên bản mới nhất (v${targetVer}).`,
-        'Không có thay đổi mới cần cập nhật.',
+        'Không có bản phát hành đã ký nào mới hơn.',
         targetVer
       );
       return;
@@ -938,248 +1168,252 @@ export async function performGitHubUpdate(
     fs.mkdirSync(stagingDir, { recursive: true });
 
     const tarBin = process.platform === 'win32' ? 'tar.exe' : 'tar';
+    const npmBin = process.platform === 'win32' ? 'npm.cmd' : 'npm';
     let usedPrebuiltFastPath = false;
-    let prebuiltCommitSha = '';
+    let resolvedCommitSha = '';
+    let stagedDepsReadyToActivate = false;
+    let stagedSymlinkCreated = false;
 
-    // 2A. Thử luồng Prebuilt Fast-Path (~5 giây, xác thực chữ ký SHA-256, không cần next build trên NAS)
-    if (!options.force) {
-      let matchedAssets: {
-        tarAsset: GitHubReleaseAsset;
-        shaAsset: GitHubReleaseAsset;
-      } | null = null;
-
-      try {
-        const relResp = await fetch(
-          `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/releases/latest`,
-          {
-            headers: buildGitHubHeaders(),
-            signal: AbortSignal.timeout(10000),
-            cache: 'no-store',
-          }
-        );
-        if (relResp.ok) {
-          const relJson = (await relResp.json()) as GitHubReleaseResponse;
-          const relVer = (relJson.tag_name || '').replace(/^v/i, '');
-          if (relVer && compareSemver(relVer, targetVer) === 0) {
-            matchedAssets = findPrebuiltAssets(relJson.assets);
-          }
+    // 2A. Luồng chuẩn mặc định (U1 & U2): BẮT BUỘC tải từ GitHub Release đã ký chữ ký số Ed25519 + SHA-256
+    // Kể cả khi `options.force === true`, chỉ cài đặt lại bản phát hành đã xác thực chữ ký (KHÔNG rơi về main HEAD).
+    if (!allowDevMain) {
+      const relResp = await fetch(
+        `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/releases/latest`,
+        {
+          headers: buildGitHubHeaders(),
+          signal: AbortSignal.timeout(15000),
+          cache: 'no-store',
         }
-      } catch {
-        matchedAssets = null;
+      );
+      if (!relResp.ok) {
+        throw new Error(
+          `Không thể truy vấn GitHub Releases (${relResp.status} ${relResp.statusText}).`
+        );
       }
 
-      if (matchedAssets) {
-        broadcastStep(
-          'DOWNLOADING',
-          20,
-          `Phát hiện gói Prebuilt v${targetVer} — Đang tải & kiểm tra chữ ký SHA-256...`,
-          `Đã sao lưu CSDL (${path.basename(
-            dbBackupFile
-          )}). Đang tải ${PREBUILT_ARCHIVE_NAME} kèm checksum SHA-256...`,
-          targetVer
+      const relJson = (await relResp.json()) as GitHubReleaseResponse;
+      const relTag = String(relJson.tag_name || '').trim();
+      const relVer = relTag.replace(/^v/i, '');
+      if (!relVer) {
+        throw new Error(
+          '[SECURITY] Bản phát hành GitHub không có tag phiên bản hợp lệ.'
         );
+      }
+      targetVer = relVer;
 
-        const shaResp = await fetchReleaseAssetResponse(
-          matchedAssets.shaAsset,
-          30000
+      const matchedAssets = findPrebuiltAssets(relJson.assets);
+      if (!matchedAssets) {
+        throw new Error(
+          `[SECURITY] Bản phát hành v${relVer} thiếu gói Prebuilt hoặc chữ ký số Ed25519 (${PREBUILT_SIG_NAME}). Đã từ chối cập nhật tự động để bảo vệ NAS.`
         );
-        const rawShaText = await shaResp.text();
-        const expectedHex = (rawShaText.trim().split(/\s+/)[0] || '').toLowerCase();
-        if (!/^[0-9a-f]{64}$/.test(expectedHex)) {
-          throw new Error(
-            '[SECURITY] Tệp chữ ký SHA-256 trên GitHub Release không đúng định dạng chuẩn 64 ký tự hex.'
-          );
-        }
+      }
 
-        const tarResp = await fetchReleaseAssetResponse(
-          matchedAssets.tarAsset,
-          120000
+      broadcastStep(
+        'DOWNLOADING',
+        20,
+        `Đang tải gói phát hành v${targetVer} & xác thực chữ ký số Ed25519...`,
+        `Đã sao lưu CSDL (${path.basename(
+          dbBackupFile
+        )}). Đang kiểm tra ${PREBUILT_SHA256_NAME} và ${PREBUILT_SIG_NAME}...`,
+        targetVer
+      );
+
+      const [shaResp, sigResp] = await Promise.all([
+        fetchReleaseAssetResponse(matchedAssets.shaAsset, 30000),
+        fetchReleaseAssetResponse(matchedAssets.sigAsset, 30000),
+      ]);
+      const rawShaText = await shaResp.text();
+      const rawSigText = (await sigResp.text()).trim();
+      const expectedHex = (
+        rawShaText.trim().split(/\s+/)[0] || ''
+      ).toLowerCase();
+
+      if (!/^[0-9a-f]{64}$/.test(expectedHex)) {
+        throw new Error(
+          '[SECURITY] Tệp checksum SHA-256 trên GitHub Release không đúng định dạng 64 ký tự hex.'
         );
-        if (!tarResp.body) {
-          throw new Error('Luồng tải gói Prebuilt từ GitHub Release bị rỗng.');
-        }
+      }
 
-        const fileStream = fs.createWriteStream(prebuiltTarPath);
-        await pipeline(
-          Readable.fromWeb(
-            tarResp.body as unknown as import('node:stream/web').ReadableStream
-          ),
-          fileStream
+      if (!verifyReleaseSignature(relTag, expectedHex, rawSigText)) {
+        throw new Error(
+          `[SECURITY] Xác thực chữ ký số Ed25519 cho bản phát hành v${relVer} THẤT BẠI! Gói phát hành có dấu hiệu giả mạo hoặc chưa được ký bằng khóa chính thức. Đã hủy cập nhật ngay lập tức.`
         );
+      }
 
-        const actualHex = (
-          await computeFileSha256Hex(prebuiltTarPath)
-        ).toLowerCase();
-        const expectedBuf = Buffer.from(expectedHex, 'hex');
-        const actualBuf = Buffer.from(actualHex, 'hex');
-        if (
-          expectedBuf.length !== actualBuf.length ||
-          !crypto.timingSafeEqual(expectedBuf, actualBuf)
-        ) {
-          fs.rmSync(prebuiltTarPath, { force: true });
-          throw new Error(
-            `[SECURITY] Sai lệch mã băm SHA-256 của gói cập nhật Prebuilt (mong đợi ${expectedHex.slice(
-              0,
-              12
-            )}..., nhận được ${actualHex.slice(
-              0,
-              12
-            )}...)! Đã hủy cập nhật ngay lập tức để bảo vệ NAS.`
-          );
-        }
+      const tarResp = await fetchReleaseAssetResponse(
+        matchedAssets.tarAsset,
+        120000
+      );
+      if (!tarResp.body) {
+        throw new Error('Luồng tải gói Prebuilt từ GitHub Release bị rỗng.');
+      }
 
-        broadcastStep(
-          'DOWNLOADING',
-          42,
-          'Chữ ký SHA-256 hợp lệ 100% — Đang giải nén gói Prebuilt...',
-          `SHA-256 khớp tuyệt đối (${actualHex.slice(
+      const fileStream = fs.createWriteStream(prebuiltTarPath);
+      await pipeline(
+        Readable.fromWeb(
+          tarResp.body as unknown as import('node:stream/web').ReadableStream
+        ),
+        fileStream
+      );
+
+      const actualHex = (
+        await computeFileSha256Hex(prebuiltTarPath)
+      ).toLowerCase();
+      const expectedBuf = Buffer.from(expectedHex, 'hex');
+      const actualBuf = Buffer.from(actualHex, 'hex');
+      if (
+        expectedBuf.length !== actualBuf.length ||
+        !crypto.timingSafeEqual(expectedBuf, actualBuf) ||
+        !verifyReleaseSignature(relTag, actualHex, rawSigText)
+      ) {
+        fs.rmSync(prebuiltTarPath, { force: true });
+        throw new Error(
+          `[SECURITY] Sai lệch mã băm SHA-256 / chữ ký Ed25519 của gói Prebuilt (mong đợi ${expectedHex.slice(
             0,
-            16
-          )}...). Giải nén vào vùng Staging...`,
+            12
+          )}..., nhận được ${actualHex.slice(
+            0,
+            12
+          )}...)! Đã hủy cập nhật ngay lập tức để bảo vệ NAS.`
+        );
+      }
+
+      broadcastStep(
+        'DOWNLOADING',
+        45,
+        'Chữ ký số Ed25519 & SHA-256 hợp lệ 100% — Đang giải nén gói Prebuilt...',
+        `Đã xác thực Ed25519 + SHA-256 (${actualHex.slice(
+          0,
+          16
+        )}...). Giải nén vào vùng Staging...`,
+        targetVer
+      );
+
+      const untarCode = await runStreamingCommand(
+        tarBin,
+        ['-xzf', prebuiltTarPath, '--strip-components=1', '-C', stagingDir],
+        releaseBaseDir,
+        (line) =>
+          broadcastStep(
+            'DOWNLOADING',
+            52,
+            'Đang giải nén gói Prebuilt...',
+            line,
+            targetVer
+          )
+      );
+      fs.rmSync(prebuiltTarPath, { force: true });
+
+      if (
+        untarCode !== 0 ||
+        !fs.existsSync(path.join(stagingDir, 'package.json')) ||
+        !fs.existsSync(path.join(stagingDir, '.next', 'BUILD_ID'))
+      ) {
+        throw new Error(
+          'Gói Prebuilt sau khi giải nén thiếu .next/BUILD_ID hoặc package.json.'
+        );
+      }
+
+      const stagedPkg = JSON.parse(
+        fs.readFileSync(path.join(stagingDir, 'package.json'), 'utf8')
+      ) as { version?: string };
+      const stagedVer = String(stagedPkg.version || '').replace(/^v/i, '');
+      if (stagedVer && compareSemver(stagedVer, targetVer) !== 0) {
+        throw new Error(
+          `[SECURITY] Phiên bản trong package.json (${stagedVer}) không khớp với tag đã ký (${targetVer}).`
+        );
+      }
+
+      try {
+        const prebuiltInfo = JSON.parse(
+          fs.readFileSync(path.join(stagingDir, 'BUILD_INFO.json'), 'utf8')
+        ) as { commit?: string };
+        if (prebuiltInfo.commit) {
+          resolvedCommitSha = prebuiltInfo.commit;
+        }
+      } catch {
+        // Ignore
+      }
+
+      const depsChanged = haveDependenciesChanged(
+        path.join(appRoot, 'package.json'),
+        path.join(stagingDir, 'package.json'),
+        false
+      );
+      const stagingNodeModules = path.join(stagingDir, 'node_modules');
+      fs.rmSync(stagingNodeModules, { recursive: true, force: true });
+
+      if (depsChanged) {
+        broadcastStep(
+          'INSTALLING',
+          65,
+          'Phát hiện thư viện mới trong package.json — Đang cài đặt cô lập tại Staging...',
+          'Chạy npm ci --omit=dev --ignore-scripts trong vùng Staging...',
           targetVer
         );
-
-        const untarCode = await runStreamingCommand(
-          tarBin,
-          ['-xzf', prebuiltTarPath, '--strip-components=1', '-C', stagingDir],
-          releaseBaseDir,
+        const npmCode = await runStreamingCommand(
+          npmBin,
+          buildNpmInstallArgs(stagingDir, false),
+          stagingDir,
           (line) =>
             broadcastStep(
-              'DOWNLOADING',
-              48,
-              'Đang giải nén gói Prebuilt...',
+              'INSTALLING',
+              74,
+              'Đang cài đặt thư viện mới...',
               line,
               targetVer
             )
         );
-        fs.rmSync(prebuiltTarPath, { force: true });
-
-        if (
-          untarCode !== 0 ||
-          !fs.existsSync(path.join(stagingDir, 'package.json')) ||
-          !fs.existsSync(path.join(stagingDir, '.next', 'BUILD_ID'))
-        ) {
+        if (npmCode !== 0) {
           throw new Error(
-            'Gói Prebuilt sau khi giải nén thiếu .next/BUILD_ID hoặc package.json.'
+            'Cài đặt gói phụ thuộc npm trong vùng Staging thất bại. Phiên bản đang chạy vẫn an toàn 100%.'
           );
         }
-
-        try {
-          const prebuiltInfo = JSON.parse(
-            fs.readFileSync(path.join(stagingDir, 'BUILD_INFO.json'), 'utf8')
-          ) as { commit?: string };
-          if (prebuiltInfo.commit) {
-            prebuiltCommitSha = prebuiltInfo.commit;
-          }
-        } catch {
-          // Ignore
-        }
-
-        const isPrebuiltBehindLatestMainCommit =
-          Boolean(checkInfo.latestCommit) &&
-          Boolean(prebuiltCommitSha) &&
-          !prebuiltCommitSha
-            .toLowerCase()
-            .startsWith(checkInfo.latestCommit!.toLowerCase());
-
-        if (isPrebuiltBehindLatestMainCommit) {
-          broadcastStep(
-            'DOWNLOADING',
-            50,
-            'Phát hiện bản vá mới hơn trên nhánh main — Chuyển sang đồng bộ trực tiếp mã nguồn main...',
-            `Gói Release hiện tại (${prebuiltCommitSha.slice(
-              0,
-              7
-            )}) cũ hơn nhánh main (${
-              checkInfo.latestCommit
-            }) -> Tự động chuyển sang tải nhánh main...`,
-            targetVer
-          );
-          fs.rmSync(stagingDir, { recursive: true, force: true });
-          fs.mkdirSync(stagingDir, { recursive: true });
-        } else {
-          const depsChanged = haveDependenciesChanged(
-            path.join(appRoot, 'package.json'),
-            path.join(stagingDir, 'package.json')
-          );
-          const stagingNodeModules = path.join(stagingDir, 'node_modules');
-          fs.rmSync(stagingNodeModules, { recursive: true, force: true });
-
-          if (depsChanged) {
-            broadcastStep(
-              'INSTALLING',
-              62,
-              'Phát hiện thư viện mới trong package.json — Đang cài đặt cô lập tại Staging...',
-              'Chạy npm install --include=dev --ignore-scripts trong vùng Staging...',
-              targetVer
-            );
-            const npmBin = process.platform === 'win32' ? 'npm.cmd' : 'npm';
-            const npmCode = await runStreamingCommand(
-              npmBin,
-              [
-                'install',
-                '--include=dev',
-                '--no-audit',
-                '--no-fund',
-                '--ignore-scripts',
-              ],
-              stagingDir,
-              (line) =>
-                broadcastStep(
-                  'INSTALLING',
-                  72,
-                  'Đang cài đặt thư viện mới...',
-                  line,
-                  targetVer
-                )
-            );
-            if (npmCode !== 0) {
-              throw new Error(
-                'Cài đặt gói phụ thuộc npm trong vùng Staging thất bại. Phiên bản đang chạy vẫn an toàn 100%.'
-              );
-            }
-            if (shouldSyncAppRoot && fs.existsSync(stagingNodeModules)) {
-              const syncRes = syncNodeModulesSafe(
-                stagingNodeModules,
-                path.join(appRoot, 'node_modules')
-              );
-              if (syncRes.deferredToRestart) {
-                fs.writeFileSync(
-                  path.join(stagingDir, '.needs_npm_sync'),
-                  new Date().toISOString(),
-                  'utf8'
-                );
-              }
-            }
-            fs.rmSync(stagingNodeModules, { recursive: true, force: true });
-          } else {
-            broadcastStep(
-              'INSTALLING',
-              75,
-              'Gói Prebuilt tương thích hoàn toàn — Bỏ qua biên dịch next build, kích hoạt siêu tốc...',
-              'Không tốn RAM/CPU biên dịch lại giao diện trên NAS (~5 giây).',
-              targetVer
-            );
-          }
-
-          usedPrebuiltFastPath = true;
-        }
+        stagedDepsReadyToActivate = true;
+      } else {
+        broadcastStep(
+          'INSTALLING',
+          78,
+          'Gói Prebuilt tương thích hoàn toàn — Bỏ qua biên dịch next build, chuẩn bị kích hoạt...',
+          'Không tốn RAM/CPU biên dịch lại giao diện trên NAS (~5 giây).',
+          targetVer
+        );
       }
-    }
 
-    // 2B. Fallback: Tải mã nguồn nhánh main & biên dịch cô lập trên NAS
-    if (!usedPrebuiltFastPath) {
+      usedPrebuiltFastPath = true;
+    } else {
+      // 2B. Kênh Dev thủ công (`ALLOW_UNVERIFIED_MAIN_UPDATE=true`), ghim chặt 1 SHA duy nhất để tránh TOCTOU (U5)
+      const commitRes = await fetch(
+        `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/commits/${GITHUB_BRANCH}`,
+        {
+          headers: buildGitHubHeaders(),
+          signal: AbortSignal.timeout(15000),
+          cache: 'no-store',
+        }
+      );
+      if (!commitRes.ok) {
+        throw new Error(
+          `Không thể phân giải SHA commit trên nhánh ${GITHUB_BRANCH} (${commitRes.status}).`
+        );
+      }
+      const commitJson = (await commitRes.json()) as { sha?: string };
+      const pinnedSha = String(commitJson.sha || '').trim();
+      if (!/^[0-9a-f]{40}$/i.test(pinnedSha)) {
+        throw new Error(
+          'SHA commit trả về từ GitHub API không hợp lệ (cần đúng 40 ký tự hex).'
+        );
+      }
+      resolvedCommitSha = pinnedSha;
+
       broadcastStep(
         'DOWNLOADING',
-        18,
-        'Đang tải gói mã nguồn mới nhất từ GitHub...',
-        `Đã sao lưu CSDL tại ${path.basename(
-          dbBackupFile
-        )}. Bắt đầu tải tarball mã nguồn...`,
+        20,
+        `[DEV MODE] Đang tải tarball ghim cứng tại commit ${pinnedSha.slice(0, 7)}...`,
+        `Đã sao lưu CSDL tại ${path.basename(dbBackupFile)}. Tải tarball theo SHA bất biến...`,
         targetVer
       );
 
-      const tarballUrl = `https://codeload.github.com/${GITHUB_OWNER}/${GITHUB_REPO}/tar.gz/refs/heads/${GITHUB_BRANCH}`;
+      const tarballUrl = `https://codeload.github.com/${GITHUB_OWNER}/${GITHUB_REPO}/tar.gz/${pinnedSha}`;
       const resp = await fetch(tarballUrl, {
         headers: buildGitHubHeaders(),
         signal: AbortSignal.timeout(60000),
@@ -1187,7 +1421,7 @@ export async function performGitHubUpdate(
 
       if (!resp.ok || !resp.body) {
         throw new Error(
-          `Không thể tải mã nguồn từ GitHub (${resp.status} ${resp.statusText}). Hãy đảm bảo kho ${GITHUB_REPO_URL} đã có nhánh ${GITHUB_BRANCH}.`
+          `Không thể tải tarball commit ${pinnedSha.slice(0, 7)} từ GitHub (${resp.status}).`
         );
       }
 
@@ -1197,13 +1431,6 @@ export async function performGitHubUpdate(
           resp.body as unknown as import('node:stream/web').ReadableStream
         ),
         fileStream
-      );
-
-      broadcastStep(
-        'DOWNLOADING',
-        32,
-        'Đang giải nén gói mã nguồn vào vùng Staging...',
-        'Đã tải xong tarball từ GitHub. Đang giải nén...'
       );
 
       const untarCode = await runStreamingCommand(
@@ -1218,15 +1445,21 @@ export async function performGitHubUpdate(
         untarCode !== 0 ||
         !fs.existsSync(path.join(stagingDir, 'package.json'))
       ) {
-        throw new Error('Giải nén gói cập nhật từ GitHub thất bại.');
+        throw new Error('Giải nén gói mã nguồn từ GitHub thất bại.');
       }
 
-      // Kiểm tra dependencies và chuẩn bị node_modules cô lập hoàn toàn trong stagingDir
+      const stagedPkg = JSON.parse(
+        fs.readFileSync(path.join(stagingDir, 'package.json'), 'utf8')
+      ) as { version?: string };
+      if (stagedPkg.version) {
+        targetVer = stagedPkg.version.replace(/^v/i, '');
+      }
+
       const depsChanged = haveDependenciesChanged(
         path.join(appRoot, 'package.json'),
-        path.join(stagingDir, 'package.json')
+        path.join(stagingDir, 'package.json'),
+        true
       );
-
       const stagingNodeModules = path.join(stagingDir, 'node_modules');
       fs.rmSync(stagingNodeModules, { recursive: true, force: true });
 
@@ -1234,19 +1467,12 @@ export async function performGitHubUpdate(
         broadcastStep(
           'INSTALLING',
           45,
-          'Phát hiện thư viện mới trong package.json — Đang cài đặt cô lập tại Staging...',
-          'Chạy npm install --include=dev --ignore-scripts trong vùng Staging...'
+          '[DEV MODE] Đang cài đặt dependencies cô lập tại Staging...',
+          'Chạy npm ci --include=dev --ignore-scripts trong vùng Staging...'
         );
-        const npmBin = process.platform === 'win32' ? 'npm.cmd' : 'npm';
         const npmCode = await runStreamingCommand(
           npmBin,
-          [
-            'install',
-            '--include=dev',
-            '--no-audit',
-            '--no-fund',
-            '--ignore-scripts',
-          ],
+          buildNpmInstallArgs(stagingDir, true),
           stagingDir,
           (line) =>
             broadcastStep(
@@ -1261,25 +1487,20 @@ export async function performGitHubUpdate(
             'Cài đặt gói phụ thuộc npm trong vùng Staging thất bại. Phiên bản đang chạy vẫn an toàn 100%.'
           );
         }
+        stagedDepsReadyToActivate = true;
       } else {
-        broadcastStep(
-          'INSTALLING',
-          48,
-          'Các gói node_modules không đổi — Tái sử dụng tức thì...',
-          'Liên kết node_modules hiện hành sang vùng Staging (0s)...'
-        );
         fs.symlinkSync(
           path.join(appRoot, 'node_modules'),
           stagingNodeModules,
           process.platform === 'win32' ? 'junction' : 'dir'
         );
+        stagedSymlinkCreated = true;
       }
 
-      // Chạy Production Build (next build) trong vùng Staging cô lập
       broadcastStep(
         'BUILDING',
-        60,
-        'Đang biên dịch Production UI (next build) trong vùng cô lập...',
+        62,
+        '[DEV MODE] Đang biên dịch Production UI (next build) trong vùng cô lập...',
         'Khởi chạy Next.js Production Build...'
       );
 
@@ -1321,55 +1542,25 @@ export async function performGitHubUpdate(
         );
       }
 
-      if (depsChanged) {
-        if (shouldSyncAppRoot && fs.existsSync(stagingNodeModules)) {
-          const syncRes = syncNodeModulesSafe(
-            stagingNodeModules,
-            path.join(appRoot, 'node_modules')
-          );
-          if (syncRes.deferredToRestart) {
-            fs.writeFileSync(
-              path.join(stagingDir, '.needs_npm_sync'),
-              new Date().toISOString(),
-              'utf8'
-            );
-          }
-        }
-        fs.rmSync(stagingNodeModules, { recursive: true, force: true });
-      } else {
+      if (stagedSymlinkCreated) {
         fs.unlinkSync(stagingNodeModules);
+        stagedSymlinkCreated = false;
       }
     }
 
-    // 3. Ghi BUILD_INFO.json, bảo toàn bản previous cho Rollback 1-Click, rồi kích hoạt sang current
+    // 3. Ghi BUILD_INFO.json, lưu bản previous cho Rollback 1-Click, rồi hoán đổi nguyên tử node_modules + appRoot ở bước cuối cùng (U3)
     broadcastStep(
       'INSTALLING',
       90,
-      'Đang lưu điểm khôi phục (Rollback) & kích hoạt phiên bản mới...',
+      'Đang lưu điểm khôi phục (Rollback) & kích hoạt nguyên tử phiên bản mới...',
       'Bảo toàn bản hiện hành sang live_release/previous và đồng bộ thực thi...',
       targetVer
     );
 
-    let fullCommit = prebuiltCommitSha || checkInfo.latestCommit || '';
-    if (!prebuiltCommitSha) {
-      try {
-        const cRes = await fetch(
-          `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/commits/${GITHUB_BRANCH}`,
-          { headers: buildGitHubHeaders(), signal: AbortSignal.timeout(8000) }
-        );
-        if (cRes.ok) {
-          const cj = (await cRes.json()) as { sha?: string };
-          if (cj.sha) fullCommit = cj.sha;
-        }
-      } catch {
-        // Keep short commit
-      }
-    }
-
     const buildInfo = {
       name: 'nas-sync',
       version: targetVer,
-      commit: fullCommit || null,
+      commit: resolvedCommitSha || null,
       prebuilt: usedPrebuiltFastPath,
       updatedAt: new Date().toISOString(),
       source: GITHUB_REPO_URL,
@@ -1385,6 +1576,28 @@ export async function performGitHubUpdate(
       currentPersistDir,
       previousPersistDir
     );
+    snapshotRotated = true;
+
+    const stagingNodeModules = path.join(stagingDir, 'node_modules');
+    if (stagedDepsReadyToActivate && fs.existsSync(stagingNodeModules)) {
+      if (shouldSyncAppRoot) {
+        const appNodeModules = path.join(appRoot, 'node_modules');
+        nmDeltaBackup = createNodeModulesDeltaBackup(
+          stagingNodeModules,
+          appNodeModules,
+          nmRollbackDir
+        );
+        const syncRes = syncNodeModulesSafe(stagingNodeModules, appNodeModules);
+        if (syncRes.deferredToRestart) {
+          fs.writeFileSync(
+            path.join(stagingDir, '.needs_npm_sync'),
+            new Date().toISOString(),
+            'utf8'
+          );
+        }
+      }
+      fs.rmSync(stagingNodeModules, { recursive: true, force: true });
+    }
 
     fs.rmSync(currentPersistDir, { recursive: true, force: true });
     fs.renameSync(stagingDir, currentPersistDir);
@@ -1393,9 +1606,14 @@ export async function performGitHubUpdate(
       syncReleaseDirToAppRoot(currentPersistDir, appRoot);
     }
 
+    if (nmDeltaBackup) {
+      fs.rmSync(nmDeltaBackup.backupDir, { recursive: true, force: true });
+      nmDeltaBackup = null;
+    }
+
     setSettings({
       installed_version: targetVer,
-      installed_commit_sha: fullCommit,
+      installed_commit_sha: resolvedCommitSha,
       last_github_update_at: new Date().toISOString(),
     });
 
@@ -1404,9 +1622,9 @@ export async function performGitHubUpdate(
       category: 'SYSTEM',
       title: `Cập nhật NAS-Sync v${targetVer} thành công`,
       message: usedPrebuiltFastPath
-        ? `Hệ thống đã nâng cấp siêu tốc lên v${targetVer} qua gói Prebuilt đã xác thực chữ ký SHA-256 (có sẵn điểm Rollback 1-Click).`
-        : `Hệ thống đã tự động tải và biên dịch bản cập nhật v${targetVer} (${
-            fullCommit ? fullCommit.slice(0, 7) : targetVer
+        ? `Hệ thống đã nâng cấp an toàn lên v${targetVer} qua gói Prebuilt xác thực chữ ký số Ed25519 & SHA-256 (có sẵn điểm Rollback 1-Click).`
+        : `[DEV MODE] Hệ thống đã tải và biên dịch bản v${targetVer} (${
+            resolvedCommitSha ? resolvedCommitSha.slice(0, 7) : targetVer
           }) từ ${GITHUB_REPO_URL}.`,
     });
 
@@ -1432,8 +1650,32 @@ export async function performGitHubUpdate(
       );
     }
   } catch (err) {
+    // U3 Rollback: Khôi phục nguyên trạng node_modules và appRoot nếu sự cố xảy ra giữa bước kích hoạt cuối cùng
+    try {
+      if (nmDeltaBackup && shouldSyncAppRoot) {
+        restoreNodeModulesDeltaBackup(
+          nmDeltaBackup,
+          path.join(appRoot, 'node_modules')
+        );
+        fs.rmSync(nmDeltaBackup.backupDir, { recursive: true, force: true });
+      }
+      if (
+        snapshotRotated &&
+        shouldSyncAppRoot &&
+        fs.existsSync(path.join(previousPersistDir, 'package.json'))
+      ) {
+        syncReleaseDirToAppRoot(previousPersistDir, appRoot);
+      }
+    } catch (rollbackErr) {
+      console.error(
+        '[NAS-Sync Updater] Lỗi khôi phục khẩn cấp sau sự cố kích hoạt:',
+        rollbackErr
+      );
+    }
+
     globalThis.__nasSyncUpdating = false;
     fs.rmSync(stagingDir, { recursive: true, force: true });
+    fs.rmSync(nmRollbackDir, { recursive: true, force: true });
     fs.rmSync(tarballPath, { force: true });
     fs.rmSync(prebuiltTarPath, { force: true });
     const msg =
@@ -1462,6 +1704,7 @@ export async function performRollbackRelease(): Promise<{
   const releaseBaseDir = path.join(getDataDir(), 'live_release');
   const currentPersistDir = path.join(releaseBaseDir, 'current');
   const previousPersistDir = path.join(releaseBaseDir, 'previous');
+  const nmRollbackDir = path.join(releaseBaseDir, 'nm_rollback_prev_tmp');
 
   const rollbackMeta = getRollbackMetadata();
   if (
@@ -1483,6 +1726,8 @@ export async function performRollbackRelease(): Promise<{
     process.platform !== 'win32' ||
     process.env.ALLOW_LOCAL_SELF_OVERWRITE === 'true';
 
+  let nmDeltaBackup: NodeModulesDeltaBackup | null = null;
+
   try {
     broadcastStep(
       'CHECKING',
@@ -1503,7 +1748,8 @@ export async function performRollbackRelease(): Promise<{
 
     const depsChanged = haveDependenciesChanged(
       path.join(appRoot, 'package.json'),
-      path.join(previousPersistDir, 'package.json')
+      path.join(previousPersistDir, 'package.json'),
+      false
     );
 
     const prevNodeModules = path.join(previousPersistDir, 'node_modules');
@@ -1513,20 +1759,14 @@ export async function performRollbackRelease(): Promise<{
       broadcastStep(
         'INSTALLING',
         45,
-        `Phát hiện khác biệt thư viện — Đang đồng bộ lại node_modules cho v${restoredVersion}...`,
-        'Chạy npm install --include=dev --ignore-scripts cho bản Rollback...',
+        `Phát hiện khác biệt thư viện — Đang chuẩn bị node_modules cô lập cho v${restoredVersion}...`,
+        'Chạy npm ci --omit=dev --ignore-scripts cho bản Rollback...',
         restoredVersion
       );
       const npmBin = process.platform === 'win32' ? 'npm.cmd' : 'npm';
       const npmCode = await runStreamingCommand(
         npmBin,
-        [
-          'install',
-          '--include=dev',
-          '--no-audit',
-          '--no-fund',
-          '--ignore-scripts',
-        ],
+        buildNpmInstallArgs(previousPersistDir, false),
         previousPersistDir,
         (line) =>
           broadcastStep(
@@ -1542,20 +1782,6 @@ export async function performRollbackRelease(): Promise<{
           'Khôi phục thư viện npm cho phiên bản trước thất bại. Hệ thống giữ nguyên phiên bản hiện hành.'
         );
       }
-      if (shouldSyncAppRoot && fs.existsSync(prevNodeModules)) {
-        const syncRes = syncNodeModulesSafe(
-          prevNodeModules,
-          path.join(appRoot, 'node_modules')
-        );
-        if (syncRes.deferredToRestart) {
-          fs.writeFileSync(
-            path.join(previousPersistDir, '.needs_npm_sync'),
-            new Date().toISOString(),
-            'utf8'
-          );
-        }
-      }
-      fs.rmSync(prevNodeModules, { recursive: true, force: true });
     }
 
     let restoredCommit = '';
@@ -1579,6 +1805,26 @@ export async function performRollbackRelease(): Promise<{
       restoredVersion
     );
 
+    if (depsChanged && fs.existsSync(prevNodeModules)) {
+      if (shouldSyncAppRoot) {
+        const appNodeModules = path.join(appRoot, 'node_modules');
+        nmDeltaBackup = createNodeModulesDeltaBackup(
+          prevNodeModules,
+          appNodeModules,
+          nmRollbackDir
+        );
+        const syncRes = syncNodeModulesSafe(prevNodeModules, appNodeModules);
+        if (syncRes.deferredToRestart) {
+          fs.writeFileSync(
+            path.join(previousPersistDir, '.needs_npm_sync'),
+            new Date().toISOString(),
+            'utf8'
+          );
+        }
+      }
+      fs.rmSync(prevNodeModules, { recursive: true, force: true });
+    }
+
     const discardedCurrentBackup = `${currentPersistDir}.discarded`;
     fs.rmSync(discardedCurrentBackup, { recursive: true, force: true });
     if (fs.existsSync(currentPersistDir)) {
@@ -1589,6 +1835,11 @@ export async function performRollbackRelease(): Promise<{
 
     if (shouldSyncAppRoot) {
       syncReleaseDirToAppRoot(currentPersistDir, appRoot);
+    }
+
+    if (nmDeltaBackup) {
+      fs.rmSync(nmDeltaBackup.backupDir, { recursive: true, force: true });
+      nmDeltaBackup = null;
     }
 
     setSettings({
@@ -1628,6 +1879,18 @@ export async function performRollbackRelease(): Promise<{
 
     return { restoredVersion };
   } catch (err) {
+    try {
+      if (nmDeltaBackup && shouldSyncAppRoot) {
+        restoreNodeModulesDeltaBackup(
+          nmDeltaBackup,
+          path.join(appRoot, 'node_modules')
+        );
+        fs.rmSync(nmDeltaBackup.backupDir, { recursive: true, force: true });
+      }
+    } catch {
+      // Ignore rollback cleanup failure
+    }
+    fs.rmSync(nmRollbackDir, { recursive: true, force: true });
     globalThis.__nasSyncUpdating = false;
     const msg =
       (err as Error).message || 'Lỗi không xác định khi Rollback phiên bản.';

@@ -9,9 +9,11 @@ import {
   shellSingleQuote,
 } from '@/lib/ssh';
 import type { DiscoveredDomain, PanelType, ServerRecord } from '@/types';
+import { buildJailedRsyncPath } from './adapters/base';
 import { getDirectorySizeAndCount, parseRsyncStats } from './rsync-runner';
 import { assertSafe, isSafeDomain, isSafeSystemUser } from './safe-names';
 import {
+  DETACHED_PROCESS_GROUP,
   RetryableNetworkError,
   STREAM_IDLE_TIMEOUT_MS,
   isJobCancelled,
@@ -153,12 +155,10 @@ function runRsyncPullMailbox(params: {
   }
 
   args.push('-e', buildRsyncSshTransport(server));
-  args.push('--rsync-path=ionice -c2 -n7 nice -n19 rsync');
+  // S3 Security Fix: Ghim inode thư mục Mailbox từ xa trong cùng phiên thực thi rsync
+  args.push(`--rsync-path=${buildJailedRsyncPath(remoteMailboxDir)}`);
   args.push(
-    `${server.ssh_user || 'root'}@${server.ip_address}:${remoteMailboxDir.replace(
-      /\/+$/,
-      ''
-    )}/`,
+    `${server.ssh_user || 'root'}@${server.ip_address}:./`,
     `${destMailboxDir.replace(/\/+$/, '')}/`
   );
 
@@ -166,6 +166,7 @@ function runRsyncPullMailbox(params: {
     const child = spawn('rsync', args, {
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
+      detached: DETACHED_PROCESS_GROUP,
     });
     registerJobChildProcess(jobId, child);
 
@@ -226,7 +227,7 @@ function runRsyncPullMailbox(params: {
       }
 
       if (exitCode !== 0 && exitCode !== 24) {
-        if ([10, 12, 23, 30, 35, 255].includes(exitCode)) {
+        if ([10, 12, 30, 35, 255].includes(exitCode)) {
           reject(
             new RetryableNetworkError(
               `Kết nối Rsync Mailbox gián đoạn (Mã lỗi ${exitCode}): ${fullStderr.trim()}`,
@@ -382,11 +383,16 @@ function pullRemoteVhostConfigsTarGz(
     const child = spawn('ssh', sshArgs, {
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
+      detached: DETACHED_PROCESS_GROUP,
     });
     registerJobChildProcess(jobId, child);
 
     const chunks: Buffer[] = [];
     let totalLen = 0;
+    const timeoutTimer = setTimeout(() => {
+      terminateChildGracefully(child);
+    }, 60_000);
+    timeoutTimer.unref();
 
     child.stdout.on('data', (chunk: Buffer) => {
       if (totalLen + chunk.length <= MAX_VHOST_ARCHIVE_UNCOMPRESSED_BYTES) {
@@ -395,8 +401,16 @@ function pullRemoteVhostConfigsTarGz(
       }
     });
 
-    child.on('error', reject);
+    child.on('error', (err) => {
+      clearTimeout(timeoutTimer);
+      reject(err);
+    });
     child.on('close', (code) => {
+      clearTimeout(timeoutTimer);
+      if (isJobCancelled(jobId)) {
+        reject(new Error('Job đã bị hủy bởi quản trị viên.'));
+        return;
+      }
       if (code === 255) {
         reject(
           new RetryableNetworkError(
@@ -538,20 +552,55 @@ export async function syncExtendedHostingExtras(params: {
       );
       const quotedList = candidates.map((c) => shellSingleQuote(c)).join(' ');
       const probeScript = `
+        SYS_USER=${shellSingleQuote(dom.systemUser)}
+        DOM=${shellSingleQuote(dom.domain)}
+        PANEL=${shellSingleQuote(server.panel_type)}
+        USER_HOME=$(getent passwd "$SYS_USER" 2>/dev/null | cut -d: -f6 || true)
+        REAL_HOME=""
+        if [ -n "$USER_HOME" ] && [ "$USER_HOME" != "/" ]; then
+          REAL_HOME=$(realpath -m -- "$USER_HOME" 2>/dev/null || readlink -m -- "$USER_HOME" 2>/dev/null || printf "%s" "$USER_HOME")
+          REAL_HOME="\${REAL_HOME%/}"
+        fi
         for CAND in ${quotedList}; do
           if [ -d "$CAND" ] && [ ! -L "$CAND" ]; then
-            REAL=$(realpath -e "$CAND" 2>/dev/null || readlink -f "$CAND" 2>/dev/null || true)
+            REAL=$(realpath -e -- "$CAND" 2>/dev/null || readlink -f -- "$CAND" 2>/dev/null || true)
             REAL="\${REAL%/}"
             case "$REAL/" in
               /|/etc/*|/root/*|/proc/*|/sys/*|/dev/*|/var/lib/mysql/*|/var/lib/postgresql/*)
                 echo "JAIL|$REAL"
                 exit 0
                 ;;
-              /home/*/*|/var/qmail/mailnames/*|/www/vmail/*)
+            esac
+            if [ "$PANEL" = "DIRECTADMIN" ] || [ "$PANEL" = "CPANEL" ] || [ "$PANEL" = "HESTIACP" ]; then
+              if [ -n "$REAL_HOME" ] && [ "$REAL_HOME" != "/" ]; then
+                case "$REAL/" in
+                  "$REAL_HOME/"*)
+                    printf "OK|%s\\n" "$REAL"
+                    exit 0
+                    ;;
+                  *)
+                    echo "JAIL|$REAL"
+                    exit 0
+                    ;;
+                esac
+              fi
+            elif [ "$PANEL" = "PLESK" ]; then
+              if [ "$REAL" = "/var/qmail/mailnames/$DOM" ]; then
                 printf "OK|%s\\n" "$REAL"
                 exit 0
-                ;;
-            esac
+              else
+                echo "JAIL|$REAL"
+                exit 0
+              fi
+            else
+              if [ "$REAL" = "/home/vmail/$DOM" ] || [ "$REAL" = "/www/vmail/$DOM" ]; then
+                printf "OK|%s\\n" "$REAL"
+                exit 0
+              else
+                echo "JAIL|$REAL"
+                exit 0
+              fi
+            fi
           fi
         done
         echo "NONE"

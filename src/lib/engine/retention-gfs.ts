@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { getDb } from '@/lib/db';
 import { isSafeSnapshotName } from './safe-names';
+import { isSnapshotReadPinned } from './snapshot-pins';
 import { refreshAllVolumes, resolveLatestSnapshotDir } from './volume-manager';
 import type { RetentionPolicy } from '@/types';
 
@@ -157,6 +158,11 @@ export async function applyGfsRetentionForServer(
       protectedSnapshotNames.has(c.snapshotName)
     ) {
       keepMap.set(c.jobId, 'Active Restore (Đang phục vụ khôi phục)');
+    } else if (isSnapshotReadPinned(c.serverId, c.snapshotName)) {
+      keepMap.set(
+        c.jobId,
+        'Active Reader Pin (Đang tải về / Kiểm định / Đồng bộ Offsite)'
+      );
     }
   });
 

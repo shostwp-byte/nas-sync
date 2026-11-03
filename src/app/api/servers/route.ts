@@ -62,6 +62,19 @@ export async function POST(req: NextRequest) {
     const panelType = String(body.panel_type || 'DIRECTADMIN').trim();
     const bwLimit = Number(body.bw_limit_kbps ?? 25600);
     const isMock = body.is_mock ? 1 : 0;
+    if (
+      isMock === 1 &&
+      process.env.NODE_ENV === 'production' &&
+      process.env.ALLOW_MOCK_SERVERS !== 'true'
+    ) {
+      return NextResponse.json(
+        {
+          error:
+            'Chế độ Máy chủ Demo Mô phỏng (is_mock) bị tắt mặc định trên môi trường Production. Đặt ALLOW_MOCK_SERVERS=true nếu cần chạy thử nghiệm.',
+        },
+        { status: 403 }
+      );
+    }
     const notes = String(body.notes || '');
     const rawCustomExcludes =
       body.custom_excludes !== undefined ? String(body.custom_excludes) : '';

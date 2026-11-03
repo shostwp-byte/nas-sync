@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { NextRequest, NextResponse } from 'next/server';
+import { safeErrorJson } from '@/lib/api-error';
 import { recordAuditLog } from '@/lib/audit';
 import { requireRole } from '@/lib/auth';
 import {
@@ -9,6 +10,11 @@ import {
   resolveSafeSubPath,
 } from '@/lib/engine/explorer';
 import { isSafeDomain } from '@/lib/engine/safe-names';
+import { acquireSnapshotReadPin } from '@/lib/engine/snapshot-pins';
+import {
+  DETACHED_PROCESS_GROUP,
+  terminateChildGracefully,
+} from '@/lib/engine/worker-state';
 
 export async function GET(req: NextRequest) {
   try {
@@ -43,13 +49,16 @@ export async function GET(req: NextRequest) {
       effectiveRelPath = relPath;
     }
 
-    const { snapshotRoot, hostname, snapshotName } =
+    const { serverId, snapshotRoot, hostname, snapshotName } =
       resolveSafeSnapshotRoot(jobId);
     const targetPath = resolveSafeSubPath(snapshotRoot, effectiveRelPath);
 
     if (!fs.existsSync(targetPath)) {
       return NextResponse.json(
-        { error: 'Thư mục hoặc tập tin sao lưu không tồn tại trong Snapshot này.' },
+        {
+          error:
+            'Thư mục hoặc tập tin sao lưu không tồn tại trong Snapshot này.',
+        },
         { status: 404 }
       );
     }
@@ -88,9 +97,19 @@ export async function GET(req: NextRequest) {
       entryName,
     ];
 
+    // Ghim đọc Snapshot để ngăn GFS Retention / xóa tay dọn mất thư mục khi đang stream tải về
+    const releasePin = acquireSnapshotReadPin(serverId, snapshotName);
+    let pinReleased = false;
+    const releasePinOnce = () => {
+      if (pinReleased) return;
+      pinReleased = true;
+      releasePin();
+    };
+
     const child = spawn(tarBin, tarArgs, {
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
+      detached: DETACHED_PROCESS_GROUP,
     });
 
     let aborted = false;
@@ -102,21 +121,8 @@ export async function GET(req: NextRequest) {
     const killTarProcess = () => {
       if (aborted) return;
       aborted = true;
-      try {
-        child.kill('SIGTERM');
-      } catch {
-        return;
-      }
-      const forceKillTimer = setTimeout(() => {
-        try {
-          if (child.exitCode === null) {
-            child.kill('SIGKILL');
-          }
-        } catch {
-          // Ignore
-        }
-      }, 3000);
-      forceKillTimer.unref();
+      releasePinOnce();
+      terminateChildGracefully(child);
     };
 
     req.signal.addEventListener('abort', killTarProcess, { once: true });
@@ -127,63 +133,87 @@ export async function GET(req: NextRequest) {
       }
     });
 
-    const webStream = new ReadableStream<Uint8Array>({
-      start(controller) {
-        const tryFinalize = () => {
-          if (aborted) return;
-          if (!stdoutEnded || !processClosed) return;
-          if (exitCode === 0) {
-            try {
-              controller.close();
-            } catch {
-              // Ignore if already closed
+    // N3 Fix: Áp dụng Backpressure thực sự (pause/resume theo controller.desiredSize + pull())
+    // chống phình bộ nhớ V8 Heap khi client tải chậm với snapshot hàng chục GB!
+    const webStream = new ReadableStream<Uint8Array>(
+      {
+        start(controller) {
+          child.stdout.pause();
+
+          const tryFinalize = () => {
+            if (aborted) return;
+            if (!stdoutEnded || !processClosed) return;
+            releasePinOnce();
+            if (exitCode === 0) {
+              try {
+                controller.close();
+              } catch {
+                // Ignore if already closed
+              }
+            } else {
+              try {
+                controller.error(
+                  new Error(
+                    `Đóng gói luồng .tar.gz thất bại (code ${exitCode}): ${stderr.trim()}`
+                  )
+                );
+              } catch {
+                // Ignore
+              }
             }
-          } else {
+          };
+
+          child.stdout.on('data', (chunk: Buffer) => {
+            if (aborted) return;
             try {
-              controller.error(
-                new Error(
-                  `Đóng gói luồng .tar.gz thất bại (code ${exitCode}): ${stderr.trim()}`
-                )
-              );
+              controller.enqueue(new Uint8Array(chunk));
+              if (
+                controller.desiredSize !== null &&
+                controller.desiredSize <= 0
+              ) {
+                child.stdout.pause();
+              }
+            } catch {
+              killTarProcess();
+            }
+          });
+
+          child.stdout.on('end', () => {
+            stdoutEnded = true;
+            tryFinalize();
+          });
+
+          child.on('error', (err) => {
+            releasePinOnce();
+            if (aborted) return;
+            try {
+              controller.error(err);
             } catch {
               // Ignore
             }
+          });
+
+          child.on('close', (code) => {
+            processClosed = true;
+            exitCode = code ?? 1;
+            if (aborted) {
+              releasePinOnce();
+              return;
+            }
+            tryFinalize();
+          });
+        },
+        pull() {
+          if (!aborted && !stdoutEnded) {
+            child.stdout.resume();
           }
-        };
-
-        child.stdout.on('data', (chunk: Buffer) => {
-          if (aborted) return;
-          try {
-            controller.enqueue(new Uint8Array(chunk));
-          } catch {
-            killTarProcess();
-          }
-        });
-
-        child.stdout.on('end', () => {
-          stdoutEnded = true;
-          tryFinalize();
-        });
-
-        child.on('error', (err) => {
-          if (aborted) return;
-          try {
-            controller.error(err);
-          } catch {
-            // Ignore
-          }
-        });
-
-        child.on('close', (code) => {
-          processClosed = true;
-          exitCode = code ?? 1;
-          tryFinalize();
-        });
+        },
+        cancel() {
+          killTarProcess();
+        },
       },
-      cancel() {
-        killTarProcess();
-      },
-    });
+      new ByteLengthQueuingStrategy({ highWaterMark: 1024 * 1024 })
+    );
 
     recordAuditLog({
       session: guard.session,
@@ -207,9 +237,10 @@ export async function GET(req: NextRequest) {
       },
     });
   } catch (err) {
-    return NextResponse.json(
-      { error: (err as Error).message },
-      { status: 400 }
+    return safeErrorJson(
+      err,
+      'Không thể đóng gói dữ liệu tải xuống.',
+      400
     );
   }
 }

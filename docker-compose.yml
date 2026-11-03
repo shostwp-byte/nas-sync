@@ -40,8 +40,10 @@ services:
       - NODE_ENV=production
       - TZ=Asia/Ho_Chi_Minh
       - APP_URL=${APP_URL:-http://localhost:3080}
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}
       - DATA_DIR=/app/data
-      - SSH_KEYS_DIR=/root/.ssh
+      - SSH_KEYS_DIR=/app/ssh_keys
       - REDIS_URL=redis://redis:6379
       - SANDBOX_DB_HOST=db_sandbox
       - SANDBOX_DB_PORT=3306
@@ -71,7 +73,7 @@ services:
       - DSM_BACKUP_SHARES=${DSM_BACKUP_SHARES:-VPS_Backups}
     volumes:
       - ./app_data:/app/data
-      - ./ssh_keys:/root/.ssh
+      - ./ssh_keys:/app/ssh_keys
       - ${NAS_VOL1_PATH:-/volume1/VPS_Backups}:/mnt/vol1
       # Bỏ dấu # dòng dưới nếu NAS có thêm phân vùng /volume2 thật sự:
       # - ${NAS_VOL2_PATH:-/volume2/VPS_Backups}:/mnt/vol2

@@ -980,13 +980,24 @@ export default function ServersPage() {
                   </label>
                   <input
                     required
+                    disabled={Boolean(
+                      editingServer &&
+                        Number(editingServer.snapshots_count || 0) > 0
+                    )}
                     value={form.hostname}
                     onChange={(e) =>
                       setForm({ ...form, hostname: e.target.value })
                     }
                     placeholder="vps01.example.com"
-                    className="w-full min-h-[42px] bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white"
+                    className="w-full min-h-[42px] bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white disabled:opacity-60 disabled:cursor-not-allowed"
                   />
+                  {editingServer &&
+                    Number(editingServer.snapshots_count || 0) > 0 && (
+                      <p className="text-[11px] text-amber-300/90 mt-1">
+                        Đã khóa đổi Hostname để bảo toàn cây thư mục Hardlink
+                        Snapshot hiện có trên NAS.
+                      </p>
+                    )}
                 </div>
                 <div className="flex flex-col justify-between">
                   <label className="block text-slate-300 mb-1 font-medium">

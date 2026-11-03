@@ -9,7 +9,11 @@ import {
   isSafeDomain,
   isSafeSystemUser,
 } from '../safe-names';
-import { finalizeDiscoveredDomains, type PanelAdapter } from './base';
+import {
+  buildPinnedCurrentDirPermissionCommand,
+  finalizeDiscoveredDomains,
+  type PanelAdapter,
+} from './base';
 
 export class DirectAdminAdapter implements PanelAdapter {
   readonly panelType = 'DIRECTADMIN' as const;
@@ -17,6 +21,7 @@ export class DirectAdminAdapter implements PanelAdapter {
   async getMysqlAdminCredentials(
     server: ServerRecord
   ): Promise<MysqlAdminCredentials> {
+    // S11 Security Fix: Chỉ lấy username từ mysql.conf, mật khẩu được đọc cục bộ trên VPS qua remoteAuthPrelude
     const script = `
       CONF="/usr/local/directadmin/conf/mysql.conf"
       if [ ! -f "$CONF" ]; then
@@ -24,19 +29,17 @@ export class DirectAdminAdapter implements PanelAdapter {
         exit 1
       fi
       U=$(grep -E '^user=' "$CONF" | head -n1 | cut -d= -f2-)
-      P=$(grep -E '^passwd=' "$CONF" | head -n1 | cut -d= -f2-)
-      printf "%s\\n%s\\n" "$U" "$P"
+      printf "OK|%s\\n" "$U"
     `;
     const res = await execRemoteSSH(server, script, { zeroImpact: true });
-    if (res.code !== 0 || res.stdout.includes('ERR_NO_CONF')) {
+    if (res.code !== 0 || !res.stdout.startsWith('OK|')) {
       throw new Error(
         `Không đọc được /usr/local/directadmin/conf/mysql.conf trên ${server.hostname}: ${res.stderr}`
       );
     }
-    const [user, password] = res.stdout.split('\n');
+    const user = res.stdout.split('\n')[0]?.slice(3).trim();
     return {
-      user: (user || 'da_admin').trim(),
-      password: (password || '').trim(),
+      user: user || 'da_admin',
       remoteAuthPrelude:
         'export MYSQL_PWD="$(grep -E \'^passwd=\' /usr/local/directadmin/conf/mysql.conf | head -n1 | cut -d= -f2- | tr -d \'\\r\\n\')"',
     };
@@ -356,8 +359,9 @@ $(head -n 120 "$cf" 2>/dev/null || true)"
     targetWebroot: string
   ): string {
     assertSafe(isSafeSystemUser, systemUser, 'systemUser');
-    return `chown -hR ${shellSingleQuote(`${systemUser}:${systemUser}`)} ${shellSingleQuote(
-      targetWebroot
-    )}`;
+    return buildPinnedCurrentDirPermissionCommand(
+      targetWebroot,
+      `chown -hR ${shellSingleQuote(`${systemUser}:${systemUser}`)} .`
+    );
   }
 }

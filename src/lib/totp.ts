@@ -1,4 +1,7 @@
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+import { getDataDir, getDb } from './db';
 import { ensureJwtSecret } from './jwt-secret';
 import { renderQrSvg } from './qr-svg';
 
@@ -7,13 +10,88 @@ const RECOVERY_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ'; // 32 ký tự rõ
 const TOTP_STEP_SECONDS = 30;
 const TOTP_DIGITS = 6;
 
-function getTotpDerivedKey(): Buffer {
+let cachedDedicatedTotpKey: { dir: string; envVal: string; key: Buffer } | null =
+  null;
+
+/**
+ * Khóa mã hóa riêng cho 2FA TOTP & Recovery Codes (`v2:`), tách biệt hoàn toàn với `JWT_SECRET`
+ * để khi xoay vòng `JWT_SECRET` (đăng xuất toàn bộ phiên) không làm hỏng khóa 2FA của quản trị viên.
+ */
+function getDedicatedTotpKey(): Buffer {
+  const envVal = (process.env.TOTP_ENCRYPTION_KEY || '').trim();
+  const dataDir = getDataDir();
+  if (
+    cachedDedicatedTotpKey &&
+    cachedDedicatedTotpKey.dir === dataDir &&
+    cachedDedicatedTotpKey.envVal === envVal
+  ) {
+    return cachedDedicatedTotpKey.key;
+  }
+
+  let rawSecret = envVal;
+  if (!rawSecret) {
+    const secretFile = path.join(dataDir, '.totp_secret');
+    try {
+      if (fs.existsSync(secretFile)) {
+        rawSecret = fs.readFileSync(secretFile, 'utf8').trim();
+      }
+    } catch {
+      rawSecret = '';
+    }
+
+    if (!rawSecret || rawSecret.length < 32) {
+      const generated = crypto.randomBytes(32).toString('hex');
+      try {
+        fs.writeFileSync(secretFile, `${generated}\n`, {
+          encoding: 'utf8',
+          mode: 0o600,
+          flag: 'wx',
+        });
+        rawSecret = generated;
+      } catch {
+        try {
+          const existing = fs.readFileSync(secretFile, 'utf8').trim();
+          if (existing.length >= 32) {
+            rawSecret = existing;
+          } else {
+            fs.writeFileSync(secretFile, `${generated}\n`, {
+              encoding: 'utf8',
+              mode: 0o600,
+            });
+            rawSecret = generated;
+          }
+        } catch {
+          rawSecret = generated;
+        }
+      }
+      if (process.platform !== 'win32') {
+        try {
+          fs.chmodSync(secretFile, 0o600);
+        } catch {
+          // Ignore RichACL warning
+        }
+      }
+    }
+  }
+
+  const key = crypto
+    .createHash('sha256')
+    .update('nas-sync-totp-v2:' + rawSecret)
+    .digest();
+  cachedDedicatedTotpKey = { dir: dataDir, envVal, key };
+  return key;
+}
+
+/**
+ * Khóa dẫn xuất thế hệ cũ (`v1:`) từ `JWT_SECRET` — chỉ giữ để giải mã tương thích ngược.
+ */
+function getLegacyTotpDerivedKey(): Buffer {
   if (!process.env.JWT_SECRET) {
     ensureJwtSecret();
   }
   const jwtSecret = process.env.JWT_SECRET;
   if (!jwtSecret) {
-    throw new Error('JWT_SECRET chưa sẵn sàng để mã hóa khóa 2FA.');
+    throw new Error('JWT_SECRET chưa sẵn sàng để giải mã khóa 2FA cũ.');
   }
   return crypto
     .createHash('sha256')
@@ -75,7 +153,7 @@ export function generateTotpSecret(byteLength = 20): string {
 }
 
 export function encryptTotpSecret(plainBase32Secret: string): string {
-  const key = getTotpDerivedKey();
+  const key = getDedicatedTotpKey();
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
   const encrypted = Buffer.concat([
@@ -83,21 +161,23 @@ export function encryptTotpSecret(plainBase32Secret: string): string {
     cipher.final(),
   ]);
   const authTag = cipher.getAuthTag();
-  return `v1:${iv.toString('hex')}:${authTag.toString('hex')}:${encrypted.toString('hex')}`;
+  return `v2:${iv.toString('hex')}:${authTag.toString('hex')}:${encrypted.toString('hex')}`;
 }
 
 export function decryptTotpSecret(encryptedPayload: string): string {
   const parts = String(encryptedPayload || '').split(':');
-  if (parts.length !== 4 || parts[0] !== 'v1') {
+  if (parts.length !== 4 || (parts[0] !== 'v2' && parts[0] !== 'v1')) {
     throw new Error('Định dạng khóa 2FA đã mã hóa không hợp lệ.');
   }
+  const version = parts[0];
   const iv = Buffer.from(parts[1], 'hex');
   const authTag = Buffer.from(parts[2], 'hex');
   const ciphertext = Buffer.from(parts[3], 'hex');
   if (iv.length !== 12 || authTag.length !== 16) {
     throw new Error('Metadata giải mã khóa 2FA không hợp lệ.');
   }
-  const key = getTotpDerivedKey();
+  const key =
+    version === 'v2' ? getDedicatedTotpKey() : getLegacyTotpDerivedKey();
   const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
   decipher.setAuthTag(authTag);
   return Buffer.concat([
@@ -106,11 +186,18 @@ export function decryptTotpSecret(encryptedPayload: string): string {
   ]).toString('utf8');
 }
 
-function computeHotp(secretBytes: Buffer, counter: bigint, digits = TOTP_DIGITS): string {
+function computeHotp(
+  secretBytes: Buffer,
+  counter: bigint,
+  digits = TOTP_DIGITS
+): string {
   const counterBuf = Buffer.alloc(8);
   counterBuf.writeBigUInt64BE(counter, 0);
 
-  const hmac = crypto.createHmac('sha1', secretBytes).update(counterBuf).digest();
+  const hmac = crypto
+    .createHmac('sha1', secretBytes)
+    .update(counterBuf)
+    .digest();
   const offset = hmac[hmac.length - 1] & 0x0f;
   const binary =
     ((hmac[offset] & 0x7f) << 24) |
@@ -132,25 +219,24 @@ export function generateTotpCode(
 }
 
 /**
- * Xác thực mã TOTP 6 chữ số theo chuẩn RFC 6238 (HMAC-SHA1, chu kỳ 30 giây).
- * Mặc định chấp nhận sai lệch ±1 chu kỳ (±30 giây) để tránh lệch đồng hồ nhẹ giữa NAS và điện thoại.
+ * Xác thực mã TOTP 6 chữ số kèm trả về chỉ số chu kỳ `matchedStep` để chống phát lại (anti-replay RFC 6238 §5.2).
  */
-export function verifyTotpCode(
+export function verifyTotpCodeWithStep(
   base32Secret: string,
   inputCode: string,
   timestampMs = Date.now(),
   window = 1
-): boolean {
+): { valid: boolean; matchedStep: number | null } {
   const cleaned = String(inputCode || '').replace(/[\s-]+/g, '');
   if (!/^\d{6}$/.test(cleaned)) {
-    return false;
+    return { valid: false, matchedStep: null };
   }
 
   let secretBytes: Buffer;
   try {
     secretBytes = decodeBase32(base32Secret);
   } catch {
-    return false;
+    return { valid: false, matchedStep: null };
   }
 
   const currentStep = BigInt(Math.floor(timestampMs / 1000 / TOTP_STEP_SECONDS));
@@ -167,11 +253,44 @@ export function verifyTotpCode(
       expectedBuf.length === candidateBuf.length &&
       crypto.timingSafeEqual(expectedBuf, candidateBuf)
     ) {
-      return true;
+      return { valid: true, matchedStep: Number(step) };
     }
   }
 
-  return false;
+  return { valid: false, matchedStep: null };
+}
+
+/**
+ * Xác thực mã TOTP 6 chữ số theo chuẩn RFC 6238 (HMAC-SHA1, chu kỳ 30 giây).
+ */
+export function verifyTotpCode(
+  base32Secret: string,
+  inputCode: string,
+  timestampMs = Date.now(),
+  window = 1
+): boolean {
+  return verifyTotpCodeWithStep(base32Secret, inputCode, timestampMs, window)
+    .valid;
+}
+
+/**
+ * Ghi nhận nguyên tử chu kỳ TOTP vừa dùng của người dùng để chặn tấn công phát lại (Replay Attack) trong cửa sổ ±30s.
+ */
+export function consumeTotpStepAtomically(
+  userId: number,
+  matchedStep: number
+): boolean {
+  if (!Number.isInteger(userId) || userId <= 0 || matchedStep <= 0) {
+    return false;
+  }
+  const res = getDb()
+    .prepare(
+      `UPDATE users
+       SET totp_last_used_step = ?
+       WHERE id = ? AND COALESCE(totp_last_used_step, 0) < ?`
+    )
+    .run(matchedStep, userId, matchedStep);
+  return Number(res.changes) === 1;
 }
 
 export function buildOtpAuthUrl(
@@ -197,9 +316,16 @@ export async function generateTotpQrSvg(otpauthUrl: string): Promise<string> {
   });
 }
 
-function hashRecoveryCodeNormalized(normalizedCode: string): string {
+function hashRecoveryCodeV2(normalizedCode: string): string {
   return crypto
-    .createHmac('sha256', getTotpDerivedKey())
+    .createHmac('sha256', getDedicatedTotpKey())
+    .update('recovery-v2:' + normalizedCode)
+    .digest('hex');
+}
+
+function hashRecoveryCodeLegacyV1(normalizedCode: string): string {
+  return crypto
+    .createHmac('sha256', getLegacyTotpDerivedKey())
     .update('recovery:' + normalizedCode)
     .digest('hex');
 }
@@ -219,7 +345,7 @@ export function generateRecoveryCodes(count = 8): {
     }
     const formatted = `${chars.slice(0, 4)}-${chars.slice(4, 8)}`;
     plainCodes.push(formatted);
-    hashedCodes.push(hashRecoveryCodeNormalized(chars));
+    hashedCodes.push(`v2:${hashRecoveryCodeV2(chars)}`);
   }
 
   return {
@@ -252,7 +378,9 @@ export function verifyAndConsumeRecoveryCode(
     const parsed = JSON.parse(storedJson || '[]');
     if (Array.isArray(parsed)) {
       storedList = parsed.filter(
-        (x): x is string => typeof x === 'string' && /^[0-9a-f]{64}$/i.test(x)
+        (x): x is string =>
+          typeof x === 'string' &&
+          (/^[0-9a-f]{64}$/i.test(x) || /^v2:[0-9a-f]{64}$/i.test(x))
       );
     }
   } catch {
@@ -271,20 +399,36 @@ export function verifyAndConsumeRecoveryCode(
     };
   }
 
-  const candidateBuf = Buffer.from(
-    hashRecoveryCodeNormalized(normalized),
-    'hex'
-  );
+  const candidateV2Buf = Buffer.from(hashRecoveryCodeV2(normalized), 'hex');
+  let candidateLegacyBuf: Buffer | null = null;
 
   let matchedIdx = -1;
   for (let i = 0; i < storedList.length; i++) {
-    const itemBuf = Buffer.from(storedList[i], 'hex');
-    if (
-      itemBuf.length === candidateBuf.length &&
-      crypto.timingSafeEqual(itemBuf, candidateBuf)
-    ) {
-      matchedIdx = i;
-      break;
+    const entry = storedList[i];
+    if (entry.startsWith('v2:')) {
+      const itemBuf = Buffer.from(entry.slice(3), 'hex');
+      if (
+        itemBuf.length === candidateV2Buf.length &&
+        crypto.timingSafeEqual(itemBuf, candidateV2Buf)
+      ) {
+        matchedIdx = i;
+        break;
+      }
+    } else {
+      if (!candidateLegacyBuf) {
+        candidateLegacyBuf = Buffer.from(
+          hashRecoveryCodeLegacyV1(normalized),
+          'hex'
+        );
+      }
+      const itemBuf = Buffer.from(entry, 'hex');
+      if (
+        itemBuf.length === candidateLegacyBuf.length &&
+        crypto.timingSafeEqual(itemBuf, candidateLegacyBuf)
+      ) {
+        matchedIdx = i;
+        break;
+      }
     }
   }
 

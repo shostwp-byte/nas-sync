@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { safeErrorJson } from '@/lib/api-error';
 import { recordAuditLog } from '@/lib/audit';
 import {
   SESSION_COOKIE_NAME,
@@ -11,6 +12,7 @@ import {
 import { getDb } from '@/lib/db';
 import {
   buildOtpAuthUrl,
+  consumeTotpStepAtomically,
   countRemainingRecoveryCodes,
   decryptTotpSecret,
   encryptTotpSecret,
@@ -18,38 +20,42 @@ import {
   generateTotpQrSvg,
   generateTotpSecret,
   verifyAndConsumeRecoveryCode,
-  verifyTotpCode,
+  verifyTotpCodeWithStep,
 } from '@/lib/totp';
 
 export async function GET() {
-  const session = await getCurrentSession();
-  if (!session) {
-    return NextResponse.json(
-      { error: 'Chưa đăng nhập hoặc phiên làm việc đã hết hạn.' },
-      { status: 401 }
+  try {
+    const session = await getCurrentSession();
+    if (!session) {
+      return NextResponse.json(
+        { error: 'Chưa đăng nhập hoặc phiên làm việc đã hết hạn.' },
+        { status: 401 }
+      );
+    }
+
+    const row = getDb()
+      .prepare(
+        'SELECT totp_enabled, totp_pending_secret, recovery_codes_json FROM users WHERE id = ?'
+      )
+      .get(session.userId);
+
+    const enabled = Boolean(row?.totp_enabled);
+    const remaining = countRemainingRecoveryCodes(
+      String(row?.recovery_codes_json || '[]')
     );
+
+    return NextResponse.json({
+      ok: true,
+      enabled,
+      totpEnabled: enabled,
+      hasPendingSetup: Boolean(row?.totp_pending_secret),
+      recoveryCodesRemaining: remaining,
+      remainingRecoveryCodes: remaining,
+      recoveryCodesCount: remaining,
+    });
+  } catch (err) {
+    return safeErrorJson(err, 'Không thể tải trạng thái 2FA.', 500);
   }
-
-  const row = getDb()
-    .prepare(
-      'SELECT totp_enabled, totp_pending_secret, recovery_codes_json FROM users WHERE id = ?'
-    )
-    .get(session.userId);
-
-  const enabled = Boolean(row?.totp_enabled);
-  const remaining = countRemainingRecoveryCodes(
-    String(row?.recovery_codes_json || '[]')
-  );
-
-  return NextResponse.json({
-    ok: true,
-    enabled,
-    totpEnabled: enabled,
-    hasPendingSetup: Boolean(row?.totp_pending_secret),
-    recoveryCodesRemaining: remaining,
-    remainingRecoveryCodes: remaining,
-    recoveryCodesCount: remaining,
-  });
 }
 
 export async function POST(req: NextRequest) {
@@ -157,7 +163,8 @@ export async function POST(req: NextRequest) {
       const pendingPlainSecret = decryptTotpSecret(
         String(user.totp_pending_secret)
       );
-      if (!verifyTotpCode(pendingPlainSecret, code)) {
+      const stepCheck = verifyTotpCodeWithStep(pendingPlainSecret, code);
+      if (!stepCheck.valid || stepCheck.matchedStep === null) {
         return NextResponse.json(
           {
             error:
@@ -169,26 +176,43 @@ export async function POST(req: NextRequest) {
 
       const { plainCodes, hashedJson } = generateRecoveryCodes(8);
       const encryptedActive = encryptTotpSecret(pendingPlainSecret);
+      const nextTokenVersion = Number(user.token_version ?? 1) + 1;
 
       db.prepare(
         `UPDATE users
          SET totp_secret = ?,
              totp_pending_secret = NULL,
              totp_enabled = 1,
-             recovery_codes_json = ?
+             totp_last_used_step = ?,
+             recovery_codes_json = ?,
+             token_version = ?
          WHERE id = ?`
-      ).run(encryptedActive, hashedJson, userId);
+      ).run(
+        encryptedActive,
+        stepCheck.matchedStep,
+        hashedJson,
+        nextTokenVersion,
+        userId
+      );
+
+      const freshToken = await signSessionToken({
+        userId,
+        username,
+        role: normalizeUserRole(user.role || 'ADMIN'),
+        tokenVersion: nextTokenVersion,
+      });
 
       recordAuditLog({
         session,
         action: 'AUTH_2FA_ENABLED',
         resourceType: 'USER',
         resourceId: String(userId),
-        detail: 'Đã kích hoạt bảo mật 2 lớp (2FA TOTP) và khởi tạo 8 mã khôi phục',
+        detail:
+          'Đã kích hoạt bảo mật 2 lớp (2FA TOTP), xoay vòng phiên đăng nhập và khởi tạo 8 mã khôi phục',
         req,
       });
 
-      return NextResponse.json({
+      const res = NextResponse.json({
         ok: true,
         enabled: true,
         totpEnabled: true,
@@ -197,6 +221,8 @@ export async function POST(req: NextRequest) {
         remainingRecoveryCodes: plainCodes.length,
         message: 'Đã kích hoạt xác thực 2 lớp (2FA TOTP) thành công!',
       });
+      res.cookies.set(SESSION_COOKIE_NAME, freshToken, sessionCookieOptions(req));
+      return res;
     }
 
     if (action === 'disable') {
@@ -236,7 +262,11 @@ export async function POST(req: NextRequest) {
 
       if (user.totp_secret) {
         const plainSecret = decryptTotpSecret(String(user.totp_secret));
-        const validTotp = verifyTotpCode(plainSecret, rawCode);
+        const stepCheck = verifyTotpCodeWithStep(plainSecret, rawCode);
+        const validTotp =
+          stepCheck.valid &&
+          stepCheck.matchedStep !== null &&
+          consumeTotpStepAtomically(userId, stepCheck.matchedStep);
         const validRec = !validTotp
           ? verifyAndConsumeRecoveryCode(
               rawCode,
@@ -245,7 +275,7 @@ export async function POST(req: NextRequest) {
           : false;
         if (!validTotp && !validRec) {
           return NextResponse.json(
-            { error: 'Mã xác thực 2FA không chính xác.' },
+            { error: 'Mã xác thực 2FA không chính xác hoặc vừa được sử dụng.' },
             { status: 400 }
           );
         }
@@ -257,6 +287,7 @@ export async function POST(req: NextRequest) {
          SET totp_enabled = 0,
              totp_secret = NULL,
              totp_pending_secret = NULL,
+             totp_last_used_step = 0,
              recovery_codes_json = '[]',
              token_version = ?
          WHERE id = ?`
@@ -326,9 +357,14 @@ export async function POST(req: NextRequest) {
       }
 
       const plainSecret = decryptTotpSecret(String(user.totp_secret));
-      if (!verifyTotpCode(plainSecret, rawCode)) {
+      const stepCheck = verifyTotpCodeWithStep(plainSecret, rawCode);
+      if (
+        !stepCheck.valid ||
+        stepCheck.matchedStep === null ||
+        !consumeTotpStepAtomically(userId, stepCheck.matchedStep)
+      ) {
         return NextResponse.json(
-          { error: 'Mã TOTP 6 chữ số không chính xác.' },
+          { error: 'Mã TOTP 6 chữ số không chính xác hoặc vừa được sử dụng.' },
           { status: 400 }
         );
       }
@@ -362,9 +398,6 @@ export async function POST(req: NextRequest) {
       { status: 400 }
     );
   } catch (err) {
-    return NextResponse.json(
-      { error: (err as Error).message || 'Lỗi máy chủ khi xử lý 2FA.' },
-      { status: 500 }
-    );
+    return safeErrorJson(err, 'Lỗi máy chủ khi xử lý 2FA.', 500);
   }
 }

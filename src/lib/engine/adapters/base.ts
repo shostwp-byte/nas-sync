@@ -36,10 +36,10 @@ export interface PanelAdapter {
 export type WebrootSafetyCheckResult =
   | { ok: true; resolvedPath: string }
   | {
-      ok: false;
-      code: 'NOT_FOUND' | 'JAIL_VIOLATION' | 'SSH_ERROR';
-      reason: string;
-    };
+    ok: false;
+    code: 'NOT_FOUND' | 'JAIL_VIOLATION' | 'SSH_ERROR';
+    reason: string;
+  };
 
 /**
  * Chỉ truyền user hoặc --defaults-extra-file qua tham số dòng lệnh;
@@ -66,11 +66,48 @@ export function buildRemoteMysqlEnvPrelude(creds: MysqlAdminCredentials): string
   return '';
 }
 
+export function buildJailedRsyncPath(expectedRealPath: string): string {
+  const clean = normalizePosixWebroot(expectedRealPath);
+  assertSafe((v) => isSafeWebroot(v, 2), clean, 'expectedRealPath');
+  if (/\s/.test(clean) || clean.includes("'") || clean.includes('"')) {
+    throw new Error(`Đường dẫn webroot không hợp lệ để ghim Rsync Jail: ${clean}`);
+  }
+  const script = [
+    `EXPECTED=${clean};`,
+    '[ ! -L "$EXPECTED" ] || exit 91;',
+    'REAL=$(realpath -e -- "$EXPECTED" 2>/dev/null || readlink -f -- "$EXPECTED" 2>/dev/null || true);',
+    '[ "$REAL" = "$EXPECTED" ] || exit 91;',
+    'cd -P -- "$EXPECTED" || exit 91;',
+    '[ "$(pwd -P)" = "$EXPECTED" ] || exit 91;',
+    'case "$EXPECTED/" in /|/etc/*|/root/*|/proc/*|/sys/*|/dev/*|/boot/*|/usr/*|/bin/*|/sbin/*|/lib/*|/lib64/*|/run/*|/var/lib/mysql/*|/var/lib/postgresql/*|/var/cpanel/*|/usr/local/directadmin/*|/usr/local/CyberCP/*|/usr/local/hestia/*|/home/clp/*|/www/server/panel/*) exit 91 ;; esac;',
+    'if command -v ionice >/dev/null 2>&1 && ionice -c2 -n7 true 2>/dev/null; then exec ionice -c2 -n7 nice -n19 rsync "$@"; else exec nice -n19 rsync "$@"; fi',
+  ].join(' ');
+  return `sh -c '${script}' nas-rsync`;
+}
+
+export function buildPinnedCurrentDirPermissionCommand(
+  targetWebroot: string,
+  currentDirAction: string
+): string {
+  const clean = normalizePosixWebroot(targetWebroot);
+  assertSafe((v) => isSafeWebroot(v, 2), clean, 'targetWebroot');
+  const q = shellSingleQuote(clean);
+  return [
+    `EXPECTED=${q}`,
+    '[ ! -L "$EXPECTED" ]',
+    'REAL=$(realpath -e -- "$EXPECTED" 2>/dev/null || readlink -f -- "$EXPECTED" 2>/dev/null || true)',
+    '[ "$REAL" = "$EXPECTED" ]',
+    'cd -P -- "$EXPECTED"',
+    '[ "$(pwd -P)" = "$EXPECTED" ]',
+    currentDirAction,
+  ].join(' && ');
+}
+
 /**
  * Kiểm tra Symlink Webroot Jail trực tiếp trên VPS trước khi chạy rsync pull/push hoặc chown:
  * - Phân giải đường dẫn thực tế qua `realpath` / `readlink`
  * - Trên cPanel/DirectAdmin/HestiaCP/CloudPanel: bắt buộc nằm bên trong thư mục home thực của `systemUser` trong `/etc/passwd`
- * - Trên CyberPanel: bắt buộc nằm bên trong `/home/<domain_or_user>/...` (không bao giờ là `/home` gốc)
+ * - Trên CyberPanel (S5): bắt buộc nằm bên trong home thực của `systemUser` hoặc `/home/<expectedDomain>/...` (hoặc `/home/<parentDomain>/...`)
  * - Trên Plesk: bắt buộc nằm trong vhost root của `systemUser` hoặc `/var/www/vhosts/<domain>/...`
  * - Trên aaPanel: bắt buộc nằm trong `/www/wwwroot/<site>`
  * - Chặn tuyệt đối mọi symlink trỏ sang `/root`, `/etc`, `/proc`, `/var/lib/mysql`, `/var/lib/postgresql` hoặc tài khoản user khác.
@@ -80,11 +117,23 @@ export async function verifyRemoteWebrootSafety(
   panelType: PanelType,
   systemUser: string,
   webroot: string,
-  options: { mustExist: boolean }
+  options: {
+    mustExist: boolean;
+    expectedDomain?: string;
+    parentDomain?: string;
+  }
 ): Promise<WebrootSafetyCheckResult> {
   const cleanWebroot = normalizePosixWebroot(webroot);
   assertSafe(isSafeSystemUser, systemUser, 'systemUser');
   assertSafe((v) => isSafeWebroot(v, 2), cleanWebroot, 'webroot');
+  const cleanExpectedDomain = options.expectedDomain?.trim() || '';
+  if (cleanExpectedDomain) {
+    assertSafe(isSafeDomain, cleanExpectedDomain, 'expectedDomain');
+  }
+  const cleanParentDomain = options.parentDomain?.trim() || '';
+  if (cleanParentDomain) {
+    assertSafe(isSafeDomain, cleanParentDomain, 'parentDomain');
+  }
 
   if (server.is_mock) {
     return { ok: true, resolvedPath: cleanWebroot };
@@ -94,21 +143,30 @@ export async function verifyRemoteWebrootSafety(
     TARGET=${shellSingleQuote(cleanWebroot)}
     SYS_USER=${shellSingleQuote(systemUser)}
     PANEL=${shellSingleQuote(panelType)}
+    EXPECTED_DOM=${shellSingleQuote(cleanExpectedDomain)}
+    PARENT_DOM=${shellSingleQuote(cleanParentDomain)}
     MUST_EXIST=${options.mustExist ? "'1'" : "'0'"}
 
     if [ "$MUST_EXIST" = "1" ]; then
-      if [ ! -e "$TARGET" ]; then
+      if [ ! -e "$TARGET" ] || [ -L "$TARGET" ]; then
+        if [ -L "$TARGET" ]; then
+          echo "ERR_JAIL|Đường dẫn webroot ($TARGET) là symlink trực tiếp — bị từ chối để chống TOCTOU"
+          exit 0
+        fi
         echo "ERR_NOT_FOUND"
         exit 0
       fi
-      REAL=$(realpath -e "$TARGET" 2>/dev/null || readlink -f "$TARGET" 2>/dev/null || true)
+      REAL=$(realpath -e -- "$TARGET" 2>/dev/null || readlink -f -- "$TARGET" 2>/dev/null || true)
+      if [ "$REAL" != "$TARGET" ]; then
+        # Cho phép nếu có thư mục hệ thống chuẩn được symlink hợp lệ (VD /home -> /mnt/home), nhưng kiểm tra không có thành phần con nào bên trong home bị symlink ra ngoài ở bước dưới
+        :
+      fi
     else
       if [ -L "$TARGET" ]; then
-        LINK_REAL=$(realpath -m "$TARGET" 2>/dev/null || readlink -m "$TARGET" 2>/dev/null || true)
-        REAL="$LINK_REAL"
-      else
-        REAL=$(realpath -m "$TARGET" 2>/dev/null || readlink -m "$TARGET" 2>/dev/null || true)
+        echo "ERR_JAIL|Đường dẫn webroot đích ($TARGET) đang là symlink — bị từ chối"
+        exit 0
       fi
+      REAL=$(realpath -m -- "$TARGET" 2>/dev/null || readlink -m -- "$TARGET" 2>/dev/null || true)
     fi
 
     if [ -z "$REAL" ]; then
@@ -141,23 +199,62 @@ export async function verifyRemoteWebrootSafety(
           ;;
       esac
     elif [ "$PANEL" = "CYBERPANEL" ]; then
-      case "$REAL" in
-        /home/*/*)
-          ;;
-        /home|/home/*)
-          echo "ERR_JAIL|Webroot CyberPanel ($REAL) phải nằm bên trong /home/<domain_or_user>/... (không được là /home hoặc thư mục cấp 1)"
-          exit 0
-          ;;
-        *)
-          echo "ERR_JAIL|Webroot CyberPanel ($REAL) nằm ngoài phạm vi /home/<domain_or_user>/..."
-          exit 0
-          ;;
-      esac
+      USER_HOME=$(getent passwd "$SYS_USER" 2>/dev/null | cut -d: -f6 || true)
+      REAL_HOME=""
+      if [ -n "$USER_HOME" ] && [ "$SYS_USER" != "root" ] && [ "$SYS_USER" != "nobody" ]; then
+        CAND_HOME=$(realpath -m -- "$USER_HOME" 2>/dev/null || readlink -m -- "$USER_HOME" 2>/dev/null || printf "%s" "$USER_HOME")
+        CAND_HOME="\${CAND_HOME%/}"
+        case "$CAND_HOME" in
+          /home/*)
+            if [ "$CAND_HOME" != "/home" ]; then
+              REAL_HOME="$CAND_HOME"
+            fi
+            ;;
+        esac
+      fi
+
+      CYBER_OK="0"
+      if [ -n "$REAL_HOME" ]; then
+        case "$REAL/" in
+          "$REAL_HOME/"*)
+            if [ "$REAL" != "$REAL_HOME" ]; then
+              CYBER_OK="1"
+            fi
+            ;;
+        esac
+      fi
+      if [ "$CYBER_OK" = "0" ] && [ -n "$EXPECTED_DOM" ]; then
+        DOM_BASE=$(realpath -m -- "/home/$EXPECTED_DOM" 2>/dev/null || printf "/home/%s" "$EXPECTED_DOM")
+        DOM_BASE="\${DOM_BASE%/}"
+        case "$REAL/" in
+          "$DOM_BASE/"*)
+            if [ "$REAL" != "$DOM_BASE" ]; then
+              CYBER_OK="1"
+            fi
+            ;;
+        esac
+      fi
+      if [ "$CYBER_OK" = "0" ] && [ -n "$PARENT_DOM" ]; then
+        PDOM_BASE=$(realpath -m -- "/home/$PARENT_DOM" 2>/dev/null || printf "/home/%s" "$PARENT_DOM")
+        PDOM_BASE="\${PDOM_BASE%/}"
+        case "$REAL/" in
+          "$PDOM_BASE/"*)
+            if [ "$REAL" != "$PDOM_BASE" ]; then
+              CYBER_OK="1"
+            fi
+            ;;
+        esac
+      fi
+
+      if [ "$CYBER_OK" != "1" ]; then
+        echo "ERR_JAIL|Webroot CyberPanel ($REAL) thoát khỏi phạm vi cho phép của user $SYS_USER / domain $EXPECTED_DOM"
+        exit 0
+      fi
     elif [ "$PANEL" = "PLESK" ]; then
       USER_HOME=$(getent passwd "$SYS_USER" 2>/dev/null | cut -d: -f6 || true)
       REAL_HOME=""
       if [ -n "$USER_HOME" ] && [ "$USER_HOME" != "/" ]; then
-        REAL_HOME=$(realpath -m "$USER_HOME" 2>/dev/null || readlink -m "$USER_HOME" 2>/dev/null || printf "%s" "$USER_HOME")
+        REAL_HOME=$(realpath -m -- "$USER_HOME" 2>/dev/null || readlink -m -- "$USER_HOME" 2>/dev/null || printf "%s" "$USER_HOME")
         REAL_HOME="\${REAL_HOME%/}"
       fi
       if [ -n "$REAL_HOME" ] && [ "$REAL_HOME" != "/" ] && [ "$SYS_USER" != "root" ]; then
@@ -169,13 +266,30 @@ export async function verifyRemoteWebrootSafety(
             ;;
         esac
       else
-        case "$REAL" in
-          /var/www/vhosts/*/*) ;;
-          *)
-            echo "ERR_JAIL|Webroot Plesk ($REAL) phải nằm trong /var/www/vhosts/<domain>/..."
-            exit 0
-            ;;
-        esac
+        if [ -n "$EXPECTED_DOM" ]; then
+          PLESK_DOM_BASE="/var/www/vhosts/$EXPECTED_DOM"
+          PLESK_PARENT_BASE=""
+          [ -n "$PARENT_DOM" ] && PLESK_PARENT_BASE="/var/www/vhosts/$PARENT_DOM"
+          case "$REAL/" in
+            "$PLESK_DOM_BASE/"*) ;;
+            *)
+              if [ -n "$PLESK_PARENT_BASE" ] && [ "\${REAL#"$PLESK_PARENT_BASE/"}" != "$REAL" ]; then
+                :
+              else
+                echo "ERR_JAIL|Webroot Plesk ($REAL) phải nằm trong $PLESK_DOM_BASE/..."
+                exit 0
+              fi
+              ;;
+          esac
+        else
+          case "$REAL" in
+            /var/www/vhosts/*/*) ;;
+            *)
+              echo "ERR_JAIL|Webroot Plesk ($REAL) phải nằm trong /var/www/vhosts/<domain>/..."
+              exit 0
+              ;;
+          esac
+        fi
       fi
     else
       USER_HOME=$(getent passwd "$SYS_USER" 2>/dev/null | cut -d: -f6 || true)
@@ -183,7 +297,7 @@ export async function verifyRemoteWebrootSafety(
         echo "ERR_JAIL|Không tìm thấy thư mục home hợp lệ trong /etc/passwd cho user $SYS_USER"
         exit 0
       fi
-      REAL_HOME=$(realpath -m "$USER_HOME" 2>/dev/null || readlink -m "$USER_HOME" 2>/dev/null || printf "%s" "$USER_HOME")
+      REAL_HOME=$(realpath -m -- "$USER_HOME" 2>/dev/null || readlink -m -- "$USER_HOME" 2>/dev/null || printf "%s" "$USER_HOME")
       REAL_HOME="\${REAL_HOME%/}"
       if [ -z "$REAL_HOME" ] || [ "$REAL_HOME" = "/" ]; then
         echo "ERR_JAIL|Thư mục home thực tế của user $SYS_USER không hợp lệ ($REAL_HOME)"

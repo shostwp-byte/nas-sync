@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { NextRequest, NextResponse } from 'next/server';
+import { safeErrorJson } from '@/lib/api-error';
 import { requireRole } from '@/lib/auth';
 import { getDataDir, getDb, getSshKeysDir } from '@/lib/db';
 import { refreshAllVolumes } from '@/lib/engine/volume-manager';
@@ -118,15 +119,22 @@ function validateAndNormalizeMountPath(rawMountPath: string): {
 }
 
 export async function GET(req: NextRequest) {
-  const shouldRefresh = req.nextUrl.searchParams.get('refresh') !== '0';
-  if (shouldRefresh) {
-    const volumes = await refreshAllVolumes();
+  try {
+    const guard = await requireRole(['ADMIN', 'OPERATOR', 'VIEWER']);
+    if (!guard.ok) return guard.response;
+
+    const shouldRefresh = req.nextUrl.searchParams.get('refresh') !== '0';
+    if (shouldRefresh) {
+      const volumes = await refreshAllVolumes();
+      return NextResponse.json({ volumes });
+    }
+    const volumes = getDb()
+      .prepare('SELECT * FROM storage_volumes ORDER BY priority ASC, id ASC')
+      .all();
     return NextResponse.json({ volumes });
+  } catch (err) {
+    return safeErrorJson(err, 'Không thể tải danh sách phân vùng lưu trữ.', 500);
   }
-  const volumes = getDb()
-    .prepare('SELECT * FROM storage_volumes ORDER BY priority ASC, id ASC')
-    .all();
-  return NextResponse.json({ volumes });
 }
 
 export async function POST(req: NextRequest) {
@@ -213,10 +221,7 @@ export async function POST(req: NextRequest) {
     const volumes = await refreshAllVolumes();
     return NextResponse.json({ ok: true, volumes });
   } catch (err) {
-    return NextResponse.json(
-      { error: (err as Error).message },
-      { status: 500 }
-    );
+    return safeErrorJson(err, 'Không thể thêm phân vùng lưu trữ.', 500);
   }
 }
 

@@ -5,7 +5,11 @@ import type {
   ServerRecord,
 } from '@/types';
 import { assertSafe, isSafeDomain } from '../safe-names';
-import { finalizeDiscoveredDomains, type PanelAdapter } from './base';
+import {
+  buildPinnedCurrentDirPermissionCommand,
+  finalizeDiscoveredDomains,
+  type PanelAdapter,
+} from './base';
 
 export class AaPanelAdapter implements PanelAdapter {
   readonly panelType = 'AAPANEL' as const;
@@ -13,13 +17,14 @@ export class AaPanelAdapter implements PanelAdapter {
   async getMysqlAdminCredentials(
     server: ServerRecord
   ): Promise<MysqlAdminCredentials> {
+    // S11 Security Fix: Chỉ xác minh cấu hình tồn tại trên VPS, tuyệt đối không in mật khẩu mysql_root về bộ nhớ NAS
     const pyScript = `
 import sqlite3
 conn = sqlite3.connect('/www/server/panel/data/default.db')
 cur = conn.cursor()
-cur.execute("SELECT mysql_root FROM config WHERE id=1")
+cur.execute("SELECT CASE WHEN LENGTH(IFNULL(mysql_root, '')) > 0 THEN 'OK' ELSE 'EMPTY' END FROM config WHERE id=1")
 row = cur.fetchone()
-print(row[0] if row else "")
+print(row[0] if row else "MISSING")
 `;
     const cmd = `
       PY="/www/server/panel/pyenv/bin/python3"
@@ -27,14 +32,13 @@ print(row[0] if row else "")
       "$PY" -c ${shellSingleQuote(pyScript)}
     `;
     const res = await execRemoteSSH(server, cmd, { zeroImpact: true });
-    if (res.code !== 0) {
+    if (res.code !== 0 || res.stdout.trim() === 'MISSING') {
       throw new Error(
-        `Không đọc được mật khẩu mysql_root từ /www/server/panel/data/default.db trên aaPanel ${server.hostname}: ${res.stderr}`
+        `Không thể xác minh cấu hình mysql_root trong /www/server/panel/data/default.db trên aaPanel ${server.hostname}: ${res.stderr}`
       );
     }
     return {
       user: 'root',
-      password: res.stdout.trim(),
       remoteAuthPrelude:
         'PY="/www/server/panel/pyenv/bin/python3"; [ ! -x "$PY" ] && PY="python3"; export MYSQL_PWD="$("$PY" -c "import sqlite3; c=sqlite3.connect(\'/www/server/panel/data/default.db\').cursor(); c.execute(\'SELECT mysql_root FROM config WHERE id=1\'); r=c.fetchone(); print(r[0] if r else \'\')" | tr -d \'\\r\\n\')"',
     };
@@ -177,7 +181,13 @@ print('/www/wwwroot/' + ${JSON.stringify(domain)})
     _domain: string,
     targetWebroot: string
   ): string {
-    const q = shellSingleQuote(targetWebroot);
-    return `chown -hR www:www ${q} && find ${q} -type d -exec chmod 755 {} + && find ${q} -type f -exec chmod 644 {} +`;
+    // S9 Security Fix: Ghim thư mục thực tại `.` và hạ quyền sang user `www` khi chạy find+chmod để chống TOCTOU symlink race
+    const chmodAsWww = shellSingleQuote(
+      'find . -P ! -type l -type d -exec chmod 755 {} + && find . -P ! -type l -type f -exec chmod 644 {} +'
+    );
+    return buildPinnedCurrentDirPermissionCommand(
+      targetWebroot,
+      `chown -hR www:www . && if id -u www >/dev/null 2>&1; then if command -v runuser >/dev/null 2>&1; then runuser -u www -- sh -c ${chmodAsWww}; else su -s /bin/sh www -c ${chmodAsWww}; fi; else sh -c ${chmodAsWww}; fi`
+    );
   }
 }

@@ -2,6 +2,28 @@
 
 Mọi thay đổi đáng chú ý của dự án **NAS-Sync** (<https://github.com/shostwp-byte/nas-sync>) đều được ghi nhận tại tài liệu này theo chuẩn [Keep a Changelog](https://keepachangelog.com/vi/1.1.0/) và [Semantic Versioning](https://semver.org/).
 
+## [1.6.0] - 2026-11-03
+
+### Security & Reliability Hardening (Xử lý Toàn diện Bản Đánh giá An ninh & Độ tin cậy)
+- **Chặn đứng RCE qua SQL Client & Luồng PostgreSQL (`S1`, `S6` — `sandbox-verifier.ts`, `restore-worker.ts`, `sql-stream-guard.ts`, `postgres-streamer.ts`)**:
+  - Bổ sung cờ bắt buộc `--binary-mode` cho mọi tiến trình nạp `mariadb`/`mysql` để vô hiệu hóa hoàn toàn các lệnh thực thi client (`\!`, `system`, `source`) bên trong file dump từ VPS không tin cậy.
+  - Xây dựng bộ lọc luồng trạng thái dòng `createSafePsqlRestoreTransform` chặn mọi meta-command `psql` (`\!`, `\i`, `\o`, `\copy`), `COPY ... PROGRAM`, `CREATE LANGUAGE ...u`, leo thang `SUPERUSER` và `SET SESSION AUTHORIZATION` trước khi đẩy vào `psql -X -v ON_ERROR_STOP=1` dưới quyền `SET SESSION AUTHORIZATION <targetUser>`.
+- **Chống Symlink Clobber & TOCTOU Leo thang Đặc quyền Root trên VPS (`S2`, `S3`, `S5`, `S9`, `S11` — `config-rewriter.ts`, `adapters/**`, `rsync-runner.ts`, `restore-worker.ts`, `extended-hosting-backup.ts`)**:
+  - Thay thế thao tác ghi đè cấu hình web dưới quyền `root` bằng kiểm tra symlink từng đoạn đường dẫn, hạ quyền xuống user sở hữu website và ghi tạm qua `mktemp` (`O_EXCL`) + `mv -f`.
+  - Bổ sung cơ chế khóa Inode thư mục làm việc `buildJailedRsyncPath` (`realpath -e` + `cd -P` + `pwd -P` ngay trong cùng tiến trình con trước khi `exec rsync`), thêm `--no-keep-dirlinks` khi Restore, siết chặt kiểm tra jail trên CyberPanel/Plesk/Maildir, chạy `chmod` aaPanel dưới quyền user `www` kèm cờ `! -type l`, và gỡ bỏ truyền mật khẩu MySQL dư thừa khi quét tên miền.
+- **Gia cố Hàng đợi BullMQ, Quản lý Process Group & Cảnh báo Khi Hết Retry (`N1`, `N2`, `N4`, `N6`, `N7`, `N8`, `N11`, `N12`, `N14` — `queue.ts`, `worker-state.ts`, `backup-worker.ts`, `restore-worker.ts`, `snapshot-pins.ts`)**:
+  - Khóa CAS nguyên tử khi nhận Job, đặt `attempts: 1` + `UnrecoverableError` cho mọi tác vụ `RESTORE` (ngăn chạy đè 10 lần khi đứt mạng giữa chừng), và ghim đọc `SnapshotReadPin` ngăn GFS Retention xóa nhầm Snapshot đang chạy Restore / tải ZIP / đẩy Offsite.
+  - Bỏ hoàn toàn lớp bọc trung gian `bash -c`, nối trực tiếp luồng giải nén Node.js vào `stdin` kèm `detached: true` và tiêu diệt toàn bộ Process Group (`-pid`) khi hủy hoặc quá hạn; tự động chuyển sang `FAILED` + phát cảnh báo `CRITICAL` + dọn sạch thư mục `.in_progress_*` khi dùng hết số lần retry; tách biệt hậu kiểm sau điểm commit nguyên tử (`renameSync`) để lỗi Sandbox không làm hỏng trạng thái `COMPLETED` của bản sao lưu.
+- **Xác thực Chữ ký số Ed25519 Bắt buộc cho Self-Updater & Kênh CI/CD (`U1`–`U5`, `E1`, `R1`, `R2` — `release-signature.ts`, `updater.ts`, `docker-entrypoint.sh`, `Dockerfile`, `.github/workflows/release.yml`, `update-synology.sh`)**:
+  - Mặc định 1-Click Self-Updater chỉ chấp nhận các gói GitHub Release chính thức có đầy đủ tệp băm `.sha256` và chữ ký số **Ed25519 (`.sig`)** hợp lệ; sao lưu delta `node_modules` để hoàn tác nguyên tử cùng mã nguồn nếu lỗi; khóa tương tranh giữa Self-Update và Cron/Offsite.
+  - Cô lập `npm ci --omit=dev` vào thư mục tạm trong `docker-entrypoint.sh`, tách riêng bước build không đặc quyền với bước ký số phát hành trong `release.yml` (ghim cứng commit SHA cho mọi GitHub Action), bảo toàn `docker-compose.yml` trong `update-synology.sh`, và bổ sung chạy container dưới tài khoản non-root `nassync` qua `su-exec`.
+- **An toàn Sao lưu Đám mây Offsite `NASSYNC2`, Backpressure & Watchdog (`O1`–`O6`, `C1`, `N3`, `N5` — `offsite-cloud.ts`, `offsite-crypto.ts`, `explorer/**`, `sandbox-verifier.ts`, `scripts/decrypt-offsite-backup.mjs`)**:
+  - Khắc phục triệt để lỗi lọc tiền tố trên Google Drive (`web` không bao giờ xóa nhầm bản sao lưu của `web-2`) kết hợp gắn nhãn `appProperties` và phân trang `nextPageToken`; tính kích thước part S3 động tới `512 MiB` hỗ trợ gói lớn hơn `78 GiB`; đồng bộ offset Google Drive Resumable Upload khi retry; chặn SSRF tới dải IP nội bộ/metadata cho S3 Endpoint tùy chỉnh; chờ xác nhận mã thoát `tar === 0` trước khi hoàn tất upload.
+  - Nâng cấp luồng mã hóa lên chuẩn **`NASSYNC2`** (`PBKDF2-HMAC-SHA256` 600.000 vòng bất đồng bộ + gắn toàn bộ 49 bytes Header làm AAD cho mọi khung `AES-256-GCM`), giữ tương thích giải mã ngược 100% với `NASSYNC1` và gỡ bỏ nhận mật khẩu trần trên dòng lệnh `process.argv` của công cụ giải mã độc lập.
+  - Áp dụng Pull Backpressure chuẩn (`pause`/`resume` theo `desiredSize`) cho API tải tệp/gói nén Explorer tránh tràn RAM OOM, và cập nhật đồng hồ hoạt động theo tiến độ đọc byte cho luồng nạp SQL lớn.
+- **Phòng thủ Chiều sâu API, RBAC, Socket.IO, SSH TOFU & 2FA TOTP (`A1`–`A8`, `S4`, `S7`, `S8`, `S10`, `N9`, `N10`, `N13`, `N15`–`N17`, ESLint)**:
+  - Chuẩn hóa toàn bộ API trả lỗi qua `safeErrorJson`, mở đúng quyền `/api/alerts` cho `VIEWER`/`OPERATOR`, phân luồng room theo vai trò và thu hồi tức thì phiên Socket.IO bị hủy, tách khóa mã hóa 2FA riêng (`v2:`) độc lập với `JWT_SECRET`, bổ sung chống phát lại mã TOTP (`totp_last_used_step`), chống dò tên đăng nhập qua thời gian phản hồi, khóa đổi `hostname` khi đã có Snapshot, bật kiểm tra chứng chỉ TLS DSM mặc định, bỏ cờ yếu `+ssh-rsa` / `accept-new` và tích hợp cấu hình ESLint chuẩn vào quy trình kiểm thử CI.
+
 ## [1.5.6] - 2026-11-03
 
 ### Fixed

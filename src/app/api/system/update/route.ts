@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { safeErrorJson } from '@/lib/api-error';
 import { recordAuditLog } from '@/lib/audit';
 import { requireRole } from '@/lib/auth';
 import {
@@ -17,9 +18,10 @@ export async function GET() {
     const info = await checkGitHubUpdate();
     return NextResponse.json(info);
   } catch (err) {
-    return NextResponse.json(
-      { error: (err as Error).message },
-      { status: 500 }
+    return safeErrorJson(
+      err,
+      'Không thể kiểm tra bản cập nhật từ GitHub lúc này.',
+      500
     );
   }
 }
@@ -76,8 +78,8 @@ export async function POST(req: NextRequest) {
       session: guard.session,
       action: 'SYSTEM_UPDATE',
       resourceType: 'SYSTEM',
-      detail: `Kích hoạt cập nhật hệ thống từ GitHub${
-        force ? ' (chế độ Force biên dịch lại từ mã nguồn)' : ''
+      detail: `Kích hoạt cập nhật hệ thống từ GitHub Release đã ký${
+        force ? ' (chế độ cài đặt lại bản phát hành)' : ''
       }`,
       req,
     });
@@ -90,12 +92,13 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({
       ok: true,
       message:
-        'Đã bắt đầu tiến trình cập nhật từ GitHub. Theo dõi trực tiếp trên màn hình...',
+        'Đã bắt đầu tiến trình cập nhật từ GitHub Releases. Theo dõi trực tiếp trên màn hình...',
     });
   } catch (err) {
-    return NextResponse.json(
-      { error: (err as Error).message },
-      { status: 400 }
+    return safeErrorJson(
+      err,
+      'Yêu cầu cập nhật hệ thống không hợp lệ.',
+      400
     );
   }
 }

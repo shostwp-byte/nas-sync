@@ -9,7 +9,11 @@ import {
   isSafeDomain,
   isSafeSystemUser,
 } from '../safe-names';
-import { finalizeDiscoveredDomains, type PanelAdapter } from './base';
+import {
+  buildPinnedCurrentDirPermissionCommand,
+  finalizeDiscoveredDomains,
+  type PanelAdapter,
+} from './base';
 
 export class CPanelAdapter implements PanelAdapter {
   readonly panelType = 'CPANEL' as const;
@@ -17,11 +21,11 @@ export class CPanelAdapter implements PanelAdapter {
   async getMysqlAdminCredentials(
     server: ServerRecord
   ): Promise<MysqlAdminCredentials> {
+    // S11 Security Fix: Không kéo mật khẩu plaintext từ /root/.my.cnf về NAS
     const script = `
       if [ -f /root/.my.cnf ]; then
         U=$(grep -E '^user[[:space:]]*=' /root/.my.cnf | head -n1 | cut -d= -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
-        P=$(grep -E '^password[[:space:]]*=' /root/.my.cnf | head -n1 | cut -d= -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
-        printf "OK|%s|%s\\n" "\${U:-root}" "$P"
+        printf "OK|%s\\n" "\${U:-root}"
       else
         echo "ERR_NO_MYCNF"
         exit 1
@@ -35,16 +39,9 @@ export class CPanelAdapter implements PanelAdapter {
     }
     const line = res.stdout.replace(/\r?\n$/, '');
     const firstPipe = line.indexOf('|');
-    const secondPipe = firstPipe >= 0 ? line.indexOf('|', firstPipe + 1) : -1;
-    const user =
-      firstPipe >= 0 && secondPipe >= 0
-        ? line.slice(firstPipe + 1, secondPipe).trim()
-        : 'root';
-    const password =
-      secondPipe >= 0 ? line.slice(secondPipe + 1).trim() : '';
+    const user = firstPipe >= 0 ? line.slice(firstPipe + 1).trim() : 'root';
     return {
       user: user || 'root',
-      password: password || undefined,
       defaultsFile: '/root/.my.cnf',
     };
   }
@@ -278,12 +275,11 @@ $(head -n 120 "$cf" 2>/dev/null || true)"
     targetWebroot: string
   ): string {
     assertSafe(isSafeSystemUser, systemUser, 'systemUser');
-    return `chown -hR ${shellSingleQuote(`${systemUser}:${systemUser}`)} ${shellSingleQuote(
-      targetWebroot
-    )} && chown -h ${shellSingleQuote(`${systemUser}:nobody`)} ${shellSingleQuote(
-      targetWebroot
-    )} 2>/dev/null || chown -hR ${shellSingleQuote(
-      `${systemUser}:${systemUser}`
-    )} ${shellSingleQuote(targetWebroot)}`;
+    const ug = shellSingleQuote(`${systemUser}:${systemUser}`);
+    const un = shellSingleQuote(`${systemUser}:nobody`);
+    return buildPinnedCurrentDirPermissionCommand(
+      targetWebroot,
+      `chown -hR ${ug} . && (chown -h ${un} . 2>/dev/null || chown -h ${ug} .)`
+    );
   }
 }
