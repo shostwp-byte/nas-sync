@@ -528,35 +528,81 @@ function describeNasWebApiAuthError(code?: number): string {
   }
 }
 
-function describeNasWebApiSnapshotError(code?: number): string {
+function formatNasWebApiErrorDetails(details?: unknown): string {
+  if (details === undefined || details === null) return '';
+  try {
+    const raw =
+      typeof details === 'string' ? details.trim() : JSON.stringify(details);
+    if (!raw || raw === '{}' || raw === '[]' || raw === '""') return '';
+    return raw.length > 160 ? ` [${raw.slice(0, 157)}...]` : ` [${raw}]`;
+  } catch {
+    return '';
+  }
+}
+
+function describeNasWebApiSnapshotError(
+  code?: number,
+  details?: unknown
+): string {
+  const extra = formatNasWebApiErrorDetails(details);
   switch (code) {
-    case 102:
-    case 103:
-      return `Mã lỗi ${code} — Thiết bị NAS chưa cài đặt hoặc chưa bật dịch vụ Snapshot Replication`;
-    case 402:
-      return 'Mã lỗi 402 — Tài khoản không đủ quyền chụp Snapshot hoặc Shared Folder chưa nằm trên phân vùng Btrfs';
     case 101:
+    case 120:
+      return `Mã lỗi ${code} — Tham số Snapshot không hợp lệ hoặc không tìm thấy Shared Folder trên phân vùng Btrfs${extra}`;
+    case 102:
+      return `Mã lỗi 102 — Thiết bị NAS chưa cài đặt hoặc chưa bật dịch vụ Snapshot Replication${extra}`;
+    case 103:
+      return `Mã lỗi 103 — Firmware NAS không hỗ trợ phương thức chụp Snapshot qua WebAPI này${extra}`;
+    case 104:
+      return `Mã lỗi 104 — Phiên bản giao thức Snapshot WebAPI không tương thích với firmware NAS${extra}`;
+    case 105:
+      return `Mã lỗi 105 — Tài khoản đăng nhập không đủ đặc quyền quản trị Snapshot Replication${extra}`;
+    case 106:
+    case 119:
+      return `Mã lỗi ${code} — Phiên xác thực WebAPI (_sid / CSRF Token) hết hạn hoặc bị từ chối${extra}`;
+    case 402:
+      return `Mã lỗi 402 — Tài khoản không đủ quyền chụp Snapshot hoặc Shared Folder chưa nằm trên phân vùng Btrfs${extra}`;
     case 3301:
     case 3302:
-      return `Mã lỗi ${code} — Không tìm thấy Shared Folder hoặc phân vùng chưa hỗ trợ khóa Immutable WORM`;
+      return `Mã lỗi ${code} — Shared Folder không hỗ trợ khóa Immutable WORM (kiểm tra định dạng Btrfs, thư mục mã hóa hoặc giới hạn phần cứng NAS)${extra}`;
     default:
-      return `Mã lỗi: ${code ?? 'unknown'}`;
+      return `Mã lỗi: ${code ?? 'unknown'}${extra}`;
   }
+}
+
+function isSafeHttpHeaderToken(value?: string): value is string {
+  if (!value) return false;
+  for (let i = 0; i < value.length; i += 1) {
+    const code = value.charCodeAt(i);
+    if (code <= 0x1f || code === 0x7f || code === 0x3b) {
+      return false;
+    }
+  }
+  return true;
 }
 
 async function postNasWebApiForm<T>(
   baseUrl: URL,
   cgiPath: string,
   params: URLSearchParams,
-  timeoutMs: number
+  timeoutMs: number,
+  sessionContext?: { sid?: string; synoToken?: string }
 ): Promise<T> {
   const targetUrl = new URL(`${baseUrl.origin}${cgiPath}`);
   const body = params.toString();
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8',
+  };
+  if (isSafeHttpHeaderToken(sessionContext?.sid)) {
+    headers.Cookie = `id=${sessionContext.sid}`;
+  }
+  if (isSafeHttpHeaderToken(sessionContext?.synoToken)) {
+    headers['X-SYNO-TOKEN'] = sessionContext.synoToken;
+  }
+
   const res = await sendWormHttpRequest(targetUrl, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8',
-    },
+    headers,
     body,
     timeoutMs,
   });
@@ -579,7 +625,7 @@ async function loginNasWebApiWithSpinupRetry(
   authVersion: string;
   authJson: {
     success?: boolean;
-    data?: { sid?: string };
+    data?: { sid?: string; synotoken?: string };
     error?: { code?: number };
   };
 }> {
@@ -593,12 +639,13 @@ async function loginNasWebApiWithSpinupRetry(
       passwd: password,
       session: 'NasSyncWORM',
       format: 'sid',
+      enable_syno_token: 'yes',
     });
 
   let authVersion = '6';
   let authJson: {
     success?: boolean;
-    data?: { sid?: string };
+    data?: { sid?: string; synotoken?: string };
     error?: { code?: number };
   };
 
@@ -640,6 +687,12 @@ async function loginNasWebApiWithSpinupRetry(
 
   return { authVersion, authJson };
 }
+
+type NasSnapApiResponse = {
+  success?: boolean;
+  data?: unknown;
+  error?: { code?: number; errors?: unknown };
+};
 
 async function executeNasBtrfsShareWebApi(
   baseUrlRaw: string,
@@ -687,32 +740,122 @@ async function executeNasBtrfsShareWebApi(
   }
 
   const sid = authJson.data.sid;
+  const synoToken = authJson.data.synotoken;
+  const sessionCtx = { sid, synoToken };
   const snapshotTimeoutMs = getWormSnapshotTimeoutMs();
   const processed: string[] = [];
 
   try {
     for (const share of shares) {
-      const snapParams = new URLSearchParams({
-        api: shareSnapApiName,
-        version: '2',
-        method: 'create',
-        name: share,
-        desc: `NAS-Sync Auto Immutable WORM (${retentionDays}d)`,
-        is_locked: 'true',
-        immutable: 'true',
-        immutable_days: String(retentionDays),
-        _sid: sid,
+      const desc = `NAS-Sync Auto Immutable WORM (${retentionDays}d)`;
+      const snapInfoJson = JSON.stringify({
+        desc,
+        lock: true,
+        worm_lock: true,
+        worm_lock_day: retentionDays,
       });
 
-      const snapJson = await postNasWebApiForm<{
-        success?: boolean;
-        error?: { code?: number };
-      }>(baseUrl, '/webapi/entry.cgi', snapParams, snapshotTimeoutMs);
+      const attachAuthFields = (params: URLSearchParams) => {
+        params.set('_sid', sid);
+        if (isSafeHttpHeaderToken(synoToken)) {
+          params.set('SynoToken', synoToken);
+        }
+        return params;
+      };
+
+      const buildCombinedParams = (version: string) =>
+        attachAuthFields(
+          new URLSearchParams({
+            api: shareSnapApiName,
+            version,
+            method: 'create',
+            name: share,
+            snapinfo: snapInfoJson,
+            desc,
+            lock: 'true',
+            is_locked: 'true',
+            worm_lock: 'true',
+            worm_lock_day: String(retentionDays),
+            immutable: 'true',
+            immutable_days: String(retentionDays),
+          })
+        );
+
+      // Trên firmware NAS OS 7.x, SYNO.Core.Share.Snapshot định nghĩa hàm `create` tại nhánh version=1
+      // (nhánh version=2 chỉ khai báo duy nhất hàm `list`).
+      let snapJson = await postNasWebApiForm<NasSnapApiResponse>(
+        baseUrl,
+        '/webapi/entry.cgi',
+        buildCombinedParams('1'),
+        snapshotTimeoutMs,
+        sessionCtx
+      );
+
+      // Tương thích chéo nếu firmware tương lai chuyển `create` sang nhánh version=2 (mã lỗi 103/104 ở v1)
+      if (
+        !snapJson.success &&
+        (snapJson.error?.code === 103 || snapJson.error?.code === 104)
+      ) {
+        snapJson = await postNasWebApiForm<NasSnapApiResponse>(
+          baseUrl,
+          '/webapi/entry.cgi',
+          buildCombinedParams('2'),
+          snapshotTimeoutMs,
+          sessionCtx
+        );
+      }
+
+      // Nếu parser C++ kiểm tra nghiêm ngặt danh sách tham số (mã 101/120), thử tuần tự dạng chuẩn `snapinfo` rồi dạng phẳng `worm_lock`
+      if (
+        !snapJson.success &&
+        (snapJson.error?.code === 101 || snapJson.error?.code === 120)
+      ) {
+        snapJson = await postNasWebApiForm<NasSnapApiResponse>(
+          baseUrl,
+          '/webapi/entry.cgi',
+          attachAuthFields(
+            new URLSearchParams({
+              api: shareSnapApiName,
+              version: '1',
+              method: 'create',
+              name: share,
+              snapinfo: snapInfoJson,
+            })
+          ),
+          snapshotTimeoutMs,
+          sessionCtx
+        );
+      }
+
+      if (
+        !snapJson.success &&
+        (snapJson.error?.code === 101 || snapJson.error?.code === 120)
+      ) {
+        snapJson = await postNasWebApiForm<NasSnapApiResponse>(
+          baseUrl,
+          '/webapi/entry.cgi',
+          attachAuthFields(
+            new URLSearchParams({
+              api: shareSnapApiName,
+              version: '1',
+              method: 'create',
+              name: share,
+              desc,
+              lock: 'true',
+              worm_lock: 'true',
+              worm_lock_day: String(retentionDays),
+            })
+          ),
+          snapshotTimeoutMs,
+          sessionCtx
+        );
+      }
 
       if (!snapJson.success) {
         throw new Error(
           `Tạo Btrfs Immutable Snapshot cho "${share}" thất bại (${describeNasWebApiSnapshotError(
-            snapJson.error?.code
+            snapJson.error?.code,
+            snapJson.error?.errors
           )}).`
         );
       }
@@ -730,7 +873,8 @@ async function executeNasBtrfsShareWebApi(
       baseUrl,
       '/webapi/auth.cgi',
       logoutParams,
-      DEFAULT_WORM_LOGOUT_TIMEOUT_MS
+      DEFAULT_WORM_LOGOUT_TIMEOUT_MS,
+      sessionCtx
     ).catch(() => {});
   }
 

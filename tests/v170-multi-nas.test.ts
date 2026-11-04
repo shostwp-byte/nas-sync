@@ -260,6 +260,18 @@ test('2. [v1.7.0 Universal WORM] Hỗ trợ đầy đủ TrueNAS ZFS Hold API v2
       return;
     }
     if (method === 'create') {
+      assert.equal(params.get('version'), '1');
+      assert.equal(params.get('lock'), 'true');
+      assert.equal(params.get('worm_lock'), 'true');
+      assert.equal(params.get('worm_lock_day'), '10');
+      const snapInfo = JSON.parse(params.get('snapinfo') || '{}') as {
+        lock?: boolean;
+        worm_lock?: boolean;
+        worm_lock_day?: number;
+      };
+      assert.equal(snapInfo.lock, true);
+      assert.equal(snapInfo.worm_lock, true);
+      assert.equal(snapInfo.worm_lock_day, 10);
       assert.equal(params.get('is_locked'), 'true');
       assert.equal(params.get('immutable'), 'true');
       assert.equal(params.get('immutable_days'), '10');
@@ -444,6 +456,72 @@ test('2E. [v1.7.2 WORM Timeout Separation & HDD Spin-Up Retry] Tách biệt Conn
     if (prevReqEnv === undefined) delete process.env.WORM_REQUEST_TIMEOUT_MS;
     else process.env.WORM_REQUEST_TIMEOUT_MS = prevReqEnv;
     await spinupMock.close();
+  }
+
+  // 4) NAS_WEBAPI: Hỗ trợ CSRF SynoToken (X-SYNO-TOKEN + Cookie) & tự thích ứng tham số nghiêm ngặt (mã 101 -> snapinfo-only)
+  const createPayloads: Array<{
+    version: string;
+    hasLegacyFields: boolean;
+    hasSnapInfo: boolean;
+    csrfHeader: string;
+    cookieHeader: string;
+  }> = [];
+  const strictMock = await startJsonMockServer((req, body, res) => {
+    const params = new URLSearchParams(body);
+    const method = params.get('method') || '';
+    res.setHeader('Content-Type', 'application/json');
+
+    if (req.url === '/webapi/auth.cgi' && method === 'login') {
+      assert.equal(params.get('enable_syno_token'), 'yes');
+      res.end(
+        JSON.stringify({
+          success: true,
+          data: { sid: 'v2.local.sid777', synotoken: 'csrf-tok-888' },
+        })
+      );
+      return;
+    }
+
+    if (req.url === '/webapi/entry.cgi' && method === 'create') {
+      const hasLegacyFields = params.has('immutable_days');
+      const hasSnapInfo = params.has('snapinfo');
+      createPayloads.push({
+        version: params.get('version') || '',
+        hasLegacyFields,
+        hasSnapInfo,
+        csrfHeader: String(req.headers['x-syno-token'] || ''),
+        cookieHeader: String(req.headers.cookie || ''),
+      });
+      if (hasLegacyFields) {
+        res.end(JSON.stringify({ success: false, error: { code: 101 } }));
+        return;
+      }
+      assert.equal(params.get('SynoToken'), 'csrf-tok-888');
+      res.end(JSON.stringify({ success: true }));
+      return;
+    }
+
+    res.end(JSON.stringify({ success: true }));
+  });
+
+  try {
+    setSettings({
+      worm_provider: 'NAS_WEBAPI',
+      worm_api_url: strictMock.url,
+      worm_username: 'nasadmin',
+      worm_password: 'naspassword123',
+      worm_target_shares: 'VPS_Backups_6TB',
+    });
+    const okStrict = await triggerImmutableWormSnapshot(7);
+    assert.equal(okStrict.ok, true, okStrict.message);
+    assert.equal(createPayloads.length, 2);
+    assert.equal(createPayloads[0].version, '1');
+    assert.equal(createPayloads[0].csrfHeader, 'csrf-tok-888');
+    assert.equal(createPayloads[0].cookieHeader, 'id=v2.local.sid777');
+    assert.equal(createPayloads[1].hasLegacyFields, false);
+    assert.equal(createPayloads[1].hasSnapInfo, true);
+  } finally {
+    await strictMock.close();
   }
 });
 
