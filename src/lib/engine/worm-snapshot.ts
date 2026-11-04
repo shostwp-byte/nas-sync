@@ -21,6 +21,25 @@ const SAFE_DATASET_REGEX = /^[A-Za-z0-9_.:-]+(?:\/[A-Za-z0-9_.:-]+)*$/;
 const SAFE_SHARE_REGEX = /^[A-Za-z0-9_.\- ]{1,128}$/;
 const MAX_WORM_RESPONSE_BYTES = 16 * 1024 * 1024; // 16 MiB cho danh sách ZFS snapshot lớn
 
+function readPositiveEnvMs(envKey: string, fallbackMs: number): number {
+  const raw = Number(process.env[envKey]);
+  return Number.isFinite(raw) && raw >= 50 ? Math.floor(raw) : fallbackMs;
+}
+
+function getWormConnectTimeoutMs(): number {
+  return readPositiveEnvMs('WORM_CONNECT_TIMEOUT_MS', 12_000);
+}
+
+function getWormAuthTimeoutMs(): number {
+  return readPositiveEnvMs('WORM_AUTH_TIMEOUT_MS', 45_000);
+}
+
+function getWormSnapshotTimeoutMs(): number {
+  return readPositiveEnvMs('WORM_REQUEST_TIMEOUT_MS', 120_000);
+}
+
+const DEFAULT_WORM_LOGOUT_TIMEOUT_MS = 10_000;
+
 function isLoopbackHost(rawHostname: string): boolean {
   const h = rawHostname.replace(/^\[|\]$/g, '').toLowerCase();
   return h === '127.0.0.1' || h === '::1' || h === 'localhost';
@@ -59,23 +78,98 @@ function shouldVerifyTls(): boolean {
   return !allowInsecure;
 }
 
-interface HttpRawResponse {
+export interface HttpRawResponse {
   statusCode: number;
   bodyText: string;
 }
 
-function sendHttpRequest(
+export class WormTimeoutError extends Error {
+  readonly phase: 'CONNECT' | 'EXECUTION';
+
+  constructor(phase: 'CONNECT' | 'EXECUTION', message: string) {
+    super(message);
+    this.name = 'WormTimeoutError';
+    this.phase = phase;
+  }
+}
+
+function formatHostPort(targetUrl: URL): string {
+  const defaultPort = targetUrl.protocol === 'https:' ? '443' : '80';
+  const port = targetUrl.port || defaultPort;
+  return `${targetUrl.hostname}:${port}`;
+}
+
+function mapWormNetworkError(err: unknown, targetUrl: URL): Error {
+  if (err instanceof WormTimeoutError) {
+    return err;
+  }
+  const e = err instanceof Error ? err : new Error(String(err));
+  const code = String((e as NodeJS.ErrnoException).code || '');
+  const msg = e.message || '';
+  const hostPort = formatHostPort(targetUrl);
+
+  if (
+    code === 'DEPTH_ZERO_SELF_SIGNED_CERT' ||
+    code === 'SELF_SIGNED_CERT_IN_CHAIN' ||
+    code === 'UNABLE_TO_VERIFY_LEAF_SIGNATURE' ||
+    code === 'ERR_TLS_CERT_ALTNAME_INVALID' ||
+    /self[- ]signed certificate|unable to verify the first certificate|Hostname\/IP does not match certificate/i.test(
+      msg
+    )
+  ) {
+    return new Error(
+      `Chứng chỉ HTTPS tại ${hostPort} là chứng chỉ tự ký hoặc không khớp địa chỉ IP — vui lòng bật tùy chọn "Cho phép chứng chỉ HTTPS tự ký (Self-Signed) trên mạng nội bộ LAN" trong mục Cài đặt WORM.`
+    );
+  }
+
+  if (
+    code === 'EPROTO' ||
+    code === 'ERR_SSL_WRONG_VERSION_NUMBER' ||
+    /wrong version number|unknown protocol/i.test(msg)
+  ) {
+    return new Error(
+      `Lỗi giao thức TLS tại ${hostPort} — hãy kiểm tra xem URL có đang điền nhầm cổng HTTP thường thay vì cổng HTTPS quản trị của NAS hay không.`
+    );
+  }
+
+  if (code === 'ECONNREFUSED') {
+    return new Error(
+      `Thiết bị NAS tại ${hostPort} từ chối kết nối (ECONNREFUSED — kiểm tra lại cổng HTTPS quản trị trong URL).`
+    );
+  }
+
+  if (code === 'ENOTFOUND' || code === 'EAI_AGAIN') {
+    return new Error(
+      `Không thể phân giải tên miền "${targetUrl.hostname}" từ bên trong container — hãy ưu tiên điền địa chỉ IP LAN trực tiếp của NAS (ví dụ https://192.168.1.254:5001).`
+    );
+  }
+
+  if (code === 'EHOSTUNREACH' || code === 'ENETUNREACH') {
+    return new Error(
+      `Không thể định tuyến mạng tới thiết bị NAS tại ${hostPort} (${code} — kiểm tra lại địa chỉ IP LAN hoặc cấu hình mạng Docker).`
+    );
+  }
+
+  return e;
+}
+
+export function sendWormHttpRequest(
   targetUrl: URL,
   options: {
     method: 'GET' | 'POST' | 'DELETE';
     headers?: Record<string, string | number>;
     body?: string;
+    connectTimeoutMs?: number;
     timeoutMs?: number;
   }
 ): Promise<HttpRawResponse> {
   return new Promise((resolve, reject) => {
     const isHttps = targetUrl.protocol === 'https:';
     const verifyTls = shouldVerifyTls();
+    const hostPort = formatHostPort(targetUrl);
+    const connectTimeoutMs =
+      options.connectTimeoutMs ?? getWormConnectTimeoutMs();
+    const timeoutMs = options.timeoutMs ?? getWormAuthTimeoutMs();
     const bodyBuf =
       options.body !== undefined ? Buffer.from(options.body, 'utf8') : null;
 
@@ -85,24 +179,47 @@ function sendHttpRequest(
       port: targetUrl.port || (isHttps ? 443 : 80),
       path: `${targetUrl.pathname}${targetUrl.search}`,
       method: options.method,
+      agent: false,
       headers: {
         Accept: 'application/json',
+        Connection: 'close',
         ...(bodyBuf ? { 'Content-Length': bodyBuf.byteLength } : {}),
         ...(options.headers || {}),
       },
       ...(isHttps ? { rejectUnauthorized: verifyTls } : {}),
     };
 
+    let settled = false;
+    let handshakeDone = false;
+    let activeSocket: import('node:net').Socket | null = null;
+    let connectTimer: ReturnType<typeof setTimeout> | null = null;
+    let execTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const clearAllTimers = () => {
+      if (connectTimer) {
+        clearTimeout(connectTimer);
+        connectTimer = null;
+      }
+      if (execTimer) {
+        clearTimeout(execTimer);
+        execTimer = null;
+      }
+    };
+
     const transport = isHttps ? https : http;
     const req = transport.request(reqOptions, (res) => {
+      markConnected();
       const chunks: Buffer[] = [];
       let totalBytes = 0;
 
       res.on('data', (chunk: Buffer) => {
         totalBytes += chunk.length;
         if (totalBytes > MAX_WORM_RESPONSE_BYTES) {
+          clearAllTimers();
           req.destroy(
-            new Error('Phản hồi từ dịch vụ WORM Snapshot vượt quá kích thước cho phép (16 MB).')
+            new Error(
+              'Phản hồi từ dịch vụ WORM Snapshot vượt quá kích thước cho phép (16 MB).'
+            )
           );
           return;
         }
@@ -110,25 +227,71 @@ function sendHttpRequest(
       });
 
       res.on('end', () => {
+        if (settled) return;
+        settled = true;
+        clearAllTimers();
         resolve({
           statusCode: res.statusCode ?? 0,
           bodyText: Buffer.concat(chunks).toString('utf8'),
         });
       });
+
+      res.on('error', (err) => {
+        if (settled) return;
+        settled = true;
+        clearAllTimers();
+        reject(mapWormNetworkError(err, targetUrl));
+      });
     });
 
-    const timeoutMs = options.timeoutMs ?? 15000;
-    req.setTimeout(timeoutMs, () => {
-      req.destroy(
-        new Error(
-          `Quá thời gian chờ kết nối dịch vụ WORM Snapshot (${Math.round(
-            timeoutMs / 1000
-          )} giây).`
-        )
+    const markConnected = () => {
+      if (handshakeDone || settled) return;
+      handshakeDone = true;
+      if (connectTimer) {
+        clearTimeout(connectTimer);
+        connectTimer = null;
+      }
+      execTimer = setTimeout(() => {
+        if (settled) return;
+        const execSec = Math.max(1, Math.round(timeoutMs / 1000));
+        const err = new WormTimeoutError(
+          'EXECUTION',
+          `Thiết bị NAS tại ${hostPort} đã nhận kết nối nhưng xử lý tác vụ WORM quá thời gian chờ (${execSec} giây — ổ cứng đang thức dậy từ chế độ ngủ đông hoặc phân vùng đang đồng bộ I/O lớn).`
+        );
+        req.destroy(err);
+        activeSocket?.destroy();
+      }, timeoutMs);
+    };
+
+    connectTimer = setTimeout(() => {
+      if (handshakeDone || settled) return;
+      const connectSec = Math.max(1, Math.round(connectTimeoutMs / 1000));
+      const err = new WormTimeoutError(
+        'CONNECT',
+        `Không thể mở kết nối mạng/TLS tới dịch vụ WORM tại ${hostPort} sau ${connectSec} giây (kiểm tra địa chỉ URL, cổng HTTPS hoặc Tường lửa NAS cho dải Docker).`
       );
+      req.destroy(err);
+      activeSocket?.destroy();
+    }, connectTimeoutMs);
+
+    req.on('socket', (sock) => {
+      activeSocket = sock;
+      if (isHttps) {
+        sock.once('secureConnect', markConnected);
+      } else if (!sock.connecting) {
+        markConnected();
+      } else {
+        sock.once('connect', markConnected);
+      }
     });
 
-    req.on('error', (err) => reject(err));
+    req.on('error', (err) => {
+      if (settled) return;
+      settled = true;
+      clearAllTimers();
+      reject(mapWormNetworkError(err, targetUrl));
+    });
+
     if (bodyBuf) {
       req.write(bodyBuf);
     }
@@ -210,10 +373,12 @@ async function executeTrueNasZfsWorm(
       throw new Error(`Tên ZFS Dataset không hợp lệ: "${dataset}".`);
     }
 
+    const snapshotTimeoutMs = getWormSnapshotTimeoutMs();
     const createUrl = new URL(`${baseUrl.origin}/api/v2.0/zfs/snapshot`);
-    const createRes = await sendHttpRequest(createUrl, {
+    const createRes = await sendWormHttpRequest(createUrl, {
       method: 'POST',
       headers: authHeaders,
+      timeoutMs: snapshotTimeoutMs,
       body: JSON.stringify({
         dataset,
         name: snapSuffix,
@@ -229,9 +394,10 @@ async function executeTrueNasZfsWorm(
 
     const fullSnapId = `${dataset}@${snapSuffix}`;
     const holdUrl = new URL(`${baseUrl.origin}/api/v2.0/zfs/snapshot/hold`);
-    const holdRes = await sendHttpRequest(holdUrl, {
+    const holdRes = await sendWormHttpRequest(holdUrl, {
       method: 'POST',
       headers: authHeaders,
+      timeoutMs: snapshotTimeoutMs,
       body: JSON.stringify({ id: fullSnapId }),
     });
 
@@ -247,10 +413,10 @@ async function executeTrueNasZfsWorm(
     try {
       const listUrl = new URL(`${baseUrl.origin}/api/v2.0/zfs/snapshot`);
       listUrl.searchParams.set('dataset', dataset);
-      const listRes = await sendHttpRequest(listUrl, {
+      const listRes = await sendWormHttpRequest(listUrl, {
         method: 'GET',
         headers: { Authorization: `Bearer ${apiKey}` },
-        timeoutMs: 30_000,
+        timeoutMs: getWormAuthTimeoutMs(),
       });
 
       if (listRes.statusCode >= 200 && listRes.statusCode < 300) {
@@ -271,9 +437,10 @@ async function executeTrueNasZfsWorm(
             if (!belongsToTree) continue;
 
             if (snapDataset !== dataset && suffix === snapSuffix) {
-              const childHoldRes = await sendHttpRequest(holdUrl, {
+              const childHoldRes = await sendWormHttpRequest(holdUrl, {
                 method: 'POST',
                 headers: authHeaders,
+                timeoutMs: snapshotTimeoutMs,
                 body: JSON.stringify({ id }),
               });
               if (
@@ -293,16 +460,17 @@ async function executeTrueNasZfsWorm(
             const snapDate = parseWormSnapshotSuffixDate(suffix);
             if (!snapDate || snapDate.getTime() >= cutoffMs) continue;
 
-            await sendHttpRequest(
+            await sendWormHttpRequest(
               new URL(`${baseUrl.origin}/api/v2.0/zfs/snapshot/release`),
               {
                 method: 'POST',
                 headers: authHeaders,
+                timeoutMs: getWormAuthTimeoutMs(),
                 body: JSON.stringify({ id }),
               }
             ).catch(() => {});
 
-            const delRes = await sendHttpRequest(
+            const delRes = await sendWormHttpRequest(
               new URL(
                 `${baseUrl.origin}/api/v2.0/zfs/snapshot/id/${encodeURIComponent(
                   id
@@ -311,6 +479,7 @@ async function executeTrueNasZfsWorm(
               {
                 method: 'DELETE',
                 headers: { Authorization: `Bearer ${apiKey}` },
+                timeoutMs: getWormAuthTimeoutMs(),
               }
             ).catch(() => null);
 
@@ -342,19 +511,54 @@ async function executeTrueNasZfsWorm(
   return { processed, expiredReleased };
 }
 
+function describeNasWebApiAuthError(code?: number): string {
+  switch (code) {
+    case 400:
+      return 'Sai tên tài khoản hoặc mật khẩu quản trị NAS';
+    case 401:
+      return 'Tài khoản quản trị NAS đang bị vô hiệu hóa';
+    case 402:
+      return 'Tài khoản không đủ quyền quản trị (cần thuộc nhóm administrators)';
+    case 403:
+      return 'Tài khoản quản trị đang bật xác thực 2 lớp (2FA/OTP) — vui lòng tạo tài khoản quản trị nội bộ riêng không bật OTP tương tác cho lịch tự động';
+    case 407:
+      return 'IP của container Docker đang bị Auto Block trên NAS chặn tạm thời — hãy thêm dải 172.16.0.0/12 vào Allow List trong Control Panel -> Security -> Protection';
+    default:
+      return `Mã lỗi: ${code ?? 'unknown'}`;
+  }
+}
+
+function describeNasWebApiSnapshotError(code?: number): string {
+  switch (code) {
+    case 102:
+    case 103:
+      return `Mã lỗi ${code} — Thiết bị NAS chưa cài đặt hoặc chưa bật dịch vụ Snapshot Replication`;
+    case 402:
+      return 'Mã lỗi 402 — Tài khoản không đủ quyền chụp Snapshot hoặc Shared Folder chưa nằm trên phân vùng Btrfs';
+    case 101:
+    case 3301:
+    case 3302:
+      return `Mã lỗi ${code} — Không tìm thấy Shared Folder hoặc phân vùng chưa hỗ trợ khóa Immutable WORM`;
+    default:
+      return `Mã lỗi: ${code ?? 'unknown'}`;
+  }
+}
+
 async function postNasWebApiForm<T>(
   baseUrl: URL,
   cgiPath: string,
-  params: URLSearchParams
+  params: URLSearchParams,
+  timeoutMs: number
 ): Promise<T> {
   const targetUrl = new URL(`${baseUrl.origin}${cgiPath}`);
   const body = params.toString();
-  const res = await sendHttpRequest(targetUrl, {
+  const res = await sendWormHttpRequest(targetUrl, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8',
     },
     body,
+    timeoutMs,
   });
 
   try {
@@ -364,6 +568,77 @@ async function postNasWebApiForm<T>(
       `NAS Btrfs Share WebAPI trả về dữ liệu không hợp lệ (HTTP ${res.statusCode}).`
     );
   }
+}
+
+async function loginNasWebApiWithSpinupRetry(
+  baseUrl: URL,
+  authApiName: string,
+  username: string,
+  password: string
+): Promise<{
+  authVersion: string;
+  authJson: {
+    success?: boolean;
+    data?: { sid?: string };
+    error?: { code?: number };
+  };
+}> {
+  const authTimeoutMs = getWormAuthTimeoutMs();
+  const buildAuthParams = (version: string) =>
+    new URLSearchParams({
+      api: authApiName,
+      version,
+      method: 'login',
+      account: username,
+      passwd: password,
+      session: 'NasSyncWORM',
+      format: 'sid',
+    });
+
+  let authVersion = '6';
+  let authJson: {
+    success?: boolean;
+    data?: { sid?: string };
+    error?: { code?: number };
+  };
+
+  try {
+    authJson = await postNasWebApiForm(
+      baseUrl,
+      '/webapi/auth.cgi',
+      buildAuthParams(authVersion),
+      authTimeoutMs
+    );
+  } catch (err) {
+    // Nếu TCP/TLS đã kết nối tới nginx nhưng CGI chờ ổ cứng RAID thức dậy từ chế độ ngủ đông (Hibernation) quá hạn lần 1,
+    // tự động thử lại ngay 1 lần nữa khi dàn đĩa vừa quay đủ tốc độ.
+    if (err instanceof WormTimeoutError && err.phase === 'EXECUTION') {
+      console.warn(
+        `[WORM] Bước xác thực NAS WebAPI quá hạn lần 1 khi đánh thức ổ cứng, đang tự động thử lại...`
+      );
+      authJson = await postNasWebApiForm(
+        baseUrl,
+        '/webapi/auth.cgi',
+        buildAuthParams(authVersion),
+        authTimeoutMs
+      );
+    } else {
+      throw err;
+    }
+  }
+
+  // Tương thích lùi cho các bản hệ điều hành NAS chỉ hỗ trợ Auth WebAPI v3 (trả mã lỗi 104 cho v6)
+  if (!authJson.success && authJson.error?.code === 104) {
+    authVersion = '3';
+    authJson = await postNasWebApiForm(
+      baseUrl,
+      '/webapi/auth.cgi',
+      buildAuthParams(authVersion),
+      authTimeoutMs
+    );
+  }
+
+  return { authVersion, authJson };
 }
 
 async function executeNasBtrfsShareWebApi(
@@ -396,31 +671,23 @@ async function executeNasBtrfsShareWebApi(
   const authApiName = ['SYNO', 'API', 'Auth'].join('.');
   const shareSnapApiName = ['SYNO', 'Core', 'Share', 'Snapshot'].join('.');
 
-  const authParams = new URLSearchParams({
-    api: authApiName,
-    version: '6',
-    method: 'login',
-    account: username,
-    passwd: password,
-    session: 'NasSyncWORM',
-    format: 'sid',
-  });
-
-  const authJson = await postNasWebApiForm<{
-    success?: boolean;
-    data?: { sid?: string };
-    error?: { code?: number };
-  }>(baseUrl, '/webapi/auth.cgi', authParams);
+  const { authVersion, authJson } = await loginNasWebApiWithSpinupRetry(
+    baseUrl,
+    authApiName,
+    username,
+    password
+  );
 
   if (!authJson.success || !authJson.data?.sid) {
     throw new Error(
-      `Đăng nhập NAS Share Snapshot WebAPI thất bại (Mã lỗi: ${
-        authJson.error?.code ?? 'unknown'
-      }).`
+      `Đăng nhập NAS Share Snapshot WebAPI thất bại (${describeNasWebApiAuthError(
+        authJson.error?.code
+      )}).`
     );
   }
 
   const sid = authJson.data.sid;
+  const snapshotTimeoutMs = getWormSnapshotTimeoutMs();
   const processed: string[] = [];
 
   try {
@@ -440,13 +707,13 @@ async function executeNasBtrfsShareWebApi(
       const snapJson = await postNasWebApiForm<{
         success?: boolean;
         error?: { code?: number };
-      }>(baseUrl, '/webapi/entry.cgi', snapParams);
+      }>(baseUrl, '/webapi/entry.cgi', snapParams, snapshotTimeoutMs);
 
       if (!snapJson.success) {
         throw new Error(
-          `Tạo Btrfs Immutable Snapshot cho "${share}" thất bại (Mã lỗi: ${
-            snapJson.error?.code ?? 'unknown'
-          }).`
+          `Tạo Btrfs Immutable Snapshot cho "${share}" thất bại (${describeNasWebApiSnapshotError(
+            snapJson.error?.code
+          )}).`
         );
       }
       processed.push(share);
@@ -454,14 +721,17 @@ async function executeNasBtrfsShareWebApi(
   } finally {
     const logoutParams = new URLSearchParams({
       api: authApiName,
-      version: '6',
+      version: authVersion,
       method: 'logout',
       session: 'NasSyncWORM',
       _sid: sid,
     });
-    await postNasWebApiForm(baseUrl, '/webapi/auth.cgi', logoutParams).catch(
-      () => {}
-    );
+    await postNasWebApiForm(
+      baseUrl,
+      '/webapi/auth.cgi',
+      logoutParams,
+      DEFAULT_WORM_LOGOUT_TIMEOUT_MS
+    ).catch(() => {});
   }
 
   return processed;
@@ -507,10 +777,11 @@ async function executeCustomWormWebhook(
     headers['Authorization'] = `Bearer ${apiKey}`;
   }
 
-  const res = await sendHttpRequest(targetUrl, {
+  const res = await sendWormHttpRequest(targetUrl, {
     method: 'POST',
     headers,
     body: rawBody,
+    timeoutMs: getWormSnapshotTimeoutMs(),
   });
 
   if (res.statusCode < 200 || res.statusCode >= 300) {

@@ -36,6 +36,8 @@ services:
       - seccomp:unconfined
     ports:
       - "${APP_HOST_PORT:-3080}:3000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       - NODE_ENV=production
       - TZ=Asia/Ho_Chi_Minh

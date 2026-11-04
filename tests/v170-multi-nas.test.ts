@@ -53,7 +53,11 @@ function startJsonMockServer(
       const port = typeof addr === 'object' && addr ? addr.port : 0;
       resolve({
         url: `http://127.0.0.1:${port}`,
-        close: () => new Promise((r) => srv.close(() => r())),
+        close: () =>
+          new Promise((r) => {
+            srv.closeAllConnections?.();
+            srv.close(() => r());
+          }),
       });
     });
   });
@@ -284,6 +288,162 @@ test('2. [v1.7.0 Universal WORM] Hỗ trợ đầy đủ TrueNAS ZFS Hold API v2
     ]);
   } finally {
     await webApiMock.close();
+  }
+});
+
+test('2E. [v1.7.2 WORM Timeout Separation & HDD Spin-Up Retry] Tách biệt Connect/TLS Timeout với Execution Timeout, tự động thử lại khi đánh thức HDD ngủ đông & giải thích mã lỗi 2FA/AutoBlock', async () => {
+  const net = await import('node:net');
+  const { setSettings } = await import('../src/lib/db');
+  const {
+    WormTimeoutError,
+    sendWormHttpRequest,
+    triggerImmutableWormSnapshot,
+  } = await import('../src/lib/engine/worm-snapshot');
+
+  // 1) Kết nối TCP thành công ngay (< 50ms), máy chủ xử lý 260ms (> connectTimeoutMs=120ms nhưng < timeoutMs=900ms) -> PHẢI THÀNH CÔNG
+  const slowExecSrv = await startJsonMockServer((_req, _body, res) => {
+    setTimeout(() => {
+      res.statusCode = 200;
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({ ok: true }));
+    }, 260);
+  });
+  try {
+    const okSlow = await sendWormHttpRequest(new URL(slowExecSrv.url), {
+      method: 'GET',
+      connectTimeoutMs: 120,
+      timeoutMs: 900,
+    });
+    assert.equal(okSlow.statusCode, 200);
+
+    // Nếu xử lý vượt quá timeoutMs -> ném WormTimeoutError pha EXECUTION
+    await assert.rejects(
+      () =>
+        sendWormHttpRequest(new URL(slowExecSrv.url), {
+          method: 'GET',
+          connectTimeoutMs: 120,
+          timeoutMs: 100,
+        }),
+      (err: unknown) =>
+        err instanceof WormTimeoutError &&
+        err.phase === 'EXECUTION' &&
+        /đã nhận kết nối nhưng xử lý tác vụ WORM quá thời gian chờ/.test(
+          err.message
+        )
+    );
+  } finally {
+    await slowExecSrv.close();
+  }
+
+  // 2) Máy chủ TCP nhận kết nối nhưng không trả lời TLS ServerHello -> ném WormTimeoutError pha CONNECT
+  const bhSockets = new Set<import('node:net').Socket>();
+  const blackholeTls = net.createServer((sock) => {
+    bhSockets.add(sock);
+    sock.on('close', () => bhSockets.delete(sock));
+    sock.on('error', () => {});
+  });
+  await new Promise<void>((r) => blackholeTls.listen(0, '127.0.0.1', () => r()));
+  const bhPort = (blackholeTls.address() as { port: number }).port;
+  try {
+    setSettings({ worm_tls_insecure: 'true' });
+    await assert.rejects(
+      () =>
+        sendWormHttpRequest(new URL(`https://127.0.0.1:${bhPort}/webapi/auth.cgi`), {
+          method: 'POST',
+          connectTimeoutMs: 150,
+          timeoutMs: 2000,
+        }),
+      (err: unknown) =>
+        err instanceof WormTimeoutError &&
+        err.phase === 'CONNECT' &&
+        /Không thể mở kết nối mạng\/TLS tới dịch vụ WORM/.test(err.message)
+    );
+  } finally {
+    for (const s of bhSockets) s.destroy();
+    await new Promise<void>((r) => blackholeTls.close(() => r()));
+  }
+
+  // 3) NAS_WEBAPI: Tự động retry khi auth.cgi lần 1 quá hạn do HDD đang thức dậy + fallback v6 -> v3 (mã 104) + snapshot xử lý lâu hơn authTimeout
+  let loginAttempts = 0;
+  let forceErrorCode: number | null = null;
+  const spinupMock = await startJsonMockServer((req, body, res) => {
+    const params = new URLSearchParams(body);
+    const method = params.get('method') || '';
+    const ver = params.get('version') || '';
+    res.setHeader('Content-Type', 'application/json');
+
+    if (req.url === '/webapi/auth.cgi' && method === 'login') {
+      loginAttempts += 1;
+      if (forceErrorCode !== null) {
+        res.end(
+          JSON.stringify({ success: false, error: { code: forceErrorCode } })
+        );
+        return;
+      }
+      if (loginAttempts === 1) {
+        // Giả lập ổ cứng RAID đang ngủ đông lúc 06:00 AM làm lần login đầu vượt quá WORM_AUTH_TIMEOUT_MS (120ms)
+        setTimeout(() => {
+          res.end(JSON.stringify({ success: true, data: { sid: 'late-sid' } }));
+        }, 280);
+        return;
+      }
+      if (ver === '6') {
+        res.end(JSON.stringify({ success: false, error: { code: 104 } }));
+        return;
+      }
+      assert.equal(ver, '3');
+      res.end(JSON.stringify({ success: true, data: { sid: 'spinup-sid-v3' } }));
+      return;
+    }
+
+    if (req.url === '/webapi/entry.cgi' && method === 'create') {
+      // Tạo Btrfs Immutable Snapshot mất 220ms (> WORM_AUTH_TIMEOUT_MS=120ms nhưng < WORM_REQUEST_TIMEOUT_MS=1200ms)
+      setTimeout(() => {
+        res.end(JSON.stringify({ success: true }));
+      }, 220);
+      return;
+    }
+
+    res.end(JSON.stringify({ success: true }));
+  });
+
+  const prevAuthEnv = process.env.WORM_AUTH_TIMEOUT_MS;
+  const prevReqEnv = process.env.WORM_REQUEST_TIMEOUT_MS;
+  process.env.WORM_AUTH_TIMEOUT_MS = '120';
+  process.env.WORM_REQUEST_TIMEOUT_MS = '1200';
+  try {
+    setSettings({
+      worm_provider: 'NAS_WEBAPI',
+      worm_api_url: spinupMock.url,
+      worm_username: 'nasadmin',
+      worm_password: 'naspassword123',
+      worm_target_shares: 'VPS_Backups',
+    });
+
+    const okSpinup = await triggerImmutableWormSnapshot(7);
+    assert.equal(okSpinup.ok, true, okSpinup.message);
+    assert.equal(
+      loginAttempts,
+      3,
+      'Phải gồm: lần 1 timeout khi đánh thức HDD -> lần 2 v6 báo 104 -> lần 3 fallback v3 thành công'
+    );
+
+    // Kiểm tra thông báo hướng dẫn chi tiết cho mã lỗi 403 (2FA/OTP) và 407 (Auto Block)
+    forceErrorCode = 403;
+    const err2fa = await triggerImmutableWormSnapshot(7);
+    assert.equal(err2fa.ok, false);
+    assert.match(err2fa.message, /2FA\/OTP/);
+
+    forceErrorCode = 407;
+    const errAutoBlock = await triggerImmutableWormSnapshot(7);
+    assert.equal(errAutoBlock.ok, false);
+    assert.match(errAutoBlock.message, /Auto Block/);
+  } finally {
+    if (prevAuthEnv === undefined) delete process.env.WORM_AUTH_TIMEOUT_MS;
+    else process.env.WORM_AUTH_TIMEOUT_MS = prevAuthEnv;
+    if (prevReqEnv === undefined) delete process.env.WORM_REQUEST_TIMEOUT_MS;
+    else process.env.WORM_REQUEST_TIMEOUT_MS = prevReqEnv;
+    await spinupMock.close();
   }
 });
 

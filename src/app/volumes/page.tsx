@@ -20,7 +20,10 @@ export default function VolumesPage() {
   const [loading, setLoading] = useState(true);
   const [showAdd, setShowAdd] = useState(false);
   const [wormLoading, setWormLoading] = useState(false);
-  const [wormMsg, setWormMsg] = useState('');
+  const [wormBanner, setWormBanner] = useState<{
+    ok: boolean;
+    message: string;
+  } | null>(null);
 
   const [form, setForm] = useState({
     name: 'NAS Volume 3',
@@ -105,17 +108,30 @@ export default function VolumesPage() {
 
   const triggerWormSnapshot = async () => {
     setWormLoading(true);
-    setWormMsg('');
+    setWormBanner(null);
     try {
       const resp = await fetch('/api/volumes/snapshot', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({}),
       });
-      const data = await resp.json();
-      setWormMsg(
-        data.message || 'Đã gửi yêu cầu chụp OS-Level Immutable WORM Snapshot.'
-      );
+      const data = await resp.json().catch(() => ({}));
+      const isOk = resp.ok && data.ok !== false;
+      setWormBanner({
+        ok: isOk,
+        message:
+          data.message ||
+          data.error ||
+          (isOk
+            ? 'Đã gửi yêu cầu chụp OS-Level Immutable WORM Snapshot.'
+            : 'Không thể tạo OS-Level WORM Snapshot.'),
+      });
+    } catch {
+      setWormBanner({
+        ok: false,
+        message:
+          'Mất kết nối trình duyệt tới máy chủ khi chờ tạo WORM Snapshot.',
+      });
     } finally {
       setWormLoading(false);
     }
@@ -181,10 +197,20 @@ export default function VolumesPage() {
         </div>
       </div>
 
-      {wormMsg && (
-        <div className="p-4 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-xs text-emerald-200 flex items-center gap-2">
-          <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" />
-          <span className="break-words">{wormMsg}</span>
+      {wormBanner && (
+        <div
+          className={`p-4 rounded-xl text-xs flex items-start gap-2.5 border ${
+            wormBanner.ok
+              ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-200'
+              : 'bg-rose-500/10 border-rose-500/30 text-rose-200'
+          }`}
+        >
+          {wormBanner.ok ? (
+            <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+          ) : (
+            <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+          )}
+          <span className="break-words leading-relaxed">{wormBanner.message}</span>
         </div>
       )}
 

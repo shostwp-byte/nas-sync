@@ -2,6 +2,17 @@
 
 Mọi thay đổi đáng chú ý của dự án **NAS-Sync** (<https://github.com/shostwp-byte/nas-sync>) đều được ghi nhận tại tài liệu này theo chuẩn [Keep a Changelog](https://keepachangelog.com/vi/1.1.0/) và [Semantic Versioning](https://semver.org/).
 
+## [1.7.2] - 2026-11-04
+
+### Fixed & Improved (Gia cố Độ tin cậy Lịch Khóa WORM Snapshot 06:00 AM & Chẩn đoán Trực tiếp)
+- **Tách biệt Timeout Kết nối Mạng/TLS và Timeout Thực thi WORM (`worm-snapshot.ts`)**:
+  - Tách bộ đếm thời gian chờ mở kết nối TCP/TLS (`12 giây` — phát hiện nhanh lỗi sai cổng hoặc Tường lửa NAS chặn dải mạng Docker) khỏi bộ đếm thời gian chờ xử lý tác vụ trên NAS (`45 giây` cho bước xác thực và **`120 giây`** cho bước đồng bộ & khóa cứng Btrfs/ZFS/Webhook WORM Snapshot), chấm dứt lỗi báo quá hạn `15 giây` giả khi dàn ổ cứng RAID thức dậy từ chế độ ngủ đông (HDD Hibernation) lúc 06:00 sáng hoặc khi phân vùng lưu trữ có dung lượng lớn.
+  - Sử dụng kết nối HTTP/HTTPS độc lập (`agent: false`, `Connection: close`) cho từng truy vấn WORM để tránh kẹt socket Keep-Alive cũ và áp dụng tức thì cấu hình kiểm tra chứng chỉ TLS mới nhất.
+  - Tự động thử lại bước đăng nhập `NAS_WEBAPI` khi dàn ổ cứng đang quay khởi động lần đầu, tự động tương thích lùi Auth WebAPI `v6 -> v3` (mã `104`), và dịch chi tiết các lỗi mạng/TLS tự ký cũng như mã lỗi WebAPI (`400`, `402`, `403` 2FA/OTP, `407` Auto Block) sang hướng dẫn tiếng Việt cụ thể.
+- **Nút Lưu & Chụp thử WORM Snapshot Trực tiếp & Hiển thị Trạng thái Chính xác (`src/app/settings/page.tsx`, `src/app/volumes/page.tsx`, `docker-compose.yml`)**:
+  - Bổ sung nút **"Lưu & Chụp thử WORM Snapshot ngay"** ngay trong thẻ cấu hình WORM tại trang Cài đặt và sửa màu cảnh báo đỏ (`AlertTriangle`) khi chụp thử thất bại trên trang Phân vùng Lưu trữ.
+  - Khai báo sẵn `extra_hosts: ["host.docker.internal:host-gateway"]` cho dịch vụ `nas_sync_core` trong `docker-compose.yml`.
+
 ## [1.7.1] - 2026-11-03
 
 ### Security & Reliability Hardening (Xử lý Triệt để Bản Đánh giá An ninh & Độ tin cậy Lần 3)

@@ -156,6 +156,11 @@ export default function SettingsPage() {
   const [showTelegramToken, setShowTelegramToken] = useState(false);
   const [showSmtpPass, setShowSmtpPass] = useState(false);
   const [showWormSecret, setShowWormSecret] = useState(false);
+  const [testingWorm, setTestingWorm] = useState(false);
+  const [wormTestResult, setWormTestResult] = useState<{
+    ok: boolean;
+    message: string;
+  } | null>(null);
 
   // Daily Morning Digest State (Tab 1)
   const [testingDigest, setTestingDigest] = useState(false);
@@ -547,6 +552,51 @@ export default function SettingsPage() {
       }
     } finally {
       setSaving(false);
+    }
+  };
+
+  const handleSaveAndTestWorm = async () => {
+    setTestingWorm(true);
+    setWormTestResult(null);
+    try {
+      const saveResp = await fetch('/api/settings', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ settings }),
+      });
+      if (!saveResp.ok) {
+        const errJson = await saveResp.json().catch(() => ({}));
+        setWormTestResult({
+          ok: false,
+          message: errJson.error || 'Không thể lưu cấu hình WORM trước khi kiểm tra.',
+        });
+        return;
+      }
+      await loadAdminSettings();
+
+      const snapResp = await fetch('/api/volumes/snapshot', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      const snapJson = await snapResp.json().catch(() => ({}));
+      const isOk = snapResp.ok && snapJson.ok !== false;
+      setWormTestResult({
+        ok: isOk,
+        message:
+          snapJson.message ||
+          snapJson.error ||
+          (isOk
+            ? 'Đã chụp khóa WORM Snapshot thành công.'
+            : 'Không thể chụp khóa WORM Snapshot.'),
+      });
+    } catch {
+      setWormTestResult({
+        ok: false,
+        message: 'Lỗi kết nối trình duyệt khi kiểm tra dịch vụ WORM Snapshot.',
+      });
+    } finally {
+      setTestingWorm(false);
     }
   };
 
@@ -2954,6 +3004,41 @@ export default function SettingsPage() {
                             nội bộ LAN (Mặc định tắt — kiểm tra TLS nghiêm ngặt)
                           </span>
                         </label>
+
+                        <div className="pt-2 border-t border-slate-800/80 space-y-2.5">
+                          <button
+                            type="button"
+                            onClick={() => void handleSaveAndTestWorm()}
+                            disabled={testingWorm || saving}
+                            className="w-full sm:w-auto min-h-[40px] inline-flex items-center justify-center gap-2 px-4 py-2 rounded-lg text-xs font-medium bg-emerald-600/20 hover:bg-emerald-600 text-emerald-300 hover:text-white border border-emerald-500/30 transition-colors disabled:opacity-50"
+                          >
+                            <Lock className="w-3.5 h-3.5 shrink-0" />
+                            <span>
+                              {testingWorm
+                                ? 'Đang lưu & chụp thử WORM Snapshot (chờ tối đa 120s)...'
+                                : 'Lưu & Chụp thử WORM Snapshot ngay'}
+                            </span>
+                          </button>
+
+                          {wormTestResult && (
+                            <div
+                              className={`p-3 rounded-xl text-xs flex items-start gap-2 border ${
+                                wormTestResult.ok
+                                  ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-200'
+                                  : 'bg-rose-500/10 border-rose-500/30 text-rose-200'
+                              }`}
+                            >
+                              {wormTestResult.ok ? (
+                                <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+                              ) : (
+                                <ShieldAlert className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+                              )}
+                              <span className="break-words leading-relaxed">
+                                {wormTestResult.message}
+                              </span>
+                            </div>
+                          )}
+                        </div>
                       </>
                     )}
                   </div>
