@@ -257,9 +257,28 @@ trap - EXIT
 # Dọn bản live_release cũ để ưu tiên Docker Image mới vừa build
 rm -rf ./app_data/live_release/current
 
-# 3. Build lại Docker Image và khởi động không gián đoạn dữ liệu
+# 3. Tự động nhận diện tên Compose Project hiện có (nếu khởi tạo qua Container Manager / Portainer GUI) để tránh xung đột container_name
+EXISTING_PROJECT=""
+for cname in nas_sync_core nas_sync_redis nas_sync_sandbox; do
+  if [ -z "$EXISTING_PROJECT" ]; then
+    EXISTING_PROJECT="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$cname" 2>/dev/null || true)"
+  fi
+done
+
 echo "🚀 Đang biên dịch lại Docker Image (${TARGET_LABEL}) & khởi động dịch vụ NAS-Sync..."
-$COMPOSE_CMD up -d --build
+if [ -n "$EXISTING_PROJECT" ]; then
+  if ! $COMPOSE_CMD -p "$EXISTING_PROJECT" up -d --build; then
+    echo "ℹ️  Đang dọn container cũ bị trùng tên để khởi tạo lại trên project '${EXISTING_PROJECT}' (giữ nguyên 100% dữ liệu)..."
+    docker rm -f nas_sync_core nas_sync_sandbox nas_sync_redis 2>/dev/null || true
+    $COMPOSE_CMD -p "$EXISTING_PROJECT" up -d --build
+  fi
+else
+  if ! $COMPOSE_CMD up -d --build; then
+    echo "ℹ️  Đang dọn container cũ bị trùng tên để khởi tạo lại (giữ nguyên 100% dữ liệu)..."
+    docker rm -f nas_sync_core nas_sync_sandbox nas_sync_redis 2>/dev/null || true
+    $COMPOSE_CMD up -d --build
+  fi
+fi
 
 echo ""
 echo "✅ CẬP NHẬT HOÀN TẤT! Phiên bản ${TARGET_LABEL} từ $REPO_URL đã sẵn sàng hoạt động."
