@@ -7,6 +7,7 @@ if (set -o pipefail) 2>/dev/null; then
   set -o pipefail
 fi
 
+main() {
 REPO_OWNER="${GITHUB_REPO_OWNER:-shostwp-byte}"
 REPO_NAME="${GITHUB_REPO_NAME:-nas-sync}"
 REPO_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}.git"
@@ -61,47 +62,78 @@ verify_ed25519_bundle_signature() {
   fi
 
   local payload_str="nas-sync-bundle-v1|${clean_tag}|${actual_sha}"
+  local node_verify_js='
+    try {
+      var crypto = require("crypto");
+      if (typeof crypto.verify !== "function" || typeof crypto.createPublicKey !== "function") {
+        process.exit(20);
+      }
+      var pubPem = String(process.env.NAS_PUB_PEM || "").replace(/\\n/g, "\n").trim();
+      var payload = Buffer.from(String(process.env.NAS_PAYLOAD || ""), "utf8");
+      var sigB64 = String(process.env.NAS_SIG_B64 || "").trim();
+      if (!/^[A-Za-z0-9+/=]+$/.test(sigB64)) process.exit(10);
+      var sig = Buffer.from(sigB64, "base64");
+      if (sig.length !== 64) process.exit(10);
+      var pubKey = crypto.createPublicKey(pubPem);
+      var ok = crypto.verify(null, payload, pubKey, sig);
+      process.exit(ok ? 0 : 10);
+    } catch (e) {
+      process.exit(20);
+    }
+  '
+  local rc=0
 
+  # 1. Thử bằng Node.js trên host (tương thích Node >= 12 không cần tiền tố node:crypto; nếu Node quá cũ trả mã 20 để chuyển tiếp)
   if command -v node >/dev/null 2>&1; then
-    NAS_PUB_PEM="$ACTIVE_PUBKEY_PEM" NAS_PAYLOAD="$payload_str" NAS_SIG_B64="$sig_b64" node -e '
-      const crypto = require("node:crypto");
-      const pubPem = String(process.env.NAS_PUB_PEM || "").replace(/\\n/g, "\n").trim();
-      const payload = Buffer.from(String(process.env.NAS_PAYLOAD || ""), "utf8");
-      const sigB64 = String(process.env.NAS_SIG_B64 || "").trim();
-      if (!/^[A-Za-z0-9+/=]+$/.test(sigB64)) process.exit(1);
-      const sig = Buffer.from(sigB64, "base64");
-      if (sig.length !== 64) process.exit(1);
-      const ok = crypto.verify(null, payload, crypto.createPublicKey(pubPem), sig);
-      process.exit(ok ? 0 : 1);
-    '
-    return $?
+    rc=0
+    NAS_PUB_PEM="$ACTIVE_PUBKEY_PEM" NAS_PAYLOAD="$payload_str" NAS_SIG_B64="$sig_b64" node -e "$node_verify_js" 2>/dev/null || rc=$?
+    if [ "$rc" -eq 0 ]; then
+      return 0
+    elif [ "$rc" -eq 10 ]; then
+      return 1
+    fi
   fi
 
-  if command -v openssl >/dev/null 2>&1; then
+  # 2. Thử trực tiếp qua Node.js hiện đại bên trong container nas_sync_core đang chạy (tức thì, không phụ thuộc gói trên host NAS)
+  if command -v docker >/dev/null 2>&1 && [ "$(docker inspect -f '{{.State.Running}}' nas_sync_core 2>/dev/null || true)" = "true" ]; then
+    rc=0
+    docker exec \
+      -e NAS_PUB_PEM="$ACTIVE_PUBKEY_PEM" \
+      -e NAS_PAYLOAD="$payload_str" \
+      -e NAS_SIG_B64="$sig_b64" \
+      nas_sync_core node -e "$node_verify_js" 2>/dev/null || rc=$?
+    if [ "$rc" -eq 0 ]; then
+      return 0
+    elif [ "$rc" -eq 10 ]; then
+      return 1
+    fi
+  fi
+
+  # 3. Thử bằng OpenSSL trên host nếu hỗ trợ đầy đủ cả khóa Ed25519 lẫn cờ -rawin (tránh báo sai trên OpenSSL 1.0.2/1.1.1 cũ của NAS)
+  if command -v openssl >/dev/null 2>&1 && openssl pkeyutl -help 2>&1 | grep -q -- '-rawin'; then
     printf '%s\n' "$ACTIVE_PUBKEY_PEM" > "$work_dir/pubkey.pem"
     printf '%s' "$payload_str" > "$work_dir/payload.bin"
-    if printf '%s' "$sig_b64" | openssl base64 -d -A -out "$work_dir/sig.bin" 2>/dev/null; then
+    if openssl pkey -pubin -in "$work_dir/pubkey.pem" -noout >/dev/null 2>&1 && \
+       printf '%s' "$sig_b64" | openssl base64 -d -A -out "$work_dir/sig.bin" 2>/dev/null; then
       if openssl pkeyutl -verify -pubin -inkey "$work_dir/pubkey.pem" -rawin -in "$work_dir/payload.bin" -sigfile "$work_dir/sig.bin" >/dev/null 2>&1; then
         return 0
       fi
+      return 1
     fi
-    return 1
   fi
 
+  # 4. Dự phòng cô lập mạng bằng image node:24-alpine chuẩn
   if command -v docker >/dev/null 2>&1; then
+    rc=0
     docker run --rm --network none \
       -e NAS_PUB_PEM="$ACTIVE_PUBKEY_PEM" \
       -e NAS_PAYLOAD="$payload_str" \
       -e NAS_SIG_B64="$sig_b64" \
-      node:24-alpine node -e '
-        const crypto = require("node:crypto");
-        const pubPem = String(process.env.NAS_PUB_PEM || "").replace(/\\n/g, "\n").trim();
-        const payload = Buffer.from(String(process.env.NAS_PAYLOAD || ""), "utf8");
-        const sig = Buffer.from(String(process.env.NAS_SIG_B64 || "").trim(), "base64");
-        if (sig.length !== 64) process.exit(1);
-        process.exit(crypto.verify(null, payload, crypto.createPublicKey(pubPem), sig) ? 0 : 1);
-      '
-    return $?
+      node:24-alpine node -e "$node_verify_js" 2>/dev/null || rc=$?
+    if [ "$rc" -eq 0 ]; then
+      return 0
+    fi
+    return 1
   fi
 
   return 1
@@ -167,16 +199,21 @@ else
     exit 1
   fi
 
+  ACTUAL_SHA=""
   if command -v sha256sum >/dev/null 2>&1; then
-    ACTUAL_SHA=$(sha256sum "$TMP_UPDATE/bundle.tar.gz" | awk '{print tolower($1)}')
-  elif command -v shasum >/dev/null 2>&1; then
-    ACTUAL_SHA=$(shasum -a 256 "$TMP_UPDATE/bundle.tar.gz" | awk '{print tolower($1)}')
-  elif command -v node >/dev/null 2>&1; then
-    ACTUAL_SHA=$(node -e 'const fs=require("node:fs"),crypto=require("node:crypto");process.stdout.write(crypto.createHash("sha256").update(fs.readFileSync(process.argv[1])).digest("hex"));' "$TMP_UPDATE/bundle.tar.gz")
-  elif command -v openssl >/dev/null 2>&1; then
-    ACTUAL_SHA=$(openssl dgst -sha256 "$TMP_UPDATE/bundle.tar.gz" | awk '{print tolower($NF)}')
-  else
-    echo "[LỖI] Không tìm thấy công cụ tính băm SHA-256 (sha256sum / shasum / node / openssl). Đã hủy cập nhật."
+    ACTUAL_SHA=$(sha256sum "$TMP_UPDATE/bundle.tar.gz" 2>/dev/null | awk '{print tolower($1)}' || true)
+  fi
+  if [ -z "$ACTUAL_SHA" ] && command -v shasum >/dev/null 2>&1; then
+    ACTUAL_SHA=$(shasum -a 256 "$TMP_UPDATE/bundle.tar.gz" 2>/dev/null | awk '{print tolower($1)}' || true)
+  fi
+  if [ -z "$ACTUAL_SHA" ] && command -v openssl >/dev/null 2>&1; then
+    ACTUAL_SHA=$(openssl dgst -sha256 "$TMP_UPDATE/bundle.tar.gz" 2>/dev/null | awk '{print tolower($NF)}' || true)
+  fi
+  if [ -z "$ACTUAL_SHA" ] && command -v node >/dev/null 2>&1; then
+    ACTUAL_SHA=$(node -e 'var fs=require("fs"),crypto=require("crypto");process.stdout.write(crypto.createHash("sha256").update(fs.readFileSync(process.argv[1])).digest("hex"));' "$TMP_UPDATE/bundle.tar.gz" 2>/dev/null || true)
+  fi
+  if [ -z "$ACTUAL_SHA" ]; then
+    echo "[LỖI] Không tìm thấy công cụ tính băm SHA-256 (sha256sum / shasum / openssl / node). Đã hủy cập nhật."
     exit 1
   fi
 
@@ -226,3 +263,7 @@ $COMPOSE_CMD up -d --build
 
 echo ""
 echo "✅ CẬP NHẬT HOÀN TẤT! Phiên bản ${TARGET_LABEL} từ $REPO_URL đã sẵn sàng hoạt động."
+}
+
+main "$@"
+exit $?

@@ -1,7 +1,7 @@
 # 🛡️ NAS-Sync — Open-Source Universal Multi-NAS & Docker Backup/Migration Platform
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-emerald.svg)](https://github.com/shostwp-byte/nas-sync/blob/main/LICENSE)
-[![Version](https://img.shields.io/badge/version-1.7.2-blue.svg)](https://github.com/shostwp-byte/nas-sync/releases)
+[![Version](https://img.shields.io/badge/version-1.7.3-blue.svg)](https://github.com/shostwp-byte/nas-sync/releases)
 [![Multi-Arch](https://img.shields.io/badge/Docker-amd64%20%7C%20arm64-2496ED.svg)](https://github.com/shostwp-byte/nas-sync/pkgs/container/nas-sync)
 [![Filesystems](https://img.shields.io/badge/Storage-ZFS%20%7C%20Btrfs%20%7C%20Ext4%20%7C%20XFS-0ea5e9.svg)](https://github.com/shostwp-byte/nas-sync)
 [![Signed Releases](https://img.shields.io/badge/Updater-Ed25519%20Signed-10b981.svg)](https://github.com/shostwp-byte/nas-sync/releases)

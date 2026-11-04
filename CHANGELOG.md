@@ -2,6 +2,13 @@
 
 Mọi thay đổi đáng chú ý của dự án **NAS-Sync** (<https://github.com/shostwp-byte/nas-sync>) đều được ghi nhận tại tài liệu này theo chuẩn [Keep a Changelog](https://keepachangelog.com/vi/1.1.0/) và [Semantic Versioning](https://semver.org/).
 
+## [1.7.3] - 2026-11-04
+
+### Fixed (Tương thích Trình Cập nhật CLI `update.sh` trên Hệ điều hành Gốc NAS Cũ)
+- **Chuỗi Xác thực Chữ ký `Ed25519` Đa Tầng Không Phụ thuộc Gói Host Cũ (`update.sh`)**:
+  - Loại bỏ tiền tố `node:crypto` / `node:fs` (gây lỗi trên các thiết bị NAS cài sẵn gói Node.js v12 trên host) và tự động chuyển tiếp liền mạch qua chuỗi xác thực: **Host `node` (≥ v12)** → **Container `nas_sync_core` đang chạy (`docker exec`)** → **Host `openssl` (kiểm tra trước cờ `-rawin` & khóa SPKI Ed25519)** → **`docker run --network none node:24-alpine`**, giữ nguyên nguyên tắc Fail-Closed trước mọi chữ ký giả mạo.
+  - Bọc toàn bộ kịch bản `update.sh` trong hàm `main() { ... }` để việc tự ghi đè `./update.sh` trong lúc cập nhật không bao giờ làm lệch con trỏ đọc kịch bản của tiến trình Bash đang chạy.
+
 ## [1.7.2] - 2026-11-04
 
 ### Fixed & Improved (Gia cố Độ tin cậy Lịch Khóa WORM Snapshot 06:00 AM & Chẩn đoán Trực tiếp)

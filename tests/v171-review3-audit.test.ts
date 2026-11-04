@@ -602,7 +602,72 @@ test('4. [Wave 5 & 7 — U6..U16] Khóa công khai Ed25519 dùng chung, ký số
         0,
         'update.sh bắt buộc phải từ chối fail-closed khi chữ ký Ed25519 giả mạo'
       );
+
+      // v1.7.3: Giả lập hệ điều hành gốc của NAS cài sẵn bản node quá cũ (có sha256 nhưng chưa có Ed25519 crypto.verify -> trả mã 20) —
+      // update.sh phải tự động chuyển tiếp sang openssl kế tiếp mà vẫn từ chối chữ ký giả.
+      const hasUsableOpenssl =
+        spawnSync(
+          bashBin,
+          [
+            '-c',
+            'command -v openssl >/dev/null 2>&1 && openssl pkeyutl -help 2>&1 | grep -q -- "-rawin"',
+          ],
+          { windowsHide: true }
+        ).status === 0;
+
+      if (hasUsableOpenssl) {
+        const fakeOldBin = fs.mkdtempSync(
+          path.join(tempRoot, 'fake-old-node-')
+        );
+        fs.writeFileSync(
+          path.join(fakeOldBin, 'node'),
+          '#!/bin/sh\nexit 20\n',
+          { mode: 0o755 }
+        );
+        fs.writeFileSync(
+          path.join(fakeOldBin, 'node.cmd'),
+          '@echo off\r\nexit /b 20\r\n'
+        );
+        const existingPathVal =
+          process.env.PATH || process.env.Path || '';
+        const mergedEnv: NodeJS.ProcessEnv = { ...process.env };
+        for (const k of Object.keys(mergedEnv)) {
+          if (k.toLowerCase() === 'path') {
+            delete mergedEnv[k];
+          }
+        }
+        mergedEnv.PATH = `${fakeOldBin}${path.delimiter}${existingPathVal}`;
+
+        activeServeDir = relDir;
+        const fallbackVerify = await runAsyncSh({
+          ...mergedEnv,
+          NAS_SYNC_UPDATE_VERIFY_ONLY: '1',
+          NAS_SYNC_RELEASE_BASE_URL_OVERRIDE: baseUrl,
+          NAS_SYNC_RELEASE_TAG_OVERRIDE: 'v1.7.1',
+          NAS_SYNC_RELEASE_PUBLIC_KEY_PEM: pubPem,
+        });
+        assert.equal(
+          fallbackVerify.status,
+          0,
+          `update.sh phải tự động chuyển tiếp sang bộ xác thực dự phòng khi node trên NAS quá cũ (stderr: ${fallbackVerify.stderr}, stdout: ${fallbackVerify.stdout})`
+        );
+
+        activeServeDir = badDir;
+        const fallbackBadVerify = await runAsyncSh({
+          ...mergedEnv,
+          NAS_SYNC_UPDATE_VERIFY_ONLY: '1',
+          NAS_SYNC_RELEASE_BASE_URL_OVERRIDE: baseUrl,
+          NAS_SYNC_RELEASE_TAG_OVERRIDE: 'v1.7.1',
+          NAS_SYNC_RELEASE_PUBLIC_KEY_PEM: pubPem,
+        });
+        assert.notEqual(
+          fallbackBadVerify.status,
+          0,
+          'Khi chuyển tiếp sang bộ xác thực dự phòng, chữ ký giả mạo vẫn phải bị chặn fail-closed'
+        );
+      }
     } finally {
+      srv.closeAllConnections?.();
       await new Promise<void>((resolve) => srv.close(() => resolve()));
     }
   }
