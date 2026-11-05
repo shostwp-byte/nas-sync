@@ -117,16 +117,14 @@ function writeOrHardlinkMockFile(
   return { totalBytes: sz, deltaBytes: sz };
 }
 
-function runRsyncPullMailbox(params: {
-  jobId: number;
+export function buildMailboxRsyncArgs(params: {
   server: ServerRecord;
   remoteMailboxDir: string;
   systemUser?: string;
   destMailboxDir: string;
   linkDestMailboxDir: string | null;
-}): Promise<{ totalBytes: number; deltaBytes: number }> {
+}): string[] {
   const {
-    jobId,
     server,
     remoteMailboxDir,
     systemUser,
@@ -134,14 +132,12 @@ function runRsyncPullMailbox(params: {
     linkDestMailboxDir,
   } = params;
 
-  fs.mkdirSync(destMailboxDir, { recursive: true });
-
+  // Lưu ý: `-a` mặc định đã tắt `-K` (--keep-dirlinks); không truyền `--no-keep-dirlinks` vì rsync 3.4/3.5 báo unknown option (code 1)
   const args: string[] = [
     '-az',
     '--no-owner',
     '--no-group',
     '--chmod=ugo-s',
-    '--no-keep-dirlinks',
     '--delete',
     '--no-devices',
     '--no-specials',
@@ -172,6 +168,21 @@ function runRsyncPullMailbox(params: {
     `${server.ssh_user || 'root'}@${server.ip_address}:./`,
     `${destMailboxDir.replace(/\/+$/, '')}/`
   );
+  return args;
+}
+
+function runRsyncPullMailbox(params: {
+  jobId: number;
+  server: ServerRecord;
+  remoteMailboxDir: string;
+  systemUser?: string;
+  destMailboxDir: string;
+  linkDestMailboxDir: string | null;
+}): Promise<{ totalBytes: number; deltaBytes: number }> {
+  const { jobId, destMailboxDir } = params;
+
+  fs.mkdirSync(destMailboxDir, { recursive: true });
+  const args = buildMailboxRsyncArgs(params);
 
   return new Promise((resolve, reject) => {
     const child = spawn('rsync', args, {

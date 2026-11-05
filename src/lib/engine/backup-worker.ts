@@ -809,10 +809,12 @@ export async function executeBackupJob(
     }
   } catch (rawErr) {
     let err = rawErr;
+    // Lưu ý: Truyền code = 0 (không truyền cứng 255) để chỉ chuyển các lỗi thực sự khớp mẫu đứt kết nối SSH tạm thời
+    // sang RetryableNetworkError; tránh lặp lại vô ích 10 lần đối với lỗi cú pháp lệnh (code 1), hết ổ đĩa hoặc sai quyền.
     if (
       !(err instanceof RetryableNetworkError) &&
       !isJobCancelled(jobId) &&
-      isTransientSshTransportError(255, (err as Error)?.message || '')
+      isTransientSshTransportError(0, (err as Error)?.message || '')
     ) {
       err = new RetryableNetworkError(
         (err as Error)?.message || 'Gián đoạn kết nối SSH tạm thời.',

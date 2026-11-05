@@ -115,12 +115,12 @@ export function buildRsyncPullArgs(params: {
     customExcludes,
   } = params;
 
+  // Lưu ý: `-a` (-rlptgoD) mặc định KHÔNG bật `-K` (--keep-dirlinks); không truyền `--no-keep-dirlinks` vì rsync 3.4/3.5 báo unknown option (code 1)
   const args: string[] = [
     '-az',
     '--no-owner',
     '--no-group',
     '--chmod=ugo-s',
-    '--no-keep-dirlinks',
     '--delete',
     '--no-devices',
     '--no-specials',

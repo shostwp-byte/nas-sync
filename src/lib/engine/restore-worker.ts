@@ -55,26 +55,23 @@ import {
 const RESTORE_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 const RESTORE_PERMISSION_FIX_TIMEOUT_MS = 15 * 60 * 1000;
 
-function pushFilesViaRsync(params: {
-  jobId: number;
+export function buildRsyncRestoreArgs(params: {
   targetServer: ServerRecord;
   targetUser: string;
   localPublicHtmlDir: string;
   targetWebroot: string;
   excludedSubpaths?: string[];
-  onProgress: (pct: number) => void;
-}): Promise<void> {
+}): string[] {
   const {
-    jobId,
     targetServer,
     targetUser,
     localPublicHtmlDir,
     targetWebroot,
     excludedSubpaths,
-    onProgress,
   } = params;
 
-  // S14 Security Fix: Loại bỏ quyền sở hữu gốc (--no-owner --no-group) và bit setuid/setgid (--chmod=ugo-s)
+  // S14 Security Fix: Loại bỏ quyền sở hữu gốc (--no-owner --no-group) và bit setuid/setgid (--chmod=ugo-s).
+  // Lưu ý: `-a` mặc định đã tắt `-K` (--keep-dirlinks); không dùng `--no-keep-dirlinks` để tương thích rsync 3.4/3.5+.
   const args: string[] = [
     '-az',
     '--no-owner',
@@ -84,7 +81,6 @@ function pushFilesViaRsync(params: {
     '--no-devices',
     '--no-specials',
     '--safe-links',
-    '--no-keep-dirlinks',
     '--info=progress2',
     '--timeout=60',
   ];
@@ -111,6 +107,20 @@ function pushFilesViaRsync(params: {
     `${localPublicHtmlDir.replace(/\/+$/, '')}/`,
     `${targetServer.ssh_user || 'root'}@${targetServer.ip_address}:./`
   );
+  return args;
+}
+
+function pushFilesViaRsync(params: {
+  jobId: number;
+  targetServer: ServerRecord;
+  targetUser: string;
+  localPublicHtmlDir: string;
+  targetWebroot: string;
+  excludedSubpaths?: string[];
+  onProgress: (pct: number) => void;
+}): Promise<void> {
+  const { jobId, onProgress } = params;
+  const args = buildRsyncRestoreArgs(params);
 
   return new Promise((resolve, reject) => {
     const child = spawn('rsync', args, {

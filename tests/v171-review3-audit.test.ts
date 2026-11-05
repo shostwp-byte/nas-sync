@@ -414,6 +414,104 @@ test('3. [Wave 4 & 7 — N18, N21, N22, N27, S14] Thống nhất số lần th�
   assert.ok(rsyncArgs.includes('--no-owner'));
   assert.ok(rsyncArgs.includes('--no-group'));
   assert.ok(rsyncArgs.includes('--chmod=ugo-s'));
+  assert.ok(!rsyncArgs.includes('--no-keep-dirlinks'));
+  assert.ok(!rsyncArgs.includes('--keep-dirlinks'));
+  assert.ok(!rsyncArgs.includes('-K'));
+
+  const { buildRsyncRestoreArgs } = await import(
+    '../src/lib/engine/restore-worker'
+  );
+  const { buildMailboxRsyncArgs } = await import(
+    '../src/lib/engine/extended-hosting-backup'
+  );
+  const { isTransientSshTransportError } = await import('../src/lib/ssh');
+  const mockSrv = {
+    id: serverId,
+    hostname: 'n18-vps.example.com',
+    ip_address: '198.51.100.18',
+    ssh_port: 22,
+    ssh_user: 'root',
+    ssh_key_path: '',
+    panel_type: 'DIRECTADMIN' as const,
+    assigned_volume_id: null,
+    bw_limit_kbps: 10240,
+    status: 'ONLINE' as const,
+    is_mock: 1,
+    last_connected_at: null,
+    notes: '',
+    host_key_status: 'VERIFIED' as const,
+    known_host_entry:
+      '198.51.100.18 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti',
+    created_at: new Date().toISOString(),
+  };
+
+  const restoreArgs = buildRsyncRestoreArgs({
+    targetServer: mockSrv,
+    targetUser: 'user1',
+    localPublicHtmlDir: path.join(tempVolDir, 'src_restore'),
+    targetWebroot: '/home/user1/domains/example.com/public_html',
+  });
+  const mailboxArgs = buildMailboxRsyncArgs({
+    server: mockSrv,
+    remoteMailboxDir: '/home/user1/imap/example.com',
+    systemUser: 'user1',
+    destMailboxDir: path.join(tempVolDir, 'dest_mail'),
+    linkDestMailboxDir: null,
+  });
+
+  for (const argSet of [restoreArgs, mailboxArgs]) {
+    assert.ok(argSet.includes('--no-owner'));
+    assert.ok(argSet.includes('--no-group'));
+    assert.ok(argSet.includes('--chmod=ugo-s'));
+    assert.ok(!argSet.includes('--no-keep-dirlinks'));
+    assert.ok(!argSet.includes('--keep-dirlinks'));
+  }
+
+  // Lỗi cú pháp lệnh rsync (code 1) tuyệt đối không được phân loại nhầm thành mất mạng SSH tạm thời (tránh retry 10 lần vô ích)
+  assert.equal(
+    isTransientSshTransportError(
+      0,
+      'Rsync thất bại (Mã lỗi 1): rsync: --no-keep-dirlinks: unknown option'
+    ),
+    false
+  );
+  assert.equal(
+    isTransientSshTransportError(
+      0,
+      'kex_exchange_identification: read: Connection reset by peer'
+    ),
+    true
+  );
+
+  // Trên môi trường Linux có cài sẵn `rsync` (như CI ubuntu-latest / Alpine), chạy thử `rsync --dry-run` với toàn bộ cờ CLI
+  const { spawnSync } = await import('node:child_process');
+  const hasRsync = spawnSync('rsync', ['--version'], { stdio: 'ignore' });
+  if (hasRsync.status === 0) {
+    const localSrc = path.join(tempVolDir, 'rsync_cli_src');
+    const localDst = path.join(tempVolDir, 'rsync_cli_dst');
+    fs.mkdirSync(localSrc, { recursive: true });
+    fs.mkdirSync(localDst, { recursive: true });
+    fs.writeFileSync(path.join(localSrc, 'probe.txt'), 'ok', 'utf8');
+
+    for (const fullArgs of [rsyncArgs, restoreArgs, mailboxArgs]) {
+      const flagOnly = fullArgs.filter((a, idx) => {
+        if (a === '-e' || fullArgs[idx - 1] === '-e') return false;
+        if (a.startsWith('--rsync-path=')) return false;
+        if (idx >= fullArgs.length - 2) return false;
+        return true;
+      });
+      const dry = spawnSync(
+        'rsync',
+        ['--dry-run', ...flagOnly, `${localSrc}/`, `${localDst}/`],
+        { encoding: 'utf8' }
+      );
+      assert.equal(
+        dry.status,
+        0,
+        `rsync --dry-run thất bại với bộ cờ CLI: ${dry.stderr}`
+      );
+    }
+  }
 });
 
 test('4. [Wave 5 & 7 — U6..U16] Khóa công khai Ed25519 dùng chung, ký số cả prebuilt + bundle, xác thực update.sh fail-closed, băm package-lock.json & chặn hạ cấp', async () => {
