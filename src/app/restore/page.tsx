@@ -567,20 +567,35 @@ function RestoreContent() {
                         <div className="font-semibold text-emerald-200 flex items-center gap-1.5 flex-wrap">
                           <Wrench className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
                           <span className="break-words">
-                            Tự động cập nhật tên Database &amp; đường dẫn trong
-                            wp-config.php / .env / configuration.php
+                            Tự động khởi tạo DB User / Mapping quyền truy cập
+                            &amp; cập nhật wp-config.php / .env /
+                            configuration.php
                           </span>
                         </div>
                         <p className="text-[11px] text-slate-300 leading-relaxed break-words">
-                          Tự động tạo bản sao lưu gốc{' '}
+                          Tự động đọc{' '}
+                          <code className="font-mono text-cyan-300">
+                            DB_NAME
+                          </code>
+                          ,{' '}
+                          <code className="font-mono text-cyan-300">
+                            DB_USER
+                          </code>
+                          ,{' '}
+                          <code className="font-mono text-cyan-300">
+                            DB_PASSWORD
+                          </code>{' '}
+                          từ tệp cấu hình để tạo MySQL User, gán toàn quyền (
+                          <code className="font-mono text-emerald-300">
+                            ALL PRIVILEGES
+                          </code>
+                          ), đăng ký vào Hosting Panel và đồng bộ lại{' '}
+                          <code className="font-mono text-cyan-300">DB_NAME</code>{' '}
+                          / đường dẫn vật lý (kèm bản lưu{' '}
                           <code className="font-mono text-amber-300">
                             .nas-sync.bak
-                          </code>{' '}
-                          (<code className="font-mono text-slate-200">chmod 600</code>)
-                          trước khi đổi{' '}
-                          <code className="font-mono text-cyan-300">DB_NAME</code>{' '}
-                          (theo bảng ánh xạ DB) và đường dẫn vật lý cũ sang đường
-                          dẫn mới trên VPS đích.
+                          </code>
+                          ).
                         </p>
                       </div>
                     </label>

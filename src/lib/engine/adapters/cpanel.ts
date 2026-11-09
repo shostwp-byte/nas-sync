@@ -55,12 +55,12 @@ export class CPanelAdapter implements PanelAdapter {
 
     const script = `
       ALL_DBS=$(mysql --defaults-extra-file=/root/.my.cnf -N -B -e "SHOW DATABASES;" 2>/dev/null | grep -Ev '^(information_schema|performance_schema|mysql|sys|cphulkd|eximstats|leechprotect|modsec|roundcube)$' || true)
+      ALL_DBS_CSV=$(printf "%s\\n" "$ALL_DBS" | paste -sd "," - || true)
       ALL_PG_DBS=$(command -v psql >/dev/null 2>&1 && su - postgres -c ${pgListCmd} 2>/dev/null || true)
 
       detect_dbs_in_webroot() {
         wroot="$1"
         udbs="$2"
-        [ -z "$udbs" ] && return 0
         [ ! -d "$wroot" ] && return 0
         cfg_blob=""
         for cf in "$wroot/wp-config.php" "$wroot/.env" "$wroot/configuration.php" "$wroot/config.php"; do
@@ -79,6 +79,14 @@ $(head -n 120 "$cf" 2>/dev/null || true)"
             if [ -z "$matched" ]; then matched="$dbn"; else matched="$matched,$dbn"; fi
           fi
         done
+        if [ -z "$matched" ] && [ -n "$ALL_DBS_CSV" ]; then
+          for dbn in $ALL_DBS_CSV; do
+            [ -z "$dbn" ] && continue
+            if printf "%s" "$cfg_blob" | grep -Eq "(DB_NAME|DB_DATABASE|[$]db|dbname|database)[^;\\n]*['\\"=[:space:]]\${dbn}(['\\"[:space:]\\r;]|$)"; then
+              if [ -z "$matched" ]; then matched="$dbn"; else matched="$matched,$dbn"; fi
+            fi
+          done
+        fi
         IFS="$OLD_IFS"
         printf "%s" "$matched"
       }

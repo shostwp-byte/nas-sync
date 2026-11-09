@@ -16,6 +16,7 @@ import type {
 import { getPanelAdapter } from './adapters';
 import { verifyRemoteWebrootSafety } from './adapters/base';
 import { evaluateBackupAnomaly } from './anomaly-detector';
+import { extractDbCredentialsFromDirectory } from './config-rewriter';
 import { parseSafeExcludePatterns } from './exclude-rules';
 import { syncExtendedHostingExtras } from './extended-hosting-backup';
 import { executeMockServerBackup } from './mock-runner';
@@ -452,8 +453,37 @@ export async function executeBackupJob(
             }
           }
 
+          // Đọc thêm thông tin kết nối DB từ wp-config.php / .env đã đồng bộ về NAS để bổ sung DB_USER chính xác
+          // hoặc phát hiện thêm DB chưa có tiền tố user trên Panel.
+          const extractedWebConfigs =
+            extractDbCredentialsFromDirectory(destPublicHtmlDir);
+          const effectiveDomDbs: Array<{
+            name: string;
+            user?: string;
+            engine?: 'MYSQL' | 'POSTGRESQL';
+            fromWebConfigOnly?: boolean;
+          }> = dom.databases.map((d) => {
+            const matchedCfg = extractedWebConfigs.find(
+              (c) => c.dbName === d.name
+            );
+            return {
+              ...d,
+              user: matchedCfg?.dbUser || d.user,
+            };
+          });
+          for (const cfg of extractedWebConfigs) {
+            if (!effectiveDomDbs.some((d) => d.name === cfg.dbName)) {
+              effectiveDomDbs.push({
+                name: cfg.dbName,
+                user: cfg.dbUser || dom.systemUser,
+                engine: 'MYSQL',
+                fromWebConfigOnly: true,
+              });
+            }
+          }
+
           // Stream từng Database (MySQL / PostgreSQL) qua SSH Pipe về thẳng NAS (Mục 5.3)
-          for (const dbEntry of dom.databases) {
+          for (const dbEntry of effectiveDomDbs) {
             if (domState.completedDbs[dbEntry.name]) {
               appendLog(
                 `[Auto-Resume] ⏭️ Bỏ qua DB ${dbEntry.name} (Đã tải xong trước đó).`
@@ -496,26 +526,36 @@ export async function executeBackupJob(
               domState.deltaBytes += pgRes.sizeBytes;
               saveState(stateFilePath, state);
             } else {
-              if (!mysqlCreds) {
-                mysqlCreds = await adapter.getMysqlAdminCredentials(server);
+              try {
+                if (!mysqlCreds) {
+                  mysqlCreds = await adapter.getMysqlAdminCredentials(server);
+                }
+                const dumpRes = await streamRemoteMysqlDumpToZst({
+                  jobId,
+                  server,
+                  creds: mysqlCreds,
+                  dbName: dbEntry.name,
+                  destDatabasesDir,
+                  onLog: appendLog,
+                });
+                domState.completedDbs[dbEntry.name] = {
+                  name: dbEntry.name,
+                  db_user: dbEntry.user,
+                  engine: 'MYSQL',
+                  file: dumpRes.fileName,
+                  size_bytes: dumpRes.sizeBytes,
+                };
+                domState.deltaBytes += dumpRes.sizeBytes;
+                saveState(stateFilePath, state);
+              } catch (dbDumpErr) {
+                if (dbEntry.fromWebConfigOnly) {
+                  appendLog(
+                    `[Cảnh báo] Bỏ qua DB "${dbEntry.name}" khai báo trong tệp cấu hình web vì không tồn tại hoặc không thể truy cập trên MySQL: ${(dbDumpErr as Error).message}`
+                  );
+                } else {
+                  throw dbDumpErr;
+                }
               }
-              const dumpRes = await streamRemoteMysqlDumpToZst({
-                jobId,
-                server,
-                creds: mysqlCreds,
-                dbName: dbEntry.name,
-                destDatabasesDir,
-                onLog: appendLog,
-              });
-              domState.completedDbs[dbEntry.name] = {
-                name: dbEntry.name,
-                db_user: dbEntry.user,
-                engine: 'MYSQL',
-                file: dumpRes.fileName,
-                size_bytes: dumpRes.sizeBytes,
-              };
-              domState.deltaBytes += dumpRes.sizeBytes;
-              saveState(stateFilePath, state);
             }
           }
         }
@@ -854,6 +894,7 @@ export async function executeBackupJob(
           currentPhase: 'Mất kết nối — Đang chờ tự động Resume...',
           speedBps: 0,
           etaSeconds: 0,
+          retryCount: nextRetry,
         });
         emitJobUpdated(jobId);
         throw err;

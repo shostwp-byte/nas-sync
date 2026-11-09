@@ -46,7 +46,7 @@ print(row[0] if row else "MISSING")
 
   async discoverDomains(server: ServerRecord): Promise<DiscoveredDomain[]> {
     const pyScript = `
-import sqlite3, json, os
+import sqlite3, json, os, re
 conn = sqlite3.connect('/www/server/panel/data/default.db')
 conn.row_factory = sqlite3.Row
 cur = conn.cursor()
@@ -54,6 +54,20 @@ cur.execute("SELECT id, name, path FROM sites WHERE IFNULL(project_type,'PHP') I
 sites = [dict(r) for r in cur.fetchall()]
 cur.execute("SELECT name, username, pid FROM databases WHERE LOWER(IFNULL(type,'mysql'))='mysql'")
 dbs = [dict(r) for r in cur.fetchall()]
+
+def read_webroot_cfg_blob(wroot):
+    if not wroot or not os.path.isdir(wroot):
+        return ''
+    chunks = []
+    for rel in ('wp-config.php', '.env', 'configuration.php', 'config.php'):
+        fp = os.path.join(wroot, rel)
+        try:
+            if os.path.isfile(fp) and not os.path.islink(fp) and os.path.getsize(fp) <= 262144:
+                with open(fp, 'r', encoding='utf-8', errors='ignore') as f:
+                    chunks.append(f.read(16384))
+        except Exception:
+            pass
+    return '\n'.join(chunks)
 
 bindings = []
 try:
@@ -108,6 +122,20 @@ for s in sites:
                 'parentDomain': sname,
                 'databases': []
             })
+
+# Khớp các DB chưa có pid (hoặc tạo thủ công) với wp-config.php / .env của từng domain trước khi fallback
+for item in out:
+    blob = read_webroot_cfg_blob(item.get('webroot'))
+    if not blob:
+        continue
+    for d in dbs:
+        dbn = d['name']
+        if dbn in assigned_dbs:
+            continue
+        pat = '(?:DB_NAME|DB_DATABASE|[$]db|dbname|database)[^;\\n]*[\\x27"=\\t ]' + re.escape(dbn) + '(?:[\\x27"\\t \\r;]|$)'
+        if re.search(pat, blob, re.I):
+            item['databases'].append({'name': dbn, 'user': d.get('username') or 'www'})
+            assigned_dbs.add(dbn)
 
 if out:
     for d in dbs:

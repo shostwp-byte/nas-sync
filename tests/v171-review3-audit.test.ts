@@ -1141,3 +1141,186 @@ test('5. [Wave 6 & 8 — A5, A11, A13, A14, O7, C1, S2, S10] Xóa triệt để 
     globalThis.__nasSyncIo = prevIo;
   }
 });
+
+test('Restore Automatic WP-Config DB Credential Extraction, MySQL User Creation & Privilege Mapping', async () => {
+  const {
+    extractDbCredentialsFromConfigContent,
+    extractDbCredentialsFromDirectory,
+  } = await import('../src/lib/engine/config-rewriter');
+  const {
+    buildMysqlProvisionDatabaseAndUserScript,
+    executeRestoreJob,
+    isProvisionableDbUser,
+  } = await import('../src/lib/engine/restore-worker');
+  const { getDataDir, getDb } = await import('../src/lib/db');
+
+  // 1) Kiểm tra trích xuất wp-config.php bỏ qua dòng comment và giải mã đúng mật khẩu có ký tự đặc biệt
+  const sampleWpConfig = `<?php
+// define( 'DB_NAME', 'commented_out_db' );
+/*
+define( 'DB_NAME', 'block_comment_db' );
+define( 'DB_USER', 'block_comment_user' );
+*/
+# define('DB_NAME', 'hash_comment_db');
+define( 'DB_NAME', 'real_wp_db' );
+define( 'DB_USER', 'real_wp_user' );
+define( 'DB_PASSWORD', 'S3cr3t\\'Pass//With# Special*Chars!' );
+define( 'DB_HOST', 'localhost:3306' );
+`;
+  const parsedWp = extractDbCredentialsFromConfigContent(
+    'wp-config.php',
+    sampleWpConfig
+  );
+  assert.ok(parsedWp);
+  assert.equal(parsedWp.dbName, 'real_wp_db');
+  assert.equal(parsedWp.dbUser, 'real_wp_user');
+  assert.equal(parsedWp.dbPassword, "S3cr3t'Pass//With# Special*Chars!");
+  assert.equal(parsedWp.dbHost, 'localhost:3306');
+
+  // 2) Kiểm tra trích xuất .env và configuration.php (Joomla)
+  const parsedEnv = extractDbCredentialsFromConfigContent(
+    '.env',
+    '# DB_DATABASE=wrong_db\nDB_DATABASE=laravel_prod\nDB_USERNAME=laravel_usr\nDB_PASSWORD="Env\\"Pass#123"\nDB_HOST=127.0.0.1\n'
+  );
+  assert.ok(parsedEnv);
+  assert.equal(parsedEnv.dbName, 'laravel_prod');
+  assert.equal(parsedEnv.dbUser, 'laravel_usr');
+  assert.equal(parsedEnv.dbPassword, 'Env"Pass#123');
+
+  // 3) Kiểm tra bảo vệ tài khoản hệ thống đặc quyền (root, da_admin, admin...) và sinh lệnh UNHEX an toàn
+  assert.equal(isProvisionableDbUser('root'), false);
+  assert.equal(isProvisionableDbUser('da_admin'), false);
+  assert.equal(isProvisionableDbUser('admin'), false);
+  assert.equal(isProvisionableDbUser('real_wp_user'), true);
+
+  const plan = buildMysqlProvisionDatabaseAndUserScript({
+    creds: { user: 'da_admin', remoteAuthPrelude: 'export MYSQL_PWD="adm";' },
+    targetDbName: 'target_wp_db',
+    dbUser: parsedWp.dbUser,
+    dbPassword: parsedWp.dbPassword,
+    dbHost: parsedWp.dbHost,
+    panelType: 'DIRECTADMIN',
+    targetSystemUser: 'user96',
+  });
+  assert.equal(plan.provisionedUser, 'real_wp_user');
+  assert.ok(plan.provisionUserCommand);
+  assert.ok(
+    plan.provisionUserCommand.includes(
+      Buffer.from("S3cr3t'Pass//With# Special*Chars!", 'utf8').toString('hex')
+    ),
+    'Mật khẩu phải được truyền qua mã Hex UNHEX để không bao giờ vỡ cú pháp shell/SQL'
+  );
+  assert.ok(plan.provisionUserCommand.includes('CREATE USER IF NOT EXISTS'));
+  assert.ok(plan.provisionUserCommand.includes('ALTER USER'));
+  assert.ok(
+    plan.provisionUserCommand.includes('GRANT ALL PRIVILEGES ON `target_wp_db`.*')
+  );
+
+  // 4) Kiểm tra tích hợp executeRestoreJob: Tự động đọc wp-config.php, tạo DB + User + Mapping và đồng bộ lại DB_NAME
+  const db = getDb();
+  const volRow = db
+    .prepare('SELECT id, mount_path FROM storage_volumes ORDER BY id ASC LIMIT 1')
+    .get() as { id: number; mount_path: string };
+  const srvRow = db
+    .prepare("SELECT id, hostname FROM servers WHERE hostname = 'mock-restore-srv' LIMIT 1")
+    .get() as { id: number; hostname: string };
+
+  const snapName = '2026-11-09_17-30-00';
+  const domainDir = path.join(
+    volRow.mount_path,
+    srvRow.hostname,
+    snapName,
+    'home',
+    'domains',
+    'wp-auto-map.vn'
+  );
+  const pubDir = path.join(domainDir, 'public_html');
+  const dbDir = path.join(domainDir, 'databases');
+  fs.mkdirSync(pubDir, { recursive: true });
+  fs.mkdirSync(dbDir, { recursive: true });
+  fs.writeFileSync(path.join(pubDir, 'wp-config.php'), sampleWpConfig, 'utf8');
+  fs.writeFileSync(
+    path.join(dbDir, 'real_wp_db.sql'),
+    'CREATE TABLE wp_options (id INT PRIMARY KEY);\n',
+    'utf8'
+  );
+
+  const dirConfigs = extractDbCredentialsFromDirectory(pubDir);
+  assert.equal(dirConfigs.length, 1);
+  assert.equal(dirConfigs[0].dbName, 'real_wp_db');
+  assert.equal(dirConfigs[0].dbUser, 'real_wp_user');
+
+  const srcJobIns = db
+    .prepare(
+      `INSERT INTO backup_jobs (job_type, server_id, volume_id, snapshot_name, status, progress_percent, current_phase)
+       VALUES ('BACKUP', ?, ?, ?, 'COMPLETED', 100, 'Hoàn tất')`
+    )
+    .run(srvRow.id, volRow.id, snapName);
+  const srcJobId = Number(srcJobIns.lastInsertRowid);
+
+  // Giả lập cả trường hợp databases_list bị trống ('[]') nhưng có file .sql trong thư mục databases và có wp-config.php
+  const itemIns = db
+    .prepare(
+      `INSERT INTO backup_items
+       (job_id, server_id, volume_id, snapshot_name, domain_name, system_user, webroot_size_bytes, databases_list, verification_status)
+       VALUES (?, ?, ?, ?, 'wp-auto-map.vn', 'user96', 65536, '[]', 'PASSED')`
+    )
+    .run(srcJobId, srvRow.id, volRow.id, snapName);
+  const itemId = Number(itemIns.lastInsertRowid);
+
+  const restoreOpts = {
+    sourceJobId: srcJobId,
+    backupItemId: itemId,
+    mode: 'FULL' as const,
+    targetServerId: srvRow.id,
+    targetSystemUser: 'user96',
+    targetDomainName: 'wp-auto-map.vn',
+    targetDbMap: { real_wp_db: 'user96_mapped_db' },
+    autoPatchConfig: true,
+  };
+  const rstJobIns = db
+    .prepare(
+      `INSERT INTO backup_jobs
+       (job_type, server_id, target_server_id, volume_id, snapshot_name, status, progress_percent, current_phase, current_domain, restore_options)
+       VALUES ('RESTORE', ?, ?, ?, ?, 'QUEUED', 0, 'Đang chuẩn bị khôi phục...', 'wp-auto-map.vn', ?)`
+    )
+    .run(
+      srvRow.id,
+      srvRow.id,
+      volRow.id,
+      snapName,
+      JSON.stringify(restoreOpts)
+    );
+  const rstJobId = Number(rstJobIns.lastInsertRowid);
+
+  await executeRestoreJob(rstJobId);
+
+  const finishedJob = db
+    .prepare('SELECT status, live_log FROM backup_jobs WHERE id = ?')
+    .get(rstJobId) as { status: string; live_log: string };
+  assert.equal(finishedJob.status, 'COMPLETED');
+  assert.ok(
+    finishedJob.live_log.includes('DB_NAME="real_wp_db", DB_USER="real_wp_user"'),
+    'Log khôi phục phải ghi nhận đã đọc DB_NAME và DB_USER từ wp-config.php'
+  );
+  assert.ok(
+    finishedJob.live_log.includes(
+      'Đã khởi tạo MySQL User "real_wp_user" và gán quyền (ALL PRIVILEGES) vào Database "user96_mapped_db"'
+    ),
+    'Log khôi phục phải ghi nhận khởi tạo MySQL User và cấp ALL PRIVILEGES vào Database đích'
+  );
+
+  const restoredWpConfigPath = path.join(
+    getDataDir(),
+    'restored_preview',
+    srvRow.hostname,
+    'wp-auto-map.vn',
+    'public_html',
+    'wp-config.php'
+  );
+  const restoredWpContent = fs.readFileSync(restoredWpConfigPath, 'utf8');
+  assert.ok(
+    restoredWpContent.includes("define('DB_NAME', 'user96_mapped_db')"),
+    'Tệp wp-config.php sau khôi phục phải được tự động cập nhật DB_NAME sang tên DB đích'
+  );
+});

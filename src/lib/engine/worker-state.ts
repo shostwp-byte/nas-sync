@@ -367,6 +367,7 @@ export interface JobProgressPatch {
   etaSeconds?: number;
   totalSizeBytes?: number;
   deltaSizeBytes?: number;
+  retryCount?: number;
 }
 
 export function createJobLogger(params: {
@@ -455,7 +456,7 @@ export function createJobProgressUpdater(params: {
       etaSeconds: nextEta,
       deltaSizeBytes: nextDelta,
       totalSizeBytes: nextTotal,
-      retryCount: curr.retry_count,
+      retryCount: patch.retryCount ?? curr.retry_count,
     });
   };
 }

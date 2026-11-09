@@ -33,8 +33,175 @@ const CANDIDATE_CONFIG_FILES = [
 
 const MAX_CONFIG_FILE_BYTES = 256 * 1024; // 256 KB
 
+export interface ExtractedWebDbConfig {
+  sourceFile: string;
+  dbName: string;
+  dbUser: string;
+  dbPassword?: string;
+  dbHost?: string;
+}
+
 function escapeRegExp(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function stripPhpCommentsPreservingStrings(source: string): string {
+  return source.replace(
+    /'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|\/\*[\s\S]*?\*\/|\/\/[^\r\n]*|#[^\r\n]*/g,
+    (match) => {
+      if (match.startsWith("'") || match.startsWith('"')) {
+        return match;
+      }
+      return ' ';
+    }
+  );
+}
+
+function unescapePhpString(raw: string, quote: string): string {
+  if (quote === "'") {
+    return raw.replace(/\\(['\\])/g, '$1');
+  }
+  return raw.replace(/\\(["\\$nrt])/g, (_m, c: string) => {
+    if (c === 'n') return '\n';
+    if (c === 'r') return '\r';
+    if (c === 't') return '\t';
+    return c;
+  });
+}
+
+function matchPhpDefine(cleanPhp: string, constNames: string[]): string | undefined {
+  for (const name of constNames) {
+    const escaped = escapeRegExp(name);
+    const re = new RegExp(
+      `\\bdefine\\s*\\(\\s*(['"])${escaped}\\1\\s*,\\s*(['"])((?:\\\\.|(?!\\2)[^\\\\])*)\\2\\s*\\)`,
+      'i'
+    );
+    const m = cleanPhp.match(re);
+    if (m) {
+      return unescapePhpString(m[3], m[2]);
+    }
+  }
+  return undefined;
+}
+
+function matchPhpVarAssignment(cleanPhp: string, varNames: string[]): string | undefined {
+  for (const name of varNames) {
+    const escaped = escapeRegExp(name);
+    const re = new RegExp(
+      `\\$${escaped}\\s*=\\s*(['"])((?:\\\\.|(?!\\1)[^\\\\])*)\\1`,
+      'i'
+    );
+    const m = cleanPhp.match(re);
+    if (m) {
+      return unescapePhpString(m[2], m[1]);
+    }
+  }
+  return undefined;
+}
+
+function matchPhpArrayKey(cleanPhp: string, keys: string[]): string | undefined {
+  for (const key of keys) {
+    const escaped = escapeRegExp(key);
+    const re = new RegExp(
+      `(['"])${escaped}\\1\\s*=>\\s*(['"])((?:\\\\.|(?!\\2)[^\\\\])*)\\2`,
+      'i'
+    );
+    const m = cleanPhp.match(re);
+    if (m) {
+      return unescapePhpString(m[3], m[2]);
+    }
+  }
+  return undefined;
+}
+
+function matchDotEnvKey(content: string, keys: string[]): string | undefined {
+  for (const key of keys) {
+    const escaped = escapeRegExp(key);
+    const re = new RegExp(
+      `^[ \\t]*(?:export[ \\t]+)?${escaped}[ \\t]*=[ \\t]*(.*?)[ \\t]*\\r?$`,
+      'm'
+    );
+    const m = content.match(re);
+    if (!m) continue;
+    const rawVal = m[1].trim();
+    if (
+      (rawVal.startsWith('"') && rawVal.endsWith('"') && rawVal.length >= 2) ||
+      (rawVal.startsWith("'") && rawVal.endsWith("'") && rawVal.length >= 2)
+    ) {
+      const q = rawVal[0];
+      return unescapePhpString(rawVal.slice(1, -1), q);
+    }
+    return rawVal.replace(/[ \t]+#.*$/, '').trim();
+  }
+  return undefined;
+}
+
+/**
+ * Trích xuất thông tin kết nối Database (DB_NAME, DB_USER, DB_PASSWORD, DB_HOST)
+ * từ nội dung tệp cấu hình web (wp-config.php, .env, configuration.php, config.php, app/etc/env.php).
+ */
+export function extractDbCredentialsFromConfigContent(
+  fileName: string,
+  content: string
+): ExtractedWebDbConfig | null {
+  if (!content || content.includes('\0')) return null;
+  const normRel = fileName.replace(/\\/g, '/').replace(/^\/+/, '');
+  const baseName = path.posix.basename(normRel);
+
+  let dbName: string | undefined;
+  let dbUser: string | undefined;
+  let dbPassword: string | undefined;
+  let dbHost: string | undefined;
+
+  if (baseName === 'wp-config.php') {
+    const cleanPhp = stripPhpCommentsPreservingStrings(content);
+    dbName = matchPhpDefine(cleanPhp, ['DB_NAME']);
+    dbUser = matchPhpDefine(cleanPhp, ['DB_USER']);
+    dbPassword = matchPhpDefine(cleanPhp, ['DB_PASSWORD']);
+    dbHost = matchPhpDefine(cleanPhp, ['DB_HOST']);
+  } else if (baseName === '.env') {
+    dbName = matchDotEnvKey(content, ['DB_DATABASE', 'DB_NAME']);
+    dbUser = matchDotEnvKey(content, ['DB_USERNAME', 'DB_USER']);
+    dbPassword = matchDotEnvKey(content, ['DB_PASSWORD', 'DB_PASS']);
+    dbHost = matchDotEnvKey(content, ['DB_HOST', 'DB_HOSTNAME']);
+  } else if (baseName === 'configuration.php') {
+    const cleanPhp = stripPhpCommentsPreservingStrings(content);
+    dbName = matchPhpVarAssignment(cleanPhp, ['db']);
+    dbUser = matchPhpVarAssignment(cleanPhp, ['user']);
+    dbPassword = matchPhpVarAssignment(cleanPhp, ['password']);
+    dbHost = matchPhpVarAssignment(cleanPhp, ['host']);
+  } else if (baseName === 'config.php' || normRel === 'app/etc/env.php') {
+    const cleanPhp = stripPhpCommentsPreservingStrings(content);
+    dbName =
+      matchPhpDefine(cleanPhp, ['DB_DATABASE', 'DB_NAME']) ??
+      matchPhpArrayKey(cleanPhp, ['dbname', 'database', 'db_name']) ??
+      matchPhpVarAssignment(cleanPhp, ['dbname', 'db_name', 'database']);
+    dbUser =
+      matchPhpDefine(cleanPhp, ['DB_USERNAME', 'DB_USER']) ??
+      matchPhpArrayKey(cleanPhp, ['username', 'user', 'db_user']) ??
+      matchPhpVarAssignment(cleanPhp, ['dbuser', 'db_user', 'username']);
+    dbPassword =
+      matchPhpDefine(cleanPhp, ['DB_PASSWORD', 'DB_PASS']) ??
+      matchPhpArrayKey(cleanPhp, ['password', 'pass', 'db_password']) ??
+      matchPhpVarAssignment(cleanPhp, ['dbpass', 'db_password', 'password']);
+    dbHost =
+      matchPhpDefine(cleanPhp, ['DB_HOSTNAME', 'DB_HOST', 'DB_SERVER']) ??
+      matchPhpArrayKey(cleanPhp, ['host', 'hostname', 'db_host']) ??
+      matchPhpVarAssignment(cleanPhp, ['dbhost', 'db_host', 'host']);
+  }
+
+  const cleanDbName = (dbName || '').trim();
+  if (!cleanDbName || !isSafeDbName(cleanDbName)) {
+    return null;
+  }
+
+  return {
+    sourceFile: normRel,
+    dbName: cleanDbName,
+    dbUser: (dbUser || '').trim(),
+    dbPassword,
+    dbHost: (dbHost || 'localhost').trim() || 'localhost',
+  };
 }
 
 function resolveEffectiveSiteUser(
@@ -184,6 +351,7 @@ export function applyConfigReplacements(
   content: string,
   options: {
     changedDbs: Array<[string, string]>;
+    changedDbUsers?: Array<[string, string]>;
     sourceWebroot?: string;
     targetWebroot?: string;
   }
@@ -252,6 +420,70 @@ export function applyConfigReplacements(
       next = next.replace(
         varDbRe,
         (_m, pre: string, _q: string, post: string) => `${pre}${newDb}${post}`
+      );
+    }
+  }
+
+  for (const [oldUser, newUser] of options.changedDbUsers || []) {
+    if (!oldUser || !newUser || oldUser === newUser) continue;
+    const escapedOldUser = escapeRegExp(oldUser);
+
+    if (baseName === 'wp-config.php') {
+      const wpUserRe = new RegExp(
+        `define\\(\\s*(['"])DB_USER\\1\\s*,\\s*(['"])${escapedOldUser}\\2\\s*\\)`,
+        'g'
+      );
+      next = next.replace(
+        wpUserRe,
+        (_m, q1: string, q2: string) =>
+          `define(${q1}DB_USER${q1}, ${q2}${newUser}${q2})`
+      );
+    } else if (baseName === '.env') {
+      const envUserRe = new RegExp(
+        `^([ \\t]*(?:export[ \\t]+)?DB_USERNAME[ \\t]*=[ \\t]*["']?)${escapedOldUser}(["']?[ \\t]*\\r?)$`,
+        'gm'
+      );
+      next = next.replace(
+        envUserRe,
+        (_m, pre: string, post: string) => `${pre}${newUser}${post}`
+      );
+    } else if (baseName === 'configuration.php') {
+      const joomlaUserRe = new RegExp(
+        `(\\$user\\s*=\\s*(['"]))${escapedOldUser}(\\2)`,
+        'g'
+      );
+      next = next.replace(
+        joomlaUserRe,
+        (_m, pre: string, _q: string, post: string) => `${pre}${newUser}${post}`
+      );
+    } else if (baseName === 'config.php' || normRel === 'app/etc/env.php') {
+      const defineUserRe = new RegExp(
+        `define\\(\\s*(['"])(DB_USERNAME|DB_USER)\\1\\s*,\\s*(['"])${escapedOldUser}\\3\\s*\\)`,
+        'gi'
+      );
+      next = next.replace(
+        defineUserRe,
+        (_m, q1: string, key: string, q2: string) =>
+          `define(${q1}${key}${q1}, ${q2}${newUser}${q2})`
+      );
+
+      const arrayUserRe = new RegExp(
+        `((['"])(?:username|user|db_user)\\2\\s*=>\\s*(['"]))${escapedOldUser}(\\3)`,
+        'gi'
+      );
+      next = next.replace(
+        arrayUserRe,
+        (_m, pre: string, _kq: string, _vq: string, post: string) =>
+          `${pre}${newUser}${post}`
+      );
+
+      const varUserRe = new RegExp(
+        `(\\$(?:dbuser|db_user|username)\\s*=\\s*(['"]))${escapedOldUser}(\\2)`,
+        'gi'
+      );
+      next = next.replace(
+        varUserRe,
+        (_m, pre: string, _q: string, post: string) => `${pre}${newUser}${post}`
       );
     }
   }
@@ -365,6 +597,169 @@ function hasAnySymlinkAlongRelativePath(
   return false;
 }
 
+/**
+ * Đọc trực tiếp các tệp cấu hình web (wp-config.php, .env, configuration.php, config.php, app/etc/env.php)
+ * trong thư mục webroot cục bộ (trên NAS) để trích xuất DB_NAME, DB_USER, DB_PASSWORD, DB_HOST.
+ */
+export function extractDbCredentialsFromDirectory(
+  webrootDir: string
+): ExtractedWebDbConfig[] {
+  if (!webrootDir || !fs.existsSync(webrootDir)) {
+    return [];
+  }
+  const rootStat = fs.lstatSync(webrootDir, { throwIfNoEntry: false });
+  if (!rootStat || rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
+    return [];
+  }
+
+  let realRoot: string;
+  try {
+    realRoot = fs.realpathSync(webrootDir);
+  } catch {
+    return [];
+  }
+
+  const results: ExtractedWebDbConfig[] = [];
+  for (const relFile of CANDIDATE_CONFIG_FILES) {
+    const fullPath = path.resolve(webrootDir, relFile);
+    if (!fs.existsSync(fullPath)) continue;
+    if (hasAnySymlinkAlongRelativePath(webrootDir, relFile)) continue;
+
+    let lst: fs.Stats;
+    try {
+      lst = fs.lstatSync(fullPath);
+    } catch {
+      continue;
+    }
+    if (
+      !lst.isFile() ||
+      lst.isSymbolicLink() ||
+      lst.size === 0 ||
+      lst.size > MAX_CONFIG_FILE_BYTES
+    ) {
+      continue;
+    }
+
+    let realFile: string;
+    try {
+      realFile = fs.realpathSync(fullPath);
+    } catch {
+      continue;
+    }
+    if (!realFile.startsWith(realRoot + path.sep)) {
+      continue;
+    }
+
+    let content: string;
+    try {
+      content = fs.readFileSync(fullPath, 'utf8');
+    } catch {
+      continue;
+    }
+    const parsed = extractDbCredentialsFromConfigContent(relFile, content);
+    if (parsed) {
+      results.push(parsed);
+    }
+  }
+
+  return results;
+}
+
+/**
+ * Fallback đọc tệp cấu hình web từ máy chủ đích qua SSH (dùng khi khôi phục DB_ONLY mà bản sao lưu cục bộ không có public_html).
+ */
+export async function extractDbCredentialsFromRemoteWebrootOverSsh(params: {
+  server: ServerRecord;
+  targetUser: string;
+  targetDomain: string;
+  targetWebroot: string;
+  jobId?: number;
+}): Promise<ExtractedWebDbConfig[]> {
+  const { server, targetUser, targetDomain } = params;
+  const cleanTargetWebroot = (params.targetWebroot || '').trim().replace(/\/+$/, '');
+  if (
+    server.is_mock ||
+    !isSafeWebroot(cleanTargetWebroot) ||
+    !isSafeSystemUser(targetUser) ||
+    !isSafeDomain(targetDomain)
+  ) {
+    return [];
+  }
+
+  const effectiveSiteUser = resolveEffectiveSiteUser(server, targetUser);
+  const quotedCandidates = CANDIDATE_CONFIG_FILES.map((c) =>
+    shellSingleQuote(c)
+  ).join(' ');
+  const probeScript = [
+    `WEBROOT=${shellSingleQuote(cleanTargetWebroot)}`,
+    '[ ! -L "$WEBROOT" ] || exit 0',
+    'REAL_ROOT=$(realpath -e -- "$WEBROOT" 2>/dev/null) || exit 0',
+    `for REL in ${quotedCandidates}; do`,
+    '  CUR="$REAL_ROOT"',
+    '  BAD_LINK=0',
+    '  OLD_IFS="$IFS"',
+    '  IFS="/"',
+    '  for SEG in $REL; do',
+    '    [ -z "$SEG" ] && continue',
+    '    CUR="$CUR/$SEG"',
+    '    if [ -L "$CUR" ]; then BAD_LINK=1; break; fi',
+    '  done',
+    '  IFS="$OLD_IFS"',
+    '  [ "$BAD_LINK" = "0" ] || continue',
+    '  F="$CUR"',
+    '  if [ -f "$F" ] && [ ! -L "$F" ]; then',
+    '    REAL_F=$(realpath -e -- "$F" 2>/dev/null || true)',
+    '    case "$REAL_F" in',
+    '      "$REAL_ROOT"/*)',
+    '        SZ=$(wc -c < "$REAL_F" 2>/dev/null | tr -d "[:space:]")',
+    `        if [ -n "$SZ" ] && [ "$SZ" -gt 0 ] && [ "$SZ" -le ${MAX_CONFIG_FILE_BYTES} ]; then`,
+    '          printf "%s\\n" "$REL"',
+    '        fi',
+    '        ;;',
+    '    esac',
+    '  fi',
+    'done',
+  ].join('\n');
+
+  const probeRes = await execRemoteSSH(server, probeScript, {
+    zeroImpact: true,
+    timeoutMs: 20000,
+    jobId: params.jobId,
+  });
+  if (probeRes.code !== 0 || !probeRes.stdout.trim()) {
+    return [];
+  }
+
+  const allowedSet = new Set<string>(CANDIDATE_CONFIG_FILES);
+  const foundCandidates = probeRes.stdout
+    .split(/\r?\n/)
+    .map((s) => s.trim())
+    .filter((s) => allowedSet.has(s));
+
+  const results: ExtractedWebDbConfig[] = [];
+  for (const relFile of foundCandidates) {
+    const readScript = buildSafeConfigReadScript(
+      cleanTargetWebroot,
+      relFile,
+      effectiveSiteUser
+    );
+    const readRes = await execRemoteSSH(server, readScript, {
+      zeroImpact: true,
+      timeoutMs: 20000,
+      jobId: params.jobId,
+    });
+    if (readRes.code !== 0 || !readRes.stdout || readRes.stdout.includes('\0')) {
+      continue;
+    }
+    const parsed = extractDbCredentialsFromConfigContent(relFile, readRes.stdout);
+    if (parsed) {
+      results.push(parsed);
+    }
+  }
+
+  return results;
+}
+
 export async function patchRestoredWebConfigOverSsh(params: {
   server: ServerRecord;
   targetUser: string;
@@ -372,6 +767,7 @@ export async function patchRestoredWebConfigOverSsh(params: {
   targetWebroot: string;
   sourceWebroot: string;
   dbRenameMap: Record<string, string>;
+  dbUserRenameMap?: Record<string, string>;
   isMock: boolean;
   mockWebrootDir?: string;
   jobId?: number;
@@ -394,6 +790,15 @@ export async function patchRestoredWebConfigOverSsh(params: {
     changedDbs.push([oldDb, newDb]);
   }
 
+  const changedDbUsers: Array<[string, string]> = [];
+  for (const [rawOldU, rawNewU] of Object.entries(params.dbUserRenameMap || {})) {
+    const oldUser = rawOldU.trim();
+    const newUser = String(rawNewU || '').trim();
+    if (!oldUser || !newUser || oldUser === newUser) continue;
+    if (!isSafeDbName(oldUser) || !isSafeDbName(newUser)) continue;
+    changedDbUsers.push([oldUser, newUser]);
+  }
+
   const cleanSourceWebroot = (params.sourceWebroot || '').trim().replace(/\/+$/, '');
   const cleanTargetWebroot = (params.targetWebroot || '').trim().replace(/\/+$/, '');
 
@@ -405,7 +810,7 @@ export async function patchRestoredWebConfigOverSsh(params: {
       isSafeWebroot(cleanTargetWebroot)
   );
 
-  if (changedDbs.length === 0 && !webrootChanged) {
+  if (changedDbs.length === 0 && changedDbUsers.length === 0 && !webrootChanged) {
     return { patchedFiles: [] };
   }
 
@@ -456,6 +861,7 @@ export async function patchRestoredWebConfigOverSsh(params: {
 
       const updated = applyConfigReplacements(relFile, original, {
         changedDbs,
+        changedDbUsers,
         sourceWebroot: webrootChanged ? cleanSourceWebroot : undefined,
         targetWebroot: webrootChanged ? cleanTargetWebroot : undefined,
       });
@@ -571,6 +977,7 @@ export async function patchRestoredWebConfigOverSsh(params: {
 
     const updated = applyConfigReplacements(relFile, readRes.stdout, {
       changedDbs,
+      changedDbUsers,
       sourceWebroot: webrootChanged ? cleanSourceWebroot : undefined,
       targetWebroot: webrootChanged ? cleanTargetWebroot : undefined,
     });

@@ -33,7 +33,12 @@ import {
   buildRemoteMysqlEnvPrelude,
   verifyRemoteWebrootSafety,
 } from './adapters/base';
-import { patchRestoredWebConfigOverSsh } from './config-rewriter';
+import {
+  extractDbCredentialsFromDirectory,
+  extractDbCredentialsFromRemoteWebrootOverSsh,
+  patchRestoredWebConfigOverSsh,
+  type ExtractedWebDbConfig,
+} from './config-rewriter';
 import { streamRestorePostgresOverSsh } from './postgres-streamer';
 import {
   assertSafe,
@@ -194,6 +199,260 @@ export function buildRemoteMysqlRestoreInnerCommand(
   const safeDb = assertSafe(isSafeDbName, targetDbName, 'Tên database đích');
   const flagPart = authFlags ? `${authFlags} --binary-mode` : '--binary-mode';
   return `${envPrelude}mysql ${flagPart} ${shellSingleQuote(safeDb)}`;
+}
+
+const RESERVED_MYSQL_USERS = new Set([
+  'root',
+  'da_admin',
+  'admin',
+  'mysql',
+  'mysql.sys',
+  'mysql.session',
+  'mysql.infoschema',
+  'debian-sys-maint',
+  'mariadb.sys',
+  'phpmyadmin',
+  'roundcube',
+  'cphulkd',
+  'postgres',
+  'clp',
+  'hestia',
+]);
+
+export function isProvisionableDbUser(user: string): boolean {
+  const clean = (user || '').trim();
+  if (!clean) return false;
+  if (RESERVED_MYSQL_USERS.has(clean.toLowerCase())) return false;
+  return /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$/.test(clean);
+}
+
+/**
+ * Xây dựng lệnh khởi tạo Database + MySQL User + Password (từ wp-config.php / .env) + GRANT ALL PRIVILEGES.
+ * Sử dụng mã hóa Hex (`UNHEX(...)`) kết hợp `PREPARE`/`EXECUTE` và `QUOTE(...)` của MySQL/MariaDB
+ * để xử lý an toàn 100% mọi ký tự đặc biệt trong mật khẩu mà không lộ plaintext hay lỗi thoát chuỗi shell/SQL.
+ */
+export function buildMysqlProvisionDatabaseAndUserScript(params: {
+  creds: MysqlAdminCredentials;
+  targetDbName: string;
+  dbUser?: string;
+  dbPassword?: string;
+  dbHost?: string;
+  panelType?: ServerRecord['panel_type'];
+  targetSystemUser?: string;
+}): {
+  createDbCommand: string;
+  provisionUserCommand: string | null;
+  provisionedUser: string | null;
+  hosts: string[];
+} {
+  const safeDb = assertSafe(isSafeDbName, params.targetDbName, 'Tên database đích');
+  const authFlags = buildMysqlAuthFlags(params.creds).trim();
+  const envPrelude = buildRemoteMysqlEnvPrelude(params.creds);
+
+  const createDbSql = `CREATE DATABASE IF NOT EXISTS \`${safeDb}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;`;
+  const createDbInner = `${envPrelude}mysql ${authFlags ? `${authFlags} ` : ''}-e ${shellSingleQuote(createDbSql)}`;
+  const createDbCommand = `bash -o pipefail -c ${shellSingleQuote(createDbInner)}`;
+
+  const rawUser = (params.dbUser || '').trim();
+  const canProvisionUser = isProvisionableDbUser(rawUser);
+
+  const hosts = ['localhost', '127.0.0.1'];
+  const customHost = (params.dbHost || '').trim().split(':')[0]?.trim() || '';
+  if (
+    customHost &&
+    customHost !== 'localhost' &&
+    customHost !== '127.0.0.1' &&
+    /^(?:%|[a-zA-Z0-9._-]+)$/.test(customHost)
+  ) {
+    hosts.push(customHost);
+  }
+
+  const sqlLines: string[] = [];
+
+  if (canProvisionUser) {
+    const userHex = Buffer.from(rawUser, 'utf8').toString('hex');
+    sqlLines.push(`SET @u = CONVERT(UNHEX('${userHex}') USING utf8mb4);`);
+
+    if (params.dbPassword !== undefined) {
+      const pwdHex = Buffer.from(params.dbPassword, 'utf8').toString('hex');
+      sqlLines.push(`SET @p = CONVERT(UNHEX('${pwdHex}') USING utf8mb4);`);
+
+      for (const h of hosts) {
+        const hostHex = Buffer.from(h, 'utf8').toString('hex');
+        sqlLines.push(
+          `SET @h = CONVERT(UNHEX('${hostHex}') USING utf8mb4);`,
+          `SET @s1 = CONCAT('CREATE USER IF NOT EXISTS ', QUOTE(@u), '@', QUOTE(@h), ' IDENTIFIED BY ', QUOTE(@p));`,
+          `PREPARE stmt FROM @s1; EXECUTE stmt; DEALLOCATE PREPARE stmt;`,
+          `SET @s2 = CONCAT('ALTER USER ', QUOTE(@u), '@', QUOTE(@h), ' IDENTIFIED BY ', QUOTE(@p));`,
+          `PREPARE stmt FROM @s2; EXECUTE stmt; DEALLOCATE PREPARE stmt;`,
+          `SET @s3 = CONCAT('GRANT ALL PRIVILEGES ON \`${safeDb}\`.* TO ', QUOTE(@u), '@', QUOTE(@h));`,
+          `PREPARE stmt FROM @s3; EXECUTE stmt; DEALLOCATE PREPARE stmt;`
+        );
+      }
+    } else {
+      for (const h of hosts) {
+        const hostHex = Buffer.from(h, 'utf8').toString('hex');
+        sqlLines.push(
+          `SET @h = CONVERT(UNHEX('${hostHex}') USING utf8mb4);`,
+          `SELECT COUNT(*) INTO @u_exists FROM mysql.user WHERE User = @u AND Host = @h;`,
+          `SET @s3 = IF(@u_exists > 0, CONCAT('GRANT ALL PRIVILEGES ON \`${safeDb}\`.* TO ', QUOTE(@u), '@', QUOTE(@h)), 'DO 0');`,
+          `PREPARE stmt FROM @s3; EXECUTE stmt; DEALLOCATE PREPARE stmt;`
+        );
+      }
+    }
+  }
+
+  if (params.panelType === 'DIRECTADMIN') {
+    sqlLines.push(
+      `SELECT COUNT(*) INTO @da_exists FROM mysql.user WHERE User = 'da_admin' AND Host = 'localhost';`,
+      `SET @sda = IF(@da_exists > 0, 'GRANT ALL PRIVILEGES ON \`${safeDb}\`.* TO ''da_admin''@''localhost'' WITH GRANT OPTION', 'DO 0');`,
+      `PREPARE stmt FROM @sda; EXECUTE stmt; DEALLOCATE PREPARE stmt;`
+    );
+    const cleanSysUser = (params.targetSystemUser || '').trim();
+    if (cleanSysUser && isSafeSystemUser(cleanSysUser)) {
+      const sysUserHex = Buffer.from(cleanSysUser, 'utf8').toString('hex');
+      sqlLines.push(
+        `SET @su = CONVERT(UNHEX('${sysUserHex}') USING utf8mb4);`,
+        `SELECT COUNT(*) INTO @su_exists FROM mysql.user WHERE User = @su AND Host = 'localhost';`,
+        `SET @ssu = IF(@su_exists > 0, CONCAT('GRANT ALL PRIVILEGES ON \`${safeDb}\`.* TO ', QUOTE(@su), '@''localhost'''), 'DO 0');`,
+        `PREPARE stmt FROM @ssu; EXECUTE stmt; DEALLOCATE PREPARE stmt;`
+      );
+    }
+  }
+
+  if (sqlLines.length === 0) {
+    return {
+      createDbCommand,
+      provisionUserCommand: null,
+      provisionedUser: null,
+      hosts,
+    };
+  }
+
+  sqlLines.push('FLUSH PRIVILEGES;');
+  const flagPart = authFlags ? `${authFlags} --force` : '--force';
+  const provisionInner = `${envPrelude}mysql ${flagPart} -e ${shellSingleQuote(sqlLines.join('\n'))}`;
+  const provisionUserCommand = `bash -o pipefail -c ${shellSingleQuote(provisionInner)}`;
+
+  return {
+    createDbCommand,
+    provisionUserCommand,
+    provisionedUser: canProvisionUser ? rawUser : null,
+    hosts,
+  };
+}
+
+/**
+ * Đăng ký ánh xạ Database & User vào metadata của Hosting Control Panel đích (cPanel, aaPanel, CyberPanel)
+ * để quản trị viên thấy ngay Database/User trên giao diện Panel sau khi khôi phục.
+ */
+async function registerRestoredDatabaseInPanel(params: {
+  targetServer: ServerRecord;
+  creds: MysqlAdminCredentials;
+  targetUser: string;
+  targetDomain: string;
+  targetDbName: string;
+  dbUser: string;
+  dbPassword?: string;
+  jobId: number;
+  onLog: (msg: string) => void;
+}): Promise<void> {
+  const {
+    targetServer,
+    creds,
+    targetUser,
+    targetDomain,
+    targetDbName,
+    dbUser,
+    dbPassword,
+    jobId,
+    onLog,
+  } = params;
+
+  if (targetServer.is_mock) return;
+  const safeDb = assertSafe(isSafeDbName, targetDbName, 'targetDbName');
+  const effectiveDbUser = isProvisionableDbUser(dbUser) ? dbUser.trim() : targetUser;
+
+  try {
+    if (targetServer.panel_type === 'CPANEL' && isSafeSystemUser(targetUser)) {
+      const cmd = [
+        'if [ -x /usr/local/cpanel/bin/dbmaptool ]; then',
+        `  /usr/local/cpanel/bin/dbmaptool ${shellSingleQuote(targetUser)} --type mysql --dbs ${shellSingleQuote(safeDb)} --dbusers ${shellSingleQuote(effectiveDbUser)} >/dev/null 2>&1 || true`,
+        'fi',
+        'if command -v uapi >/dev/null 2>&1; then',
+        `  uapi --user=${shellSingleQuote(targetUser)} Mysql set_privileges_on_database user=${shellSingleQuote(effectiveDbUser)} database=${shellSingleQuote(safeDb)} privileges='ALL PRIVILEGES' >/dev/null 2>&1 || true`,
+        'fi',
+      ].join('\n');
+      await execRemoteSSH(targetServer, cmd, {
+        zeroImpact: true,
+        timeoutMs: 20000,
+        jobId,
+      });
+      onLog(
+        `[Panel Mapping] Đã ánh xạ Database "${safeDb}" & User "${effectiveDbUser}" vào tài khoản cPanel "${targetUser}".`
+      );
+    } else if (targetServer.panel_type === 'AAPANEL' && isSafeDomain(targetDomain)) {
+      const pyScript = `
+import sqlite3, time
+conn = sqlite3.connect('/www/server/panel/data/default.db')
+cur = conn.cursor()
+cur.execute("SELECT id FROM sites WHERE name=? LIMIT 1", (${JSON.stringify(targetDomain)},))
+srow = cur.fetchone()
+pid = int(srow[0]) if srow and srow[0] else 0
+cur.execute("SELECT id, password FROM databases WHERE name=? LIMIT 1", (${JSON.stringify(safeDb)},))
+drow = cur.fetchone()
+pwd = ${JSON.stringify(dbPassword ?? '')}
+if drow:
+    if pwd:
+        cur.execute("UPDATE databases SET username=?, password=?, pid=CASE WHEN ? > 0 THEN ? ELSE pid END WHERE id=?", (${JSON.stringify(effectiveDbUser)}, pwd, pid, pid, drow[0]))
+    else:
+        cur.execute("UPDATE databases SET username=?, pid=CASE WHEN ? > 0 THEN ? ELSE pid END WHERE id=?", (${JSON.stringify(effectiveDbUser)}, pid, pid, drow[0]))
+else:
+    now_str = time.strftime('%Y-%m-%d %H:%M:%S')
+    try:
+        cur.execute("INSERT INTO databases (pid, name, username, password, accept, ps, addtime, type) VALUES (?, ?, ?, ?, '127.0.0.1', ?, ?, 'MySQL')", (pid, ${JSON.stringify(safeDb)}, ${JSON.stringify(effectiveDbUser)}, pwd, ${JSON.stringify(targetDomain)}, now_str))
+    except Exception:
+        cur.execute("INSERT INTO databases (pid, name, username, password, accept, ps, addtime) VALUES (?, ?, ?, ?, '127.0.0.1', ?, ?)", (pid, ${JSON.stringify(safeDb)}, ${JSON.stringify(effectiveDbUser)}, pwd, ${JSON.stringify(targetDomain)}, now_str))
+conn.commit()
+`;
+      const cmd = `
+        PY="/www/server/panel/pyenv/bin/python3"
+        [ ! -x "$PY" ] && PY="python3"
+        "$PY" -c ${shellSingleQuote(pyScript)} >/dev/null 2>&1 || true
+      `;
+      await execRemoteSSH(targetServer, cmd, {
+        zeroImpact: true,
+        timeoutMs: 20000,
+        jobId,
+      });
+      onLog(
+        `[Panel Mapping] Đã đăng ký Database "${safeDb}" & User "${effectiveDbUser}" vào danh mục quản lý aaPanel.`
+      );
+    } else if (targetServer.panel_type === 'CYBERPANEL' && isSafeDomain(targetDomain)) {
+      const authFlags = buildMysqlAuthFlags(creds).trim();
+      const envPrelude = buildRemoteMysqlEnvPrelude(creds);
+      const userHex = Buffer.from(effectiveDbUser, 'utf8').toString('hex');
+      const domHex = Buffer.from(targetDomain, 'utf8').toString('hex');
+      const sql = [
+        `SET @u = CONVERT(UNHEX('${userHex}') USING utf8mb4);`,
+        `SET @d = CONVERT(UNHEX('${domHex}') USING utf8mb4);`,
+        `INSERT INTO cyberpanel.databases_databases (website_id, dbName, dbUser)`,
+        `SELECT w.id, '${safeDb}', @u FROM cyberpanel.websiteFunctions_websites w`,
+        `WHERE w.domain = @d AND NOT EXISTS (SELECT 1 FROM cyberpanel.databases_databases x WHERE x.dbName = '${safeDb}') LIMIT 1;`,
+      ].join(' ');
+      const inner = `${envPrelude}mysql ${authFlags ? `${authFlags} ` : ''}--force -e ${shellSingleQuote(sql)} >/dev/null 2>&1 || true`;
+      await execRemoteSSH(targetServer, `bash -c ${shellSingleQuote(inner)}`, {
+        zeroImpact: true,
+        timeoutMs: 15000,
+        jobId,
+      });
+      onLog(
+        `[Panel Mapping] Đã đăng ký Database "${safeDb}" & User "${effectiveDbUser}" vào danh mục quản lý CyberPanel.`
+      );
+    }
+  } catch {
+    // Non-fatal: MySQL database và quyền truy cập đã được cấp thành công ở tầng hệ quản trị CSDL
+  }
 }
 
 function streamRestoreDatabaseOverSsh(params: {
@@ -812,25 +1071,87 @@ export async function executeRestoreJob(jobId: number): Promise<void> {
       }
     }
 
-    // 2. Khôi phục Database
+    // Trích xuất thông tin kết nối Database (DB_NAME, DB_USER, DB_PASSWORD, DB_HOST) từ wp-config.php / .env / configuration.php
+    let extractedConfigs = extractDbCredentialsFromDirectory(localPublicHtml);
+    if (
+      extractedConfigs.length === 0 &&
+      !targetServer.is_mock &&
+      payload.mode === 'DB_ONLY'
+    ) {
+      extractedConfigs = await extractDbCredentialsFromRemoteWebrootOverSsh({
+        server: targetServer,
+        targetUser,
+        targetDomain,
+        targetWebroot: resolvedWebroot,
+        jobId,
+      }).catch(() => []);
+    }
+
+    for (const cfg of extractedConfigs) {
+      appendLog(
+        `[Web Config] Đọc cấu hình ${cfg.sourceFile} ➔ DB_NAME="${cfg.dbName}", DB_USER="${cfg.dbUser || '(trống)'}", DB_HOST="${cfg.dbHost || 'localhost'}"${cfg.dbPassword !== undefined ? ' (đã trích xuất DB_PASSWORD)' : ''}.`
+      );
+    }
+
+    // Tự động bổ sung file dump SQL từ thư mục databases cục bộ nếu metadata item.databases_list bị thiếu
+    const availableDatabases: DatabaseBackupInfo[] = [...item.databases_list];
+    if (fs.existsSync(localDatabasesDir)) {
+      try {
+        const existingFiles = new Set(availableDatabases.map((d) => d.file));
+        const dirEntries = fs.readdirSync(localDatabasesDir);
+        for (const entryName of dirEntries) {
+          if (existingFiles.has(entryName)) continue;
+          const matchDump = entryName.match(/^(.+?)\.sql(?:\.zst|\.gz)?$/i);
+          if (!matchDump) continue;
+          const rawBase = matchDump[1];
+          const isPgDump = rawBase.startsWith('pg_');
+          const inferredDbName = isPgDump ? rawBase.slice(3) : rawBase;
+          if (!isSafeDbName(inferredDbName)) continue;
+          const fullDumpPath = path.join(localDatabasesDir, entryName);
+          const st = fs.lstatSync(fullDumpPath, { throwIfNoEntry: false });
+          if (!st || !st.isFile() || st.isSymbolicLink()) continue;
+          const matchedCfg =
+            extractedConfigs.find((c) => c.dbName === inferredDbName) ||
+            (extractedConfigs.length === 1 ? extractedConfigs[0] : undefined);
+          availableDatabases.push({
+            name: inferredDbName,
+            file: entryName,
+            size_bytes: st.size,
+            db_user: matchedCfg?.dbUser || targetUser,
+            engine: isPgDump ? 'POSTGRESQL' : 'MYSQL',
+          });
+        }
+      } catch {
+        // Ignore directory scan errors
+      }
+    }
+
+    const effectiveDbRenameMap: Record<string, string> = {
+      ...(payload.targetDbMap || {}),
+    };
+    const provisionedDbNames = new Set<string>();
+    let cachedMysqlCreds: MysqlAdminCredentials | null = null;
+
+    // 2. Khôi phục Database & Tự động khởi tạo User / Mapping quyền truy cập
     if (payload.mode === 'DB_ONLY' || payload.mode === 'FULL') {
       const dbsToRestore: DatabaseBackupInfo[] = payload.selectedDatabases?.length
-        ? item.databases_list.filter((d) =>
+        ? availableDatabases.filter((d) =>
             payload.selectedDatabases!.includes(d.name)
           )
-        : item.databases_list;
+        : availableDatabases;
 
       if (dbsToRestore.length === 0) {
-        appendLog(`[DB Restore] Không có database nào được chọn hoặc domain không dùng DB.`);
+        appendLog(
+          `[DB Restore] Không có file dump SQL nào trong bản sao lưu${extractedConfigs.length > 0 ? '; sẽ kiểm tra khởi tạo DB/User rỗng từ tệp cấu hình web' : ''}.`
+        );
       } else {
         const needsMysqlCreds = dbsToRestore.some(
           (d) => !(d.engine === 'POSTGRESQL' || d.file.startsWith('pg_'))
         );
-        const creds = needsMysqlCreds
-          ? await targetAdapter.getMysqlAdminCredentials(targetServer)
-          : null;
-        const authFlags = creds ? buildMysqlAuthFlags(creds) : '';
-        const envPrelude = creds ? buildRemoteMysqlEnvPrelude(creds) : '';
+        if (needsMysqlCreds) {
+          cachedMysqlCreds =
+            await targetAdapter.getMysqlAdminCredentials(targetServer);
+        }
 
         for (let i = 0; i < dbsToRestore.length; i++) {
           if (isJobCancelled(jobId)) {
@@ -842,9 +1163,25 @@ export async function executeRestoreJob(jobId: number): Promise<void> {
             dbInfo.engine === 'POSTGRESQL' || dbInfo.file.startsWith('pg_');
           const targetDbName = assertSafe(
             isSafeDbName,
-            payload.targetDbMap?.[dbInfo.name]?.trim() || dbInfo.name,
+            effectiveDbRenameMap[dbInfo.name]?.trim() || dbInfo.name,
             'Tên database đích'
           );
+
+          const matchedConfig: ExtractedWebDbConfig | undefined =
+            extractedConfigs.find(
+              (c) => c.dbName === dbInfo.name || c.dbName === targetDbName
+            ) ||
+            (dbsToRestore.length === 1 && extractedConfigs.length === 1
+              ? extractedConfigs[0]
+              : undefined);
+
+          if (
+            matchedConfig &&
+            matchedConfig.dbName !== targetDbName &&
+            isSafeDbName(matchedConfig.dbName)
+          ) {
+            effectiveDbRenameMap[matchedConfig.dbName] = targetDbName;
+          }
 
           if (
             !dbInfo.file ||
@@ -869,8 +1206,10 @@ export async function executeRestoreJob(jobId: number): Promise<void> {
           );
 
           if (isPostgres) {
+            const pgUser =
+              matchedConfig?.dbUser || dbInfo.db_user || targetUser;
             appendLog(
-              `[PG Stream Restore] Stream ${dbInfo.file} ➔ PostgreSQL(${targetServer.hostname}) / DB: ${targetDbName}`
+              `[PG Stream Restore] Stream ${dbInfo.file} ➔ PostgreSQL(${targetServer.hostname}) / DB: ${targetDbName} (User: ${pgUser})`
             );
 
             if (targetServer.is_mock) {
@@ -884,46 +1223,199 @@ export async function executeRestoreJob(jobId: number): Promise<void> {
                 targetServer,
                 dumpFilePath: dumpPath,
                 targetDbName,
-                targetDbUser: dbInfo.db_user || targetUser,
+                targetDbUser: pgUser,
               });
               appendLog(
                 `[PG Stream Restore] ✅ Hoàn tất nạp PostgreSQL Database "${targetDbName}".`
               );
             }
           } else {
+            const dbUserToProvision = (
+              matchedConfig?.dbUser ||
+              dbInfo.db_user ||
+              ''
+            ).trim();
+            const dbPasswordToProvision = matchedConfig?.dbPassword;
+            const dbHostToProvision = matchedConfig?.dbHost || 'localhost';
+
+            const provisionPlan = buildMysqlProvisionDatabaseAndUserScript({
+              creds: cachedMysqlCreds || { user: 'root' },
+              targetDbName,
+              dbUser: dbUserToProvision,
+              dbPassword: dbPasswordToProvision,
+              dbHost: dbHostToProvision,
+              panelType: targetServer.panel_type,
+              targetSystemUser: targetUser,
+            });
+
             appendLog(
               `[DB Stream Restore] Stream ${dbInfo.file} ➔ MySQL(${targetServer.hostname}) / DB: ${targetDbName}`
             );
 
             if (targetServer.is_mock) {
               await new Promise((r) => setTimeout(r, 450));
+              if (provisionPlan.provisionedUser) {
+                appendLog(
+                  `[DB Provision] ✅ Đã khởi tạo MySQL User "${provisionPlan.provisionedUser}" và gán quyền (ALL PRIVILEGES) vào Database "${targetDbName}"${matchedConfig ? ` (từ ${matchedConfig.sourceFile})` : ''}.`
+                );
+              }
               appendLog(
                 `[DB Stream Restore] ✅ Đã nạp thành công toàn bộ bảng vào database "${targetDbName}" trên ${targetServer.hostname}.`
               );
             } else {
-              const createDbCmd = `bash -o pipefail -c ${shellSingleQuote(
-                `${envPrelude}mysql ${authFlags} -e "CREATE DATABASE IF NOT EXISTS \\\`${targetDbName}\\\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"`
-              )}`;
-              const createRes = await execRemoteSSH(targetServer, createDbCmd, {
-                zeroImpact: true,
-                jobId,
-              });
+              const createRes = await execRemoteSSH(
+                targetServer,
+                provisionPlan.createDbCommand,
+                {
+                  zeroImpact: true,
+                  jobId,
+                }
+              );
               if (createRes.code !== 0) {
                 throw new Error(
                   `Không thể khởi tạo database đích "${targetDbName}": ${createRes.stderr.trim()}`
                 );
               }
+
+              if (provisionPlan.provisionUserCommand) {
+                const userRes = await execRemoteSSH(
+                  targetServer,
+                  provisionPlan.provisionUserCommand,
+                  {
+                    zeroImpact: true,
+                    jobId,
+                  }
+                );
+                if (userRes.code === 0) {
+                  if (provisionPlan.provisionedUser) {
+                    appendLog(
+                      `[DB Provision] ✅ Đã khởi tạo MySQL User "${provisionPlan.provisionedUser}" và gán quyền (ALL PRIVILEGES) vào Database "${targetDbName}"${matchedConfig ? ` (từ ${matchedConfig.sourceFile})` : ''}.`
+                    );
+                  }
+                } else {
+                  appendLog(
+                    `[Cảnh báo] Khởi tạo User/Grant cho Database "${targetDbName}" trả về mã ${userRes.code}: ${userRes.stderr.trim()}`
+                  );
+                }
+              }
+
               await streamRestoreDatabaseOverSsh({
                 jobId,
                 targetServer,
-                creds: creds!,
+                creds: cachedMysqlCreds!,
                 dumpFilePath: dumpPath,
                 targetDbName,
               });
+
+              await registerRestoredDatabaseInPanel({
+                targetServer,
+                creds: cachedMysqlCreds!,
+                targetUser,
+                targetDomain,
+                targetDbName,
+                dbUser:
+                  provisionPlan.provisionedUser ||
+                  dbUserToProvision ||
+                  targetUser,
+                dbPassword: dbPasswordToProvision,
+                jobId,
+                onLog: appendLog,
+              });
+
               appendLog(
                 `[DB Stream Restore] ✅ Hoàn tất nạp Database "${targetDbName}".`
               );
             }
+          }
+
+          provisionedDbNames.add(dbInfo.name);
+          provisionedDbNames.add(targetDbName);
+          if (matchedConfig) {
+            provisionedDbNames.add(matchedConfig.dbName);
+          }
+        }
+      }
+    }
+
+    // 2b. Nếu tệp cấu hình (wp-config.php / .env / configuration.php) khai báo DB/User chưa có trong danh sách dump SQL,
+    // tự động khởi tạo Database + MySQL User + Password + Mapping để website kết nối được ngay không cần tạo thủ công.
+    const unprovisionedConfigs = extractedConfigs.filter(
+      (c) => !provisionedDbNames.has(c.dbName)
+    );
+    if (unprovisionedConfigs.length > 0) {
+      if (!cachedMysqlCreds && !targetServer.is_mock) {
+        try {
+          cachedMysqlCreds =
+            await targetAdapter.getMysqlAdminCredentials(targetServer);
+        } catch (credErr) {
+          appendLog(
+            `[Cảnh báo] Không thể lấy thông tin quản trị MySQL để khởi tạo DB từ cấu hình web: ${(credErr as Error).message}`
+          );
+        }
+      }
+
+      for (const cfg of unprovisionedConfigs) {
+        const targetDbName = assertSafe(
+          isSafeDbName,
+          effectiveDbRenameMap[cfg.dbName]?.trim() || cfg.dbName,
+          'Tên database đích'
+        );
+        const provisionPlan = buildMysqlProvisionDatabaseAndUserScript({
+          creds: cachedMysqlCreds || { user: 'root' },
+          targetDbName,
+          dbUser: cfg.dbUser,
+          dbPassword: cfg.dbPassword,
+          dbHost: cfg.dbHost,
+          panelType: targetServer.panel_type,
+          targetSystemUser: targetUser,
+        });
+
+        if (targetServer.is_mock) {
+          appendLog(
+            `[DB Provision] ✅ Đã tự động khởi tạo Database "${targetDbName}"${provisionPlan.provisionedUser ? ` & MySQL User "${provisionPlan.provisionedUser}" (ALL PRIVILEGES)` : ''} từ ${cfg.sourceFile}.`
+          );
+          provisionedDbNames.add(cfg.dbName);
+          provisionedDbNames.add(targetDbName);
+        } else if (cachedMysqlCreds) {
+          const createRes = await execRemoteSSH(
+            targetServer,
+            provisionPlan.createDbCommand,
+            {
+              zeroImpact: true,
+              jobId,
+            }
+          );
+          if (createRes.code === 0) {
+            if (provisionPlan.provisionUserCommand) {
+              await execRemoteSSH(
+                targetServer,
+                provisionPlan.provisionUserCommand,
+                {
+                  zeroImpact: true,
+                  jobId,
+                }
+              );
+            }
+            await registerRestoredDatabaseInPanel({
+              targetServer,
+              creds: cachedMysqlCreds,
+              targetUser,
+              targetDomain,
+              targetDbName,
+              dbUser: provisionPlan.provisionedUser || cfg.dbUser || targetUser,
+              dbPassword: cfg.dbPassword,
+              jobId,
+              onLog: appendLog,
+            });
+            appendLog(
+              `[DB Provision] ✅ Đã tự động khởi tạo Database "${targetDbName}"${provisionPlan.provisionedUser ? ` & MySQL User "${provisionPlan.provisionedUser}" (ALL PRIVILEGES)` : ''} từ ${cfg.sourceFile}.`
+            );
+            provisionedDbNames.add(cfg.dbName);
+            provisionedDbNames.add(targetDbName);
+          } else {
+            appendLog(
+              `[Cảnh báo] Không thể khởi tạo Database "${targetDbName}" từ ${cfg.sourceFile}: ${createRes.stderr.trim()}`
+            );
           }
         }
       }
@@ -938,7 +1430,7 @@ export async function executeRestoreJob(jobId: number): Promise<void> {
         targetDomain,
         targetWebroot: resolvedWebroot,
         sourceWebroot: item.source_webroot || '',
-        dbRenameMap: payload.targetDbMap || {},
+        dbRenameMap: effectiveDbRenameMap,
         isMock: Boolean(targetServer.is_mock),
         mockWebrootDir: targetServer.is_mock ? mockRestoreDest : undefined,
         jobId,
