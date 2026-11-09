@@ -6,8 +6,10 @@ import {
   Activity,
   CheckCircle2,
   Download,
+  ExternalLink,
   Eye,
   FolderGit2,
+  Globe,
   Pin,
   PinOff,
   RefreshCw,
@@ -25,16 +27,47 @@ import {
   formatSpeed,
   getJobStatusMeta,
   getPanelBadgeClass,
+  resolveRealtimeJobView,
 } from '@/lib/format';
-import type { BackupItem, BackupJob, ServerRecord, UserRole } from '@/types';
+import type {
+  BackupItem,
+  BackupJob,
+  RestoreRequestPayload,
+  ServerRecord,
+  UserRole,
+} from '@/types';
 
 interface ExtendedJob extends BackupJob {
   domains_count?: number;
   verified_domains_count?: number;
 }
 
+function parseRestoreOptions(
+  raw?: string | null
+): Partial<RestoreRequestPayload> | null {
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw) as Partial<RestoreRequestPayload>;
+  } catch {
+    return null;
+  }
+}
+
+function getRestoreModeLabel(mode?: string): string {
+  switch (mode) {
+    case 'FULL':
+      return 'Toàn bộ (Web + DB)';
+    case 'FILES_ONLY':
+      return 'Chỉ Mã nguồn (Files)';
+    case 'DB_ONLY':
+      return 'Chỉ Database (SQL)';
+    default:
+      return 'Toàn bộ (Web + DB)';
+  }
+}
+
 export default function JobsPage() {
-  const { progressMap, lastUpdateCounter } = useRealtime();
+  const { progressMap, liveLogs, lastUpdateCounter } = useRealtime();
   const [jobs, setJobs] = useState<ExtendedJob[]>([]);
   const [servers, setServers] = useState<ServerRecord[]>([]);
   const [filterServer, setFilterServer] = useState('');
@@ -45,6 +78,7 @@ export default function JobsPage() {
   const [selectedJob, setSelectedJob] = useState<ExtendedJob | null>(null);
   const [jobItems, setJobItems] = useState<BackupItem[]>([]);
   const [detailLoading, setDetailLoading] = useState(false);
+  const selectedJobId = selectedJob?.id ?? null;
 
   // Offsite Cloud 3-2-1 Push State
   const [pushingOffsiteJobId, setPushingOffsiteJobId] = useState<number | null>(
@@ -90,6 +124,25 @@ export default function JobsPage() {
   useEffect(() => {
     void loadJobs();
   }, [loadJobs, lastUpdateCounter]);
+
+  useEffect(() => {
+    if (!selectedJobId) return;
+    let active = true;
+    fetch(`/api/jobs/${selectedJobId}`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((json) => {
+        if (active && json?.job) {
+          setSelectedJob(json.job);
+          if (Array.isArray(json.items)) {
+            setJobItems(json.items);
+          }
+        }
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, [selectedJobId, lastUpdateCounter]);
 
   const openJobDetail = async (job: ExtendedJob) => {
     setSelectedJob(job);
@@ -282,12 +335,19 @@ export default function JobsPage() {
             </div>
           ) : (
             jobs.map((job) => {
-              const live = progressMap[job.id];
-              const status = live?.status || job.status;
-              const pct = live?.progressPercent ?? job.progress_percent;
-              const phase = live?.currentPhase ?? job.current_phase;
-              const speed = live?.speedBps ?? job.speed_bps;
-              const eta = live?.etaSeconds ?? job.eta_seconds;
+              const view = resolveRealtimeJobView(job, progressMap[job.id]);
+              const status = view.status;
+              const pct = view.progressPercent;
+              const phase = view.currentPhase;
+              const speed = view.speedBps;
+              const eta = view.etaSeconds;
+              const totalBytes = view.totalSizeBytes;
+              const deltaBytes = view.deltaSizeBytes;
+              const domain = view.currentDomain;
+              const restoreOpts =
+                job.job_type === 'RESTORE'
+                  ? parseRestoreOptions(job.restore_options)
+                  : null;
               const st = getJobStatusMeta(status);
 
               return (
@@ -302,6 +362,11 @@ export default function JobsPage() {
                       >
                         {job.job_type === 'RESTORE' ? 'RESTORE' : job.job_type}
                       </span>
+                      {job.job_type === 'RESTORE' && domain && (
+                        <span className="px-1.5 py-0.5 text-[10px] rounded bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 font-mono">
+                          🌐 {domain}
+                        </span>
+                      )}
                       {job.is_pinned === 1 && (
                         <span className="px-1.5 py-0.5 text-[10px] rounded bg-amber-500/20 text-amber-300 border border-amber-500/30">
                           📌 Pinned
@@ -366,17 +431,29 @@ export default function JobsPage() {
                   <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] bg-slate-950/70 border border-slate-800/80 rounded-xl px-3 py-2">
                     <div>
                       <span className="text-slate-200 font-medium">
-                        {formatBytes(job.total_size_bytes)}
+                        {formatBytes(totalBytes)}
                       </span>
-                      <span className="text-emerald-400 ml-2">
-                        Delta: +{formatBytes(job.delta_size_bytes)}
-                      </span>
+                      {job.job_type === 'RESTORE' ? (
+                        <span className="text-cyan-400 ml-2">
+                          • {getRestoreModeLabel(restoreOpts?.mode)}
+                        </span>
+                      ) : (
+                        <span className="text-emerald-400 ml-2">
+                          Delta: +{formatBytes(deltaBytes)}
+                        </span>
+                      )}
                     </div>
                     {job.job_type === 'BACKUP' && status === 'COMPLETED' && (
                       <span className="inline-flex items-center gap-1 text-emerald-400 font-medium">
                         <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
                         {job.verified_domains_count || 0}/{job.domains_count || 0}{' '}
                         Verified ✅
+                      </span>
+                    )}
+                    {job.job_type === 'RESTORE' && status === 'COMPLETED' && (
+                      <span className="inline-flex items-center gap-1 text-emerald-400 font-semibold">
+                        <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+                        Đã khôi phục hoàn tất ✅
                       </span>
                     )}
                   </div>
@@ -388,8 +465,25 @@ export default function JobsPage() {
                       className="min-h-[38px] inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700"
                     >
                       <Eye className="w-3.5 h-3.5 shrink-0" />
-                      Chi tiết & Log
+                      {job.job_type === 'RESTORE' && status === 'COMPLETED'
+                        ? 'Kết quả & Log'
+                        : 'Chi tiết & Log'}
                     </button>
+
+                    {job.job_type === 'RESTORE' &&
+                      status === 'COMPLETED' &&
+                      domain && (
+                        <a
+                          href={`https://${domain}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="min-h-[38px] inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-600/20 hover:bg-emerald-600 text-emerald-300 hover:text-white border border-emerald-500/35 font-medium transition-colors"
+                        >
+                          <Globe className="w-3.5 h-3.5 shrink-0" />
+                          <span>Mở Website</span>
+                          <ExternalLink className="w-3 h-3 shrink-0" />
+                        </a>
+                      )}
 
                     {job.job_type === 'BACKUP' && status === 'COMPLETED' && (
                       <>
@@ -446,37 +540,39 @@ export default function JobsPage() {
                           </button>
                         )}
 
-                        <button
-                          type="button"
-                          onClick={() =>
-                            void runJobAction(
-                              job.id,
-                              job.is_pinned === 1 ? 'unpin' : 'pin'
-                            )
-                          }
-                          aria-label={
-                            job.is_pinned === 1
-                              ? 'Bỏ khóa Pin'
-                              : 'Khóa Pin chống xóa GFS'
-                          }
-                          className={`min-h-[38px] inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border ${
-                            job.is_pinned === 1
-                              ? 'bg-amber-500/20 border-amber-500/40 text-amber-300'
-                              : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-white'
-                          }`}
-                        >
-                          {job.is_pinned === 1 ? (
-                            <>
-                              <PinOff className="w-3.5 h-3.5 shrink-0" />
-                              <span>Bỏ ghim</span>
-                            </>
-                          ) : (
-                            <>
-                              <Pin className="w-3.5 h-3.5 shrink-0" />
-                              <span>Ghim</span>
-                            </>
-                          )}
-                        </button>
+                        {job.job_type === 'BACKUP' && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              void runJobAction(
+                                job.id,
+                                job.is_pinned === 1 ? 'unpin' : 'pin'
+                              )
+                            }
+                            aria-label={
+                              job.is_pinned === 1
+                                ? 'Bỏ khóa Pin'
+                                : 'Khóa Pin chống xóa GFS'
+                            }
+                            className={`min-h-[38px] inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border ${
+                              job.is_pinned === 1
+                                ? 'bg-amber-500/20 border-amber-500/40 text-amber-300'
+                                : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-white'
+                            }`}
+                          >
+                            {job.is_pinned === 1 ? (
+                              <>
+                                <PinOff className="w-3.5 h-3.5 shrink-0" />
+                                <span>Bỏ ghim</span>
+                              </>
+                            ) : (
+                              <>
+                                <Pin className="w-3.5 h-3.5 shrink-0" />
+                                <span>Ghim</span>
+                              </>
+                            )}
+                          </button>
+                        )}
                       </>
                     )}
 
@@ -505,8 +601,8 @@ export default function JobsPage() {
                 <th className="p-4 font-medium">ID / Máy chủ</th>
                 <th className="p-4 font-medium">Snapshot</th>
                 <th className="p-4 font-medium">Tiến trình Realtime</th>
-                <th className="p-4 font-medium">Dung lượng / Delta</th>
-                <th className="p-4 font-medium">Kiểm định SQL</th>
+                <th className="p-4 font-medium">Dung lượng / Chế độ</th>
+                <th className="p-4 font-medium">Kiểm định / Kết quả</th>
                 <th className="p-4 font-medium">Trạng thái</th>
                 <th className="p-4 font-medium text-right">Thao tác</th>
               </tr>
@@ -526,18 +622,25 @@ export default function JobsPage() {
                 </tr>
               ) : (
                 jobs.map((job) => {
-                  const live = progressMap[job.id];
-                  const status = live?.status || job.status;
-                  const pct = live?.progressPercent ?? job.progress_percent;
-                  const phase = live?.currentPhase ?? job.current_phase;
-                  const speed = live?.speedBps ?? job.speed_bps;
-                  const eta = live?.etaSeconds ?? job.eta_seconds;
+                  const view = resolveRealtimeJobView(job, progressMap[job.id]);
+                  const status = view.status;
+                  const pct = view.progressPercent;
+                  const phase = view.currentPhase;
+                  const speed = view.speedBps;
+                  const eta = view.etaSeconds;
+                  const totalBytes = view.totalSizeBytes;
+                  const deltaBytes = view.deltaSizeBytes;
+                  const domain = view.currentDomain;
+                  const restoreOpts =
+                    job.job_type === 'RESTORE'
+                      ? parseRestoreOptions(job.restore_options)
+                      : null;
                   const st = getJobStatusMeta(status);
 
                   return (
                     <tr key={job.id} className="hover:bg-slate-800/30">
                       <td className="p-4">
-                        <div className="font-semibold text-white flex items-center gap-1.5">
+                        <div className="font-semibold text-white flex items-center gap-1.5 flex-wrap">
                           <span>#{job.id}</span>
                           <span>{job.server_hostname}</span>
                           {job.is_pinned === 1 && (
@@ -551,7 +654,7 @@ export default function JobsPage() {
                             </span>
                           )}
                         </div>
-                        <div className="flex items-center gap-2 mt-1">
+                        <div className="flex flex-wrap items-center gap-1.5 mt-1">
                           <span
                             className={`text-[10px] px-1.5 py-0.5 rounded border ${getPanelBadgeClass(
                               job.server_panel
@@ -561,6 +664,11 @@ export default function JobsPage() {
                               ? `RESTORE ➔ ${job.target_server_hostname || ''}`
                               : job.server_panel}
                           </span>
+                          {job.job_type === 'RESTORE' && domain && (
+                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 font-mono">
+                              🌐 {domain}
+                            </span>
+                          )}
                           <span className="text-[11px] text-slate-500">
                             {job.volume_name || ''}
                           </span>
@@ -588,7 +696,9 @@ export default function JobsPage() {
                           />
                         </div>
                         <div className="flex justify-between text-[11px] text-slate-400">
-                          <span className="truncate max-w-[150px]">{phase}</span>
+                          <span className="truncate max-w-[165px]" title={phase}>
+                            {phase}
+                          </span>
                           <span className="font-mono text-slate-300">
                             {pct}%
                             {speed > 0
@@ -600,11 +710,17 @@ export default function JobsPage() {
 
                       <td className="p-4">
                         <div className="text-slate-200 font-medium">
-                          {formatBytes(job.total_size_bytes)}
+                          {formatBytes(totalBytes)}
                         </div>
-                        <div className="text-[11px] text-emerald-400">
-                          Delta: +{formatBytes(job.delta_size_bytes)}
-                        </div>
+                        {job.job_type === 'RESTORE' ? (
+                          <div className="text-[11px] text-cyan-400">
+                            {getRestoreModeLabel(restoreOpts?.mode)}
+                          </div>
+                        ) : (
+                          <div className="text-[11px] text-emerald-400">
+                            Delta: +{formatBytes(deltaBytes)}
+                          </div>
+                        )}
                       </td>
 
                       <td className="p-4">
@@ -613,6 +729,22 @@ export default function JobsPage() {
                             <CheckCircle2 className="w-3.5 h-3.5" />
                             {job.verified_domains_count || 0}/
                             {job.domains_count || 0} Verified ✅
+                          </span>
+                        ) : job.job_type === 'RESTORE' &&
+                          status === 'COMPLETED' ? (
+                          <span className="inline-flex items-center gap-1 text-emerald-400 font-semibold">
+                            <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+                            Đã khôi phục ✅
+                          </span>
+                        ) : job.job_type === 'RESTORE' &&
+                          ['RUNNING', 'QUEUED', 'RESUMING'].includes(status) ? (
+                          <span className="text-blue-400 font-medium">
+                            Đang khôi phục...
+                          </span>
+                        ) : job.job_type === 'RESTORE' &&
+                          status === 'FAILED' ? (
+                          <span className="text-rose-400 font-medium">
+                            Khôi phục lỗi ❌
                           </span>
                         ) : (
                           <span className="text-slate-500">—</span>
@@ -632,11 +764,29 @@ export default function JobsPage() {
                           <button
                             type="button"
                             onClick={() => void openJobDetail(job)}
-                            className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700"
+                            className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 whitespace-nowrap"
                           >
                             <Eye className="w-3.5 h-3.5" />
-                            Chi tiết
+                            {job.job_type === 'RESTORE' && status === 'COMPLETED'
+                              ? 'Kết quả'
+                              : 'Chi tiết'}
                           </button>
+
+                          {job.job_type === 'RESTORE' &&
+                            status === 'COMPLETED' &&
+                            domain && (
+                              <a
+                                href={`https://${domain}`}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                title={`Mở website đã khôi phục: https://${domain}`}
+                                className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-emerald-600/20 hover:bg-emerald-600 text-emerald-300 hover:text-white border border-emerald-500/35 font-medium whitespace-nowrap transition-colors"
+                              >
+                                <Globe className="w-3.5 h-3.5 shrink-0" />
+                                <span>Mở Web</span>
+                                <ExternalLink className="w-3 h-3 shrink-0" />
+                              </a>
+                            )}
 
                           {job.job_type === 'BACKUP' &&
                             status === 'COMPLETED' && (
@@ -701,31 +851,33 @@ export default function JobsPage() {
                                 </button>
                               )}
 
-                              <button
-                                type="button"
-                                onClick={() =>
-                                  void runJobAction(
-                                    job.id,
-                                    job.is_pinned === 1 ? 'unpin' : 'pin'
-                                  )
-                                }
-                                title={
-                                  job.is_pinned === 1
-                                    ? 'Bỏ khóa Pin'
-                                    : 'Khóa Pin chống xóa GFS'
-                                }
-                                className={`p-1.5 rounded-lg border ${
-                                  job.is_pinned === 1
-                                    ? 'bg-amber-500/20 border-amber-500/40 text-amber-300'
-                                    : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-white'
-                                }`}
-                              >
-                                {job.is_pinned === 1 ? (
-                                  <PinOff className="w-3.5 h-3.5" />
-                                ) : (
-                                  <Pin className="w-3.5 h-3.5" />
-                                )}
-                              </button>
+                              {job.job_type === 'BACKUP' && (
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    void runJobAction(
+                                      job.id,
+                                      job.is_pinned === 1 ? 'unpin' : 'pin'
+                                    )
+                                  }
+                                  title={
+                                    job.is_pinned === 1
+                                      ? 'Bỏ khóa Pin'
+                                      : 'Khóa Pin chống xóa GFS'
+                                  }
+                                  className={`p-1.5 rounded-lg border ${
+                                    job.is_pinned === 1
+                                      ? 'bg-amber-500/20 border-amber-500/40 text-amber-300'
+                                      : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-white'
+                                  }`}
+                                >
+                                  {job.is_pinned === 1 ? (
+                                    <PinOff className="w-3.5 h-3.5" />
+                                  ) : (
+                                    <Pin className="w-3.5 h-3.5" />
+                                  )}
+                                </button>
+                              )}
                             </>
                           )}
 
@@ -751,388 +903,520 @@ export default function JobsPage() {
       </div>
 
       {/* Job Details Modal */}
-      {selectedJob && (
-        <div className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4">
-          <div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-4xl w-full p-4 sm:p-6 gap-4 max-h-[calc(100dvh-2rem)] flex flex-col overflow-hidden">
-            <div className="flex items-start justify-between gap-3 shrink-0">
-              <div className="min-w-0">
-                <h3 className="text-sm sm:text-base font-bold text-white break-words">
-                  Chi tiết Job #{selectedJob.id} — {selectedJob.server_hostname}{' '}
-                  <span className="font-mono text-cyan-300 break-all">
-                    ({selectedJob.snapshot_name})
-                  </span>
-                </h3>
-                <p className="text-xs text-slate-400 mt-0.5 break-all">
-                  Phân vùng: {selectedJob.volume_name} (
-                  {selectedJob.volume_mount_path}) • Tổng file:{' '}
-                  {selectedJob.files_total} (Đổi: {selectedJob.files_changed})
-                </p>
-              </div>
-              <div className="flex items-center gap-2 shrink-0">
-                {selectedJob.job_type === 'BACKUP' &&
-                  (progressMap[selectedJob.id]?.status ||
-                    selectedJob.status) === 'COMPLETED' &&
-                  canPushOffsiteRole && (
+      {selectedJob &&
+        (() => {
+          const selectedView = resolveRealtimeJobView(
+            selectedJob,
+            progressMap[selectedJob.id]
+          );
+          const selectedStatusMeta = getJobStatusMeta(selectedView.status);
+          const selectedRestoreOpts =
+            selectedJob.job_type === 'RESTORE'
+              ? parseRestoreOptions(selectedJob.restore_options)
+              : null;
+          const selectedDomain =
+            selectedView.currentDomain ||
+            selectedRestoreOpts?.targetDomainName ||
+            jobItems[0]?.domain_name ||
+            '';
+          const liveJobLogLines = liveLogs
+            .filter((l) => l.jobId === selectedJob.id)
+            .map((l) => `[${l.timestamp}] ${l.line}`);
+          const combinedLogText =
+            selectedJob.live_log ||
+            (liveJobLogLines.length > 0 ? liveJobLogLines.join('\n') : '') ||
+            selectedJob.error_log ||
+            'Chưa có nhật ký.';
+
+          return (
+            <div className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4">
+              <div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-4xl w-full p-4 sm:p-6 gap-4 max-h-[calc(100dvh-2rem)] flex flex-col overflow-hidden">
+                <div className="flex items-start justify-between gap-3 shrink-0">
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <h3 className="text-sm sm:text-base font-bold text-white break-words">
+                        Chi tiết {selectedJob.job_type === 'RESTORE' ? 'Khôi phục' : 'Job'} #{selectedJob.id} —{' '}
+                        {selectedJob.server_hostname}
+                        {selectedJob.job_type === 'RESTORE' &&
+                        selectedJob.target_server_hostname
+                          ? ` ➔ ${selectedJob.target_server_hostname}`
+                          : ''}{' '}
+                        <span className="font-mono text-cyan-300 break-all">
+                          ({selectedJob.snapshot_name})
+                        </span>
+                      </h3>
+                      <span
+                        className={`px-2 py-0.5 rounded border text-[11px] font-medium ${selectedStatusMeta.className}`}
+                      >
+                        {selectedStatusMeta.label} ({selectedView.progressPercent}%)
+                      </span>
+                    </div>
+                    <p className="text-xs text-slate-400 mt-0.5 break-all">
+                      Phân vùng: {selectedJob.volume_name} (
+                      {selectedJob.volume_mount_path})
+                      {selectedJob.job_type === 'RESTORE'
+                        ? ` • Dung lượng khôi phục: ${formatBytes(
+                            selectedView.totalSizeBytes
+                          )}`
+                        : ` • Tổng file: ${selectedJob.files_total} (Đổi: ${selectedJob.files_changed})`}
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    {selectedJob.job_type === 'BACKUP' &&
+                      selectedView.status === 'COMPLETED' &&
+                      canPushOffsiteRole && (
+                        <button
+                          type="button"
+                          disabled={pushingOffsiteJobId === selectedJob.id}
+                          onClick={() => void handlePushOffsite(selectedJob)}
+                          className="hidden sm:inline-flex min-h-[38px] items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-emerald-600/20 hover:bg-emerald-600 text-emerald-300 hover:text-white border border-emerald-500/35 whitespace-nowrap disabled:opacity-50 transition-colors"
+                        >
+                          {pushingOffsiteJobId === selectedJob.id ? (
+                            <>
+                              <RefreshCw className="w-3.5 h-3.5 animate-spin shrink-0" />
+                              <span>Đang đẩy Offsite...</span>
+                            </>
+                          ) : (
+                            <span>☁️ Đẩy Offsite 3-2-1</span>
+                          )}
+                        </button>
+                      )}
                     <button
                       type="button"
-                      disabled={pushingOffsiteJobId === selectedJob.id}
-                      onClick={() => void handlePushOffsite(selectedJob)}
-                      className="hidden sm:inline-flex min-h-[38px] items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-emerald-600/20 hover:bg-emerald-600 text-emerald-300 hover:text-white border border-emerald-500/35 whitespace-nowrap disabled:opacity-50 transition-colors"
+                      onClick={() => setSelectedJob(null)}
+                      aria-label="Đóng"
+                      className="h-10 w-10 inline-flex items-center justify-center rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 shrink-0"
                     >
-                      {pushingOffsiteJobId === selectedJob.id ? (
-                        <>
-                          <RefreshCw className="w-3.5 h-3.5 animate-spin shrink-0" />
-                          <span>Đang đẩy Offsite...</span>
-                        </>
-                      ) : (
-                        <span>☁️ Đẩy Offsite 3-2-1</span>
-                      )}
+                      <X className="w-5 h-5" />
                     </button>
-                  )}
-                <button
-                  type="button"
-                  onClick={() => setSelectedJob(null)}
-                  aria-label="Đóng"
-                  className="h-10 w-10 inline-flex items-center justify-center rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 shrink-0"
-                >
-                  <X className="w-5 h-5" />
-                </button>
-              </div>
-            </div>
-
-            {selectedJob.job_type === 'BACKUP' &&
-              (progressMap[selectedJob.id]?.status || selectedJob.status) ===
-                'COMPLETED' &&
-              canPushOffsiteRole && (
-                <div className="sm:hidden shrink-0">
-                  <button
-                    type="button"
-                    disabled={pushingOffsiteJobId === selectedJob.id}
-                    onClick={() => void handlePushOffsite(selectedJob)}
-                    className="w-full min-h-[40px] inline-flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold bg-emerald-600/20 hover:bg-emerald-600 text-emerald-300 hover:text-white border border-emerald-500/35 disabled:opacity-50 transition-colors"
-                  >
-                    {pushingOffsiteJobId === selectedJob.id ? (
-                      <>
-                        <RefreshCw className="w-3.5 h-3.5 animate-spin shrink-0" />
-                        <span>Đang đẩy Offsite...</span>
-                      </>
-                    ) : (
-                      <span>☁️ Đẩy Offsite 3-2-1</span>
-                    )}
-                  </button>
-                </div>
-              )}
-
-            <div className="flex-1 overflow-y-auto space-y-5 min-h-0 pr-0.5">
-              {offsiteFeedback && offsiteFeedback.jobId === selectedJob.id && (
-                <div
-                  className={`p-3.5 rounded-xl border text-xs flex items-start justify-between gap-3 ${
-                    offsiteFeedback.ok
-                      ? 'bg-emerald-500/15 border-emerald-500/35 text-emerald-200'
-                      : 'bg-rose-500/15 border-rose-500/35 text-rose-200'
-                  }`}
-                >
-                  <div className="min-w-0 break-words space-y-1">
-                    <div>
-                      {offsiteFeedback.ok ? '✅ ' : '❌ '}
-                      {offsiteFeedback.text}
-                    </div>
-                    {!offsiteFeedback.ok && userRole === 'ADMIN' && (
-                      <div>
-                        <Link
-                          href="/settings?tab=backup"
-                          className="text-cyan-300 hover:underline font-semibold"
-                        >
-                          → Mở tab Sao lưu để thiết lập Đám mây Offsite 3-2-1
-                        </Link>
-                      </div>
-                    )}
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => setOffsiteFeedback(null)}
-                    aria-label="Đóng thông báo"
-                    className="text-slate-400 hover:text-white shrink-0"
-                  >
-                    <X className="w-4 h-4" />
-                  </button>
                 </div>
-              )}
 
-              {selectedJob.anomaly_detected === 1 && (
-                <div className="p-3.5 rounded-xl bg-rose-500/15 border border-rose-500/40 text-xs text-rose-200 break-words">
-                  🚨 <strong>Cảnh báo Bất thường (Anomaly Detection):</strong>{' '}
-                  {selectedJob.anomaly_reason}
-                </div>
-              )}
+                {selectedJob.job_type === 'BACKUP' &&
+                  selectedView.status === 'COMPLETED' &&
+                  canPushOffsiteRole && (
+                    <div className="sm:hidden shrink-0">
+                      <button
+                        type="button"
+                        disabled={pushingOffsiteJobId === selectedJob.id}
+                        onClick={() => void handlePushOffsite(selectedJob)}
+                        className="w-full min-h-[40px] inline-flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold bg-emerald-600/20 hover:bg-emerald-600 text-emerald-300 hover:text-white border border-emerald-500/35 disabled:opacity-50 transition-colors"
+                      >
+                        {pushingOffsiteJobId === selectedJob.id ? (
+                          <>
+                            <RefreshCw className="w-3.5 h-3.5 animate-spin shrink-0" />
+                            <span>Đang đẩy Offsite...</span>
+                          </>
+                        ) : (
+                          <span>☁️ Đẩy Offsite 3-2-1</span>
+                        )}
+                      </button>
+                    </div>
+                  )}
 
-              {detailLoading ? (
-                <div className="py-8 text-center text-xs text-slate-400">
-                  Đang tải danh sách Domain & Nhật ký phiên chạy...
-                </div>
-              ) : (
-                <>
-                  {jobItems.length > 0 && (
-                    <div className="space-y-2.5">
+                <div className="flex-1 overflow-y-auto space-y-5 min-h-0 pr-0.5">
+                  {/* Restore Completion / Progress Banner */}
+                  {selectedJob.job_type === 'RESTORE' && (
+                    <div
+                      className={`p-4 rounded-xl border text-xs space-y-3 ${
+                        selectedView.status === 'COMPLETED'
+                          ? 'bg-emerald-500/10 border-emerald-500/35 text-emerald-100'
+                          : selectedView.status === 'FAILED'
+                          ? 'bg-rose-500/10 border-rose-500/35 text-rose-100'
+                          : 'bg-blue-500/10 border-blue-500/35 text-blue-100'
+                      }`}
+                    >
                       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-                        <h4 className="text-xs font-semibold text-slate-200">
-                          Danh sách Website & Database trong Snapshot (
-                          {jobItems.length} domains)
-                        </h4>
-                        {userRole !== 'VIEWER' && (
-                          <button
-                            type="button"
-                            onClick={() =>
-                              void runJobAction(
-                                selectedJob.id,
-                                'verify_sandbox'
-                              )
-                            }
-                            className="w-full sm:w-auto justify-center min-h-[38px] inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs bg-violet-600/20 hover:bg-violet-600 text-violet-300 hover:text-white border border-violet-500/30 transition-colors"
-                          >
-                            <ShieldCheck className="w-3.5 h-3.5 shrink-0" />
-                            Chạy Kiểm thử SQL Sandbox Ngay
-                          </button>
+                        <div className="font-semibold text-sm flex items-center gap-2">
+                          {selectedView.status === 'COMPLETED' ? (
+                            <>
+                              <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                              <span>
+                                🎉 Khôi phục 1-Click hoàn tất 100%! Website đã sẵn sàng trên máy chủ đích.
+                              </span>
+                            </>
+                          ) : selectedView.status === 'FAILED' ? (
+                            <span>
+                              ❌ Tiến trình khôi phục dừng do sự cố: {selectedJob.error_log || selectedView.currentPhase}
+                            </span>
+                          ) : (
+                            <span>
+                              ♻️ {selectedView.currentPhase} ({selectedView.progressPercent}%)
+                            </span>
+                          )}
+                        </div>
+                        {selectedView.status === 'COMPLETED' && selectedDomain && (
+                          <div className="flex flex-wrap items-center gap-2 shrink-0">
+                            <a
+                              href={`https://${selectedDomain}`}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-semibold transition-colors"
+                            >
+                              <Globe className="w-3.5 h-3.5 shrink-0" />
+                              <span>Mở https://{selectedDomain}</span>
+                              <ExternalLink className="w-3 h-3 shrink-0" />
+                            </a>
+                            <Link
+                              href="/restore"
+                              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 font-medium transition-colors"
+                            >
+                              <span>Khôi phục bản khác</span>
+                            </Link>
+                          </div>
                         )}
                       </div>
 
-                      <div className="border border-slate-800 rounded-xl overflow-hidden">
-                        {/* Mobile Domain Card List (< md) */}
-                        <div className="md:hidden divide-y divide-slate-800">
-                          {jobItems.map((it) => (
-                            <div
-                              key={it.id}
-                              className="p-3.5 space-y-2.5 text-xs bg-slate-950/40"
-                            >
-                              <div className="flex items-start justify-between gap-2">
-                                <div className="min-w-0">
-                                  <div className="font-semibold text-white flex flex-wrap items-center gap-1.5">
-                                    <span className="break-all">
-                                      {it.domain_name}
-                                    </span>
-                                    {it.is_subdomain === 1 && (
-                                      <span className="text-[10px] px-1.5 py-0.5 rounded bg-violet-500/20 text-violet-300 border border-violet-500/30 font-medium shrink-0">
-                                        SUB
-                                      </span>
-                                    )}
-                                  </div>
-                                  <div className="text-[11px] font-mono text-slate-400 mt-0.5">
-                                    User: {it.system_user} • {it.php_version}
-                                  </div>
-                                  {it.source_webroot && (
-                                    <div className="text-[11px] font-mono text-slate-500 break-all mt-0.5">
-                                      {it.source_webroot}
-                                    </div>
-                                  )}
-                                </div>
-
-                                <div className="shrink-0">
-                                  {it.verification_status === 'PASSED' ? (
-                                    <span
-                                      title={it.verification_detail || ''}
-                                      className="px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 text-[11px] whitespace-nowrap"
-                                    >
-                                      Verified ✅
-                                    </span>
-                                  ) : it.verification_status === 'CORRUPTED' ? (
-                                    <span className="px-2 py-0.5 rounded bg-rose-500/15 text-rose-300 border border-rose-500/30 text-[11px] whitespace-nowrap">
-                                      Corrupted ❌
-                                    </span>
-                                  ) : (
-                                    <span className="text-[11px] text-slate-500 whitespace-nowrap">
-                                      Chưa kiểm tra
-                                    </span>
-                                  )}
-                                </div>
-                              </div>
-
-                              <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] bg-slate-950 border border-slate-800/80 rounded-lg px-2.5 py-1.5">
-                                <span className="text-slate-300">
-                                  Mã nguồn:{' '}
-                                  <strong className="text-white">
-                                    {formatBytes(it.webroot_size_bytes)}
-                                  </strong>
-                                </span>
-                                <div className="flex flex-wrap items-center gap-1.5 font-mono text-cyan-300">
-                                  {it.databases_list.length === 0 ? (
-                                    <span>Không dùng DB</span>
-                                  ) : (
-                                    it.databases_list.map((d) => {
-                                      const isPg =
-                                        d.engine === 'POSTGRESQL' ||
-                                        Boolean(d.file?.startsWith('pg_'));
-                                      return (
-                                        <span
-                                          key={d.name}
-                                          className="inline-flex items-center gap-1 break-all"
-                                        >
-                                          <span>
-                                            {d.name} ({formatBytes(d.size_bytes)})
-                                          </span>
-                                          {isPg && (
-                                            <span className="px-1.5 py-0.5 rounded bg-violet-500/20 text-violet-300 border border-violet-500/35 text-[10px] font-sans font-semibold shrink-0">
-                                              PostgreSQL
-                                            </span>
-                                          )}
-                                        </span>
-                                      );
-                                    })
-                                  )}
-                                </div>
-                              </div>
-
-                              <div className="flex flex-wrap items-center gap-2">
-                                <a
-                                  href={`/api/explorer/archive?jobId=${selectedJob.id}&domain=${encodeURIComponent(
-                                    it.domain_name
-                                  )}`}
-                                  title={`Tải trọn gói website ${it.domain_name} (.tar.gz)`}
-                                  className="flex-1 min-h-[38px] px-3 py-1.5 inline-flex items-center justify-center gap-1.5 rounded-lg bg-emerald-600/20 hover:bg-emerald-600 text-emerald-300 hover:text-white border border-emerald-500/30 font-semibold whitespace-nowrap transition-colors"
-                                >
-                                  <Download className="w-3.5 h-3.5 shrink-0" />
-                                  <span>Tải .tar.gz</span>
-                                </a>
-                                {userRole !== 'VIEWER' && (
-                                  <Link
-                                    href={`/restore?itemId=${it.id}`}
-                                    className="flex-1 min-h-[38px] px-3 py-1.5 inline-flex items-center justify-center rounded-lg bg-blue-600/20 hover:bg-blue-600 text-blue-300 hover:text-white border border-blue-500/30 font-semibold whitespace-nowrap transition-colors"
-                                  >
-                                    Restore →
-                                  </Link>
-                                )}
-                              </div>
-                            </div>
-                          ))}
+                      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5 pt-2 border-t border-slate-800/70 text-[11px]">
+                        <div className="bg-slate-950/60 rounded-lg p-2.5 border border-slate-800/80">
+                          <div className="text-slate-400">Tên miền đích</div>
+                          <div className="font-mono font-semibold text-white mt-0.5 break-all">
+                            {selectedDomain || '—'}
+                          </div>
                         </div>
+                        <div className="bg-slate-950/60 rounded-lg p-2.5 border border-slate-800/80">
+                          <div className="text-slate-400">Điều phối Máy chủ</div>
+                          <div className="font-semibold text-cyan-300 mt-0.5 break-all">
+                            {selectedJob.server_hostname} ➔{' '}
+                            {selectedJob.target_server_hostname ||
+                              selectedJob.server_hostname}
+                          </div>
+                        </div>
+                        <div className="bg-slate-950/60 rounded-lg p-2.5 border border-slate-800/80">
+                          <div className="text-slate-400">Chế độ Khôi phục</div>
+                          <div className="font-semibold text-white mt-0.5">
+                            {getRestoreModeLabel(selectedRestoreOpts?.mode)}
+                            {selectedRestoreOpts?.autoPatchConfig
+                              ? ' • Auto-Patch ON'
+                              : ''}
+                          </div>
+                        </div>
+                        <div className="bg-slate-950/60 rounded-lg p-2.5 border border-slate-800/80">
+                          <div className="text-slate-400">Thời điểm hoàn tất</div>
+                          <div className="font-semibold text-emerald-300 mt-0.5">
+                            {formatDateTime(
+                              selectedJob.completed_at || selectedJob.created_at
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  )}
 
-                        {/* Tablet/Desktop Table (>= md) */}
-                        <div className="hidden md:block overflow-x-auto">
-                          <table className="w-full min-w-[680px] text-left text-xs">
-                            <thead className="bg-slate-950 text-slate-400">
-                              <tr>
-                                <th className="p-3">Domain / System User</th>
-                                <th className="p-3">Mã nguồn</th>
-                                <th className="p-3">Databases (MySQL / PostgreSQL)</th>
-                                <th className="p-3">Trạng thái Sandbox</th>
-                                <th className="p-3 text-right">
-                                  Tải gói / Khôi phục
-                                </th>
-                              </tr>
-                            </thead>
-                            <tbody className="divide-y divide-slate-800">
+                  {offsiteFeedback && offsiteFeedback.jobId === selectedJob.id && (
+                    <div
+                      className={`p-3.5 rounded-xl border text-xs flex items-start justify-between gap-3 ${
+                        offsiteFeedback.ok
+                          ? 'bg-emerald-500/15 border-emerald-500/35 text-emerald-200'
+                          : 'bg-rose-500/15 border-rose-500/35 text-rose-200'
+                      }`}
+                    >
+                      <div className="min-w-0 break-words space-y-1">
+                        <div>
+                          {offsiteFeedback.ok ? '✅ ' : '❌ '}
+                          {offsiteFeedback.text}
+                        </div>
+                        {!offsiteFeedback.ok && userRole === 'ADMIN' && (
+                          <div>
+                            <Link
+                              href="/settings?tab=backup"
+                              className="text-cyan-300 hover:underline font-semibold"
+                            >
+                              → Mở tab Sao lưu để thiết lập Đám mây Offsite 3-2-1
+                            </Link>
+                          </div>
+                        )}
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setOffsiteFeedback(null)}
+                        aria-label="Đóng thông báo"
+                        className="text-slate-400 hover:text-white shrink-0"
+                      >
+                        <X className="w-4 h-4" />
+                      </button>
+                    </div>
+                  )}
+
+                  {selectedJob.anomaly_detected === 1 && (
+                    <div className="p-3.5 rounded-xl bg-rose-500/15 border border-rose-500/40 text-xs text-rose-200 break-words">
+                      🚨 <strong>Cảnh báo Bất thường (Anomaly Detection):</strong>{' '}
+                      {selectedJob.anomaly_reason}
+                    </div>
+                  )}
+
+                  {detailLoading ? (
+                    <div className="py-8 text-center text-xs text-slate-400">
+                      Đang tải danh sách Domain & Nhật ký phiên chạy...
+                    </div>
+                  ) : (
+                    <>
+                      {jobItems.length > 0 && (
+                        <div className="space-y-2.5">
+                          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                            <h4 className="text-xs font-semibold text-slate-200">
+                              {selectedJob.job_type === 'RESTORE'
+                                ? 'Bản sao lưu Website & Database Nguồn đã dùng để Khôi phục'
+                                : `Danh sách Website & Database trong Snapshot (${jobItems.length} domains)`}
+                            </h4>
+                            {userRole !== 'VIEWER' &&
+                              selectedJob.job_type === 'BACKUP' && (
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    void runJobAction(
+                                      selectedJob.id,
+                                      'verify_sandbox'
+                                    )
+                                  }
+                                  className="w-full sm:w-auto justify-center min-h-[38px] inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs bg-violet-600/20 hover:bg-violet-600 text-violet-300 hover:text-white border border-violet-500/30 transition-colors"
+                                >
+                                  <ShieldCheck className="w-3.5 h-3.5 shrink-0" />
+                                  Chạy Kiểm thử SQL Sandbox Ngay
+                                </button>
+                              )}
+                          </div>
+
+                          <div className="border border-slate-800 rounded-xl overflow-hidden">
+                            {/* Mobile Domain Card List (< md) */}
+                            <div className="md:hidden divide-y divide-slate-800">
                               {jobItems.map((it) => (
-                                <tr key={it.id}>
-                                  <td className="p-3">
-                                    <div className="font-semibold text-white flex items-center gap-1.5 flex-wrap">
-                                      <span>{it.domain_name}</span>
-                                      {it.is_subdomain === 1 && (
-                                        <span className="text-[10px] px-1.5 py-0.5 rounded bg-violet-500/20 text-violet-300 border border-violet-500/30 font-medium">
-                                          SUB
+                                <div
+                                  key={it.id}
+                                  className="p-3.5 space-y-2.5 text-xs bg-slate-950/40"
+                                >
+                                  <div className="flex items-start justify-between gap-2">
+                                    <div className="min-w-0">
+                                      <div className="font-semibold text-white flex flex-wrap items-center gap-1.5">
+                                        <span className="break-all">
+                                          {it.domain_name}
+                                        </span>
+                                        {it.is_subdomain === 1 && (
+                                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-violet-500/20 text-violet-300 border border-violet-500/30 font-medium shrink-0">
+                                            SUB
+                                          </span>
+                                        )}
+                                      </div>
+                                      <div className="text-[11px] font-mono text-slate-400 mt-0.5">
+                                        User: {it.system_user} • {it.php_version}
+                                      </div>
+                                      {it.source_webroot && (
+                                        <div className="text-[11px] font-mono text-slate-500 break-all mt-0.5">
+                                          {it.source_webroot}
+                                        </div>
+                                      )}
+                                    </div>
+
+                                    <div className="shrink-0">
+                                      {it.verification_status === 'PASSED' ? (
+                                        <span
+                                          title={it.verification_detail || ''}
+                                          className="px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 text-[11px] whitespace-nowrap"
+                                        >
+                                          Verified ✅
+                                        </span>
+                                      ) : it.verification_status === 'CORRUPTED' ? (
+                                        <span className="px-2 py-0.5 rounded bg-rose-500/15 text-rose-300 border border-rose-500/30 text-[11px] whitespace-nowrap">
+                                          Corrupted ❌
+                                        </span>
+                                      ) : (
+                                        <span className="text-[11px] text-slate-500 whitespace-nowrap">
+                                          Chưa kiểm tra
                                         </span>
                                       )}
                                     </div>
-                                    <div className="text-[11px] font-mono text-slate-400">
-                                      User: {it.system_user} • {it.php_version}
-                                    </div>
-                                  </td>
-                                  <td className="p-3 text-slate-300 whitespace-nowrap">
-                                    {formatBytes(it.webroot_size_bytes)}
-                                  </td>
-                                  <td className="p-3 font-mono text-[11px] text-cyan-300">
-                                    {it.databases_list.length === 0 ? (
-                                      <span className="text-slate-500 font-sans">
-                                        Không dùng DB
-                                      </span>
-                                    ) : (
-                                      <div className="flex flex-wrap items-center gap-1.5">
-                                        {it.databases_list.map((d) => {
+                                  </div>
+
+                                  <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] bg-slate-950 border border-slate-800/80 rounded-lg px-2.5 py-1.5">
+                                    <span className="text-slate-300">
+                                      Mã nguồn:{' '}
+                                      <strong className="text-white">
+                                        {formatBytes(it.webroot_size_bytes)}
+                                      </strong>
+                                    </span>
+                                    <div className="flex flex-wrap items-center gap-1.5 font-mono text-cyan-300">
+                                      {it.databases_list.length === 0 ? (
+                                        <span>Không dùng DB</span>
+                                      ) : (
+                                        it.databases_list.map((d) => {
                                           const isPg =
                                             d.engine === 'POSTGRESQL' ||
                                             Boolean(d.file?.startsWith('pg_'));
                                           return (
                                             <span
                                               key={d.name}
-                                              className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-slate-950 border border-slate-800"
+                                              className="inline-flex items-center gap-1 break-all"
                                             >
                                               <span>
                                                 {d.name} ({formatBytes(d.size_bytes)})
                                               </span>
                                               {isPg && (
-                                                <span className="px-1.5 py-0.5 rounded bg-violet-500/20 text-violet-300 border border-violet-500/35 text-[10px] font-sans font-semibold">
+                                                <span className="px-1.5 py-0.5 rounded bg-violet-500/20 text-violet-300 border border-violet-500/35 text-[10px] font-sans font-semibold shrink-0">
                                                   PostgreSQL
                                                 </span>
                                               )}
                                             </span>
                                           );
-                                        })}
-                                      </div>
-                                    )}
-                                  </td>
-                                  <td className="p-3 whitespace-nowrap">
-                                    {it.verification_status === 'PASSED' ? (
-                                      <span
-                                        title={it.verification_detail || ''}
-                                        className="px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 text-[11px]"
-                                      >
-                                        Verified ✅
-                                      </span>
-                                    ) : it.verification_status === 'CORRUPTED' ? (
-                                      <span className="px-2 py-0.5 rounded bg-rose-500/15 text-rose-300 border border-rose-500/30 text-[11px]">
-                                        Corrupted ❌
-                                      </span>
-                                    ) : (
-                                      <span className="text-slate-500">
-                                        Chưa kiểm tra
-                                      </span>
-                                    )}
-                                  </td>
-                                  <td className="p-3 text-right whitespace-nowrap">
-                                    <div className="inline-flex items-center justify-end gap-1.5">
-                                      <a
-                                        href={`/api/explorer/archive?jobId=${selectedJob.id}&domain=${encodeURIComponent(
-                                          it.domain_name
-                                        )}`}
-                                        title={`Tải trọn gói website ${it.domain_name} (.tar.gz)`}
-                                        className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-emerald-600/20 hover:bg-emerald-600 text-emerald-300 hover:text-white border border-emerald-500/30 transition-colors"
-                                      >
-                                        <Download className="w-3 h-3 shrink-0" />
-                                        <span>Tải .tar.gz</span>
-                                      </a>
-                                      {userRole !== 'VIEWER' && (
-                                        <Link
-                                          href={`/restore?itemId=${it.id}`}
-                                          className="inline-flex items-center px-2.5 py-1 rounded bg-blue-600/20 hover:bg-blue-600 text-blue-300 hover:text-white border border-blue-500/30 transition-colors"
-                                        >
-                                          Restore
-                                        </Link>
+                                        })
                                       )}
                                     </div>
-                                  </td>
-                                </tr>
-                              ))}
-                            </tbody>
-                          </table>
-                        </div>
-                      </div>
-                    </div>
-                  )}
+                                  </div>
 
-                  <div className="space-y-2">
-                    <h4 className="text-xs font-semibold text-slate-200">
-                      Nhật ký Thực thi Chi tiết (Worker Execution Log)
-                    </h4>
-                    <pre className="bg-slate-950 border border-slate-800 rounded-xl p-3.5 sm:p-4 font-mono text-xs text-slate-300 max-h-64 overflow-y-auto whitespace-pre-wrap break-words">
-                      {selectedJob.live_log ||
-                        selectedJob.error_log ||
-                        'Chưa có nhật ký.'}
-                    </pre>
-                  </div>
-                </>
-              )}
+                                  <div className="flex flex-wrap items-center gap-2">
+                                    <a
+                                      href={`/api/explorer/archive?jobId=${
+                                        it.job_id || selectedJob.id
+                                      }&domain=${encodeURIComponent(
+                                        it.domain_name
+                                      )}`}
+                                      title={`Tải trọn gói website ${it.domain_name} (.tar.gz)`}
+                                      className="flex-1 min-h-[38px] px-3 py-1.5 inline-flex items-center justify-center gap-1.5 rounded-lg bg-emerald-600/20 hover:bg-emerald-600 text-emerald-300 hover:text-white border border-emerald-500/30 font-semibold whitespace-nowrap transition-colors"
+                                    >
+                                      <Download className="w-3.5 h-3.5 shrink-0" />
+                                      <span>Tải .tar.gz</span>
+                                    </a>
+                                    {userRole !== 'VIEWER' && (
+                                      <Link
+                                        href={`/restore?itemId=${it.id}`}
+                                        className="flex-1 min-h-[38px] px-3 py-1.5 inline-flex items-center justify-center rounded-lg bg-blue-600/20 hover:bg-blue-600 text-blue-300 hover:text-white border border-blue-500/30 font-semibold whitespace-nowrap transition-colors"
+                                      >
+                                        Restore →
+                                      </Link>
+                                    )}
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+
+                            {/* Tablet/Desktop Table (>= md) */}
+                            <div className="hidden md:block overflow-x-auto">
+                              <table className="w-full min-w-[680px] text-left text-xs">
+                                <thead className="bg-slate-950 text-slate-400">
+                                  <tr>
+                                    <th className="p-3">Domain / System User</th>
+                                    <th className="p-3">Mã nguồn</th>
+                                    <th className="p-3">Databases (MySQL / PostgreSQL)</th>
+                                    <th className="p-3">Trạng thái Sandbox</th>
+                                    <th className="p-3 text-right">
+                                      Tải gói / Khôi phục
+                                    </th>
+                                  </tr>
+                                </thead>
+                                <tbody className="divide-y divide-slate-800">
+                                  {jobItems.map((it) => (
+                                    <tr key={it.id}>
+                                      <td className="p-3">
+                                        <div className="font-semibold text-white flex items-center gap-1.5 flex-wrap">
+                                          <span>{it.domain_name}</span>
+                                          {it.is_subdomain === 1 && (
+                                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-violet-500/20 text-violet-300 border border-violet-500/30 font-medium">
+                                              SUB
+                                            </span>
+                                          )}
+                                        </div>
+                                        <div className="text-[11px] font-mono text-slate-400">
+                                          User: {it.system_user} • {it.php_version}
+                                        </div>
+                                      </td>
+                                      <td className="p-3 text-slate-300 whitespace-nowrap">
+                                        {formatBytes(it.webroot_size_bytes)}
+                                      </td>
+                                      <td className="p-3 font-mono text-[11px] text-cyan-300">
+                                        {it.databases_list.length === 0 ? (
+                                          <span className="text-slate-500 font-sans">
+                                            Không dùng DB
+                                          </span>
+                                        ) : (
+                                          <div className="flex flex-wrap items-center gap-1.5">
+                                            {it.databases_list.map((d) => {
+                                              const isPg =
+                                                d.engine === 'POSTGRESQL' ||
+                                                Boolean(d.file?.startsWith('pg_'));
+                                              return (
+                                                <span
+                                                  key={d.name}
+                                                  className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-slate-950 border border-slate-800"
+                                                >
+                                                  <span>
+                                                    {d.name} ({formatBytes(d.size_bytes)})
+                                                  </span>
+                                                  {isPg && (
+                                                    <span className="px-1.5 py-0.5 rounded bg-violet-500/20 text-violet-300 border border-violet-500/35 text-[10px] font-sans font-semibold">
+                                                      PostgreSQL
+                                                    </span>
+                                                  )}
+                                                </span>
+                                              );
+                                            })}
+                                          </div>
+                                        )}
+                                      </td>
+                                      <td className="p-3 whitespace-nowrap">
+                                        {it.verification_status === 'PASSED' ? (
+                                          <span
+                                            title={it.verification_detail || ''}
+                                            className="px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 text-[11px]"
+                                          >
+                                            Verified ✅
+                                          </span>
+                                        ) : it.verification_status === 'CORRUPTED' ? (
+                                          <span className="px-2 py-0.5 rounded bg-rose-500/15 text-rose-300 border border-rose-500/30 text-[11px]">
+                                            Corrupted ❌
+                                          </span>
+                                        ) : (
+                                          <span className="text-slate-500">
+                                            Chưa kiểm tra
+                                          </span>
+                                        )}
+                                      </td>
+                                      <td className="p-3 text-right whitespace-nowrap">
+                                        <div className="inline-flex items-center justify-end gap-1.5">
+                                          <a
+                                            href={`/api/explorer/archive?jobId=${
+                                              it.job_id || selectedJob.id
+                                            }&domain=${encodeURIComponent(
+                                              it.domain_name
+                                            )}`}
+                                            title={`Tải trọn gói website ${it.domain_name} (.tar.gz)`}
+                                            className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-emerald-600/20 hover:bg-emerald-600 text-emerald-300 hover:text-white border border-emerald-500/30 transition-colors"
+                                          >
+                                            <Download className="w-3 h-3 shrink-0" />
+                                            <span>Tải .tar.gz</span>
+                                          </a>
+                                          {userRole !== 'VIEWER' && (
+                                            <Link
+                                              href={`/restore?itemId=${it.id}`}
+                                              className="inline-flex items-center px-2.5 py-1 rounded bg-blue-600/20 hover:bg-blue-600 text-blue-300 hover:text-white border border-blue-500/30 transition-colors"
+                                            >
+                                              Restore
+                                            </Link>
+                                          )}
+                                        </div>
+                                      </td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                            </div>
+                          </div>
+                        </div>
+                      )}
+
+                      <div className="space-y-2">
+                        <h4 className="text-xs font-semibold text-slate-200">
+                          Nhật ký Thực thi Chi tiết (Worker Execution Log)
+                        </h4>
+                        <pre className="bg-slate-950 border border-slate-800 rounded-xl p-3.5 sm:p-4 font-mono text-xs text-slate-300 max-h-64 overflow-y-auto whitespace-pre-wrap break-words">
+                          {combinedLogText}
+                        </pre>
+                      </div>
+                    </>
+                  )}
+                </div>
+              </div>
             </div>
-          </div>
-        </div>
-      )}
+          );
+        })()}
     </div>
   );
 }

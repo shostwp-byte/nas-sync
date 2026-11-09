@@ -1,4 +1,90 @@
-import type { JobStatus, PanelType } from '@/types';
+import type { JobStatus, PanelType, ProgressEventPayload } from '@/types';
+
+const TERMINAL_JOB_STATUSES = new Set<string>([
+  'COMPLETED',
+  'FAILED',
+  'CANCELLED',
+]);
+
+/**
+ * Hợp nhất trạng thái tiến trình giữa bản ghi CSDL (`job`) và gói tin WebSocket thời gian thực (`live`).
+ * Nếu CSDL đã ghi nhận trạng thái kết thúc (`COMPLETED`, `FAILED`, `CANCELLED`) nhưng `live` trong
+ * `progressMap` vẫn còn lưu bước trung gian đang chạy (ví dụ `RUNNING` ở `96%`), luôn ưu tiên trạng thái
+ * kết thúc từ CSDL để giao diện không bao giờ bị kẹt ở `96%` hoặc `RUNNING`.
+ */
+export function resolveRealtimeJobView(
+  job: {
+    status: JobStatus;
+    progress_percent: number;
+    current_phase: string;
+    current_domain?: string | null;
+    speed_bps?: number;
+    eta_seconds?: number;
+    total_size_bytes?: number;
+    delta_size_bytes?: number;
+    retry_count?: number;
+  },
+  live?: ProgressEventPayload | null
+): {
+  status: JobStatus;
+  progressPercent: number;
+  currentPhase: string;
+  currentDomain: string;
+  speedBps: number;
+  etaSeconds: number;
+  totalSizeBytes: number;
+  deltaSizeBytes: number;
+  retryCount: number;
+} {
+  if (
+    TERMINAL_JOB_STATUSES.has(job.status) &&
+    (!live || !TERMINAL_JOB_STATUSES.has(live.status))
+  ) {
+    return {
+      status: job.status,
+      progressPercent:
+        job.status === 'COMPLETED'
+          ? 100
+          : Math.max(0, Math.min(100, Number(job.progress_percent || 0))),
+      currentPhase:
+        job.current_phase ||
+        (job.status === 'COMPLETED' ? 'Hoàn tất 100%' : ''),
+      currentDomain: job.current_domain || live?.currentDomain || '',
+      speedBps: 0,
+      etaSeconds: 0,
+      totalSizeBytes:
+        Number(job.total_size_bytes || 0) || Number(live?.totalSizeBytes || 0),
+      deltaSizeBytes:
+        Number(job.delta_size_bytes || 0) || Number(live?.deltaSizeBytes || 0),
+      retryCount: Number(job.retry_count ?? live?.retryCount ?? 0),
+    };
+  }
+
+  const resolvedStatus = (live?.status || job.status) as JobStatus;
+  const rawPct = live?.progressPercent ?? job.progress_percent ?? 0;
+  const resolvedPct =
+    resolvedStatus === 'COMPLETED'
+      ? 100
+      : Math.max(0, Math.min(100, Number(rawPct)));
+
+  return {
+    status: resolvedStatus,
+    progressPercent: resolvedPct,
+    currentPhase: live?.currentPhase ?? job.current_phase ?? '',
+    currentDomain: live?.currentDomain ?? job.current_domain ?? '',
+    speedBps: TERMINAL_JOB_STATUSES.has(resolvedStatus)
+      ? 0
+      : Number(live?.speedBps ?? job.speed_bps ?? 0),
+    etaSeconds: TERMINAL_JOB_STATUSES.has(resolvedStatus)
+      ? 0
+      : Number(live?.etaSeconds ?? job.eta_seconds ?? 0),
+    totalSizeBytes:
+      Number(live?.totalSizeBytes || 0) || Number(job.total_size_bytes || 0),
+    deltaSizeBytes:
+      Number(live?.deltaSizeBytes || 0) || Number(job.delta_size_bytes || 0),
+    retryCount: Number(live?.retryCount ?? job.retry_count ?? 0),
+  };
+}
 
 export function formatBytes(bytes: number | null | undefined): string {
   const b = Number(bytes || 0);

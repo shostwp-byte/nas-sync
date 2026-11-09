@@ -28,6 +28,7 @@ import {
   formatSpeed,
   getJobStatusMeta,
   getPanelBadgeClass,
+  resolveRealtimeJobView,
 } from '@/lib/format';
 import type {
   BackupJob,
@@ -179,11 +180,16 @@ export default function DashboardPage() {
   }
 
   const stats = data?.stats;
-  const activeJobs = (data?.recentJobs || []).filter((j) =>
-    ['QUEUED', 'RUNNING', 'RESUMING', 'VERIFYING', 'INTERRUPTED'].includes(
-      progressMap[j.id]?.status || j.status
-    )
-  );
+  const activeJobs = (data?.recentJobs || []).filter((j) => {
+    const view = resolveRealtimeJobView(j, progressMap[j.id]);
+    return [
+      'QUEUED',
+      'RUNNING',
+      'RESUMING',
+      'VERIFYING',
+      'INTERRUPTED',
+    ].includes(view.status);
+  });
 
   // Precompute 30-day SVG chart geometry
   const svgW = 680;
@@ -1113,14 +1119,14 @@ export default function DashboardPage() {
           ) : (
             <div className="space-y-3">
               {activeJobs.map((j) => {
-                const live = progressMap[j.id];
-                const pct = live?.progressPercent ?? j.progress_percent;
-                const phase = live?.currentPhase ?? j.current_phase;
-                const dom = live?.currentDomain ?? j.current_domain;
-                const speed = live?.speedBps ?? j.speed_bps;
-                const eta = live?.etaSeconds ?? j.eta_seconds;
-                const retries = live?.retryCount ?? j.retry_count;
-                const st = getJobStatusMeta(live?.status ?? j.status);
+                const view = resolveRealtimeJobView(j, progressMap[j.id]);
+                const pct = view.progressPercent;
+                const phase = view.currentPhase;
+                const dom = view.currentDomain;
+                const speed = view.speedBps;
+                const eta = view.etaSeconds;
+                const retries = view.retryCount;
+                const st = getJobStatusMeta(view.status);
 
                 return (
                   <div
@@ -1230,9 +1236,8 @@ export default function DashboardPage() {
               </div>
             ) : (
               (data?.recentJobs || []).slice(0, 8).map((job) => {
-                const st = getJobStatusMeta(
-                  progressMap[job.id]?.status || job.status
-                );
+                const view = resolveRealtimeJobView(job, progressMap[job.id]);
+                const st = getJobStatusMeta(view.status);
                 return (
                   <div key={job.id} className="py-3.5 first:pt-0 last:pb-0 space-y-2 text-xs">
                     <div className="flex items-start justify-between gap-2">
@@ -1301,9 +1306,8 @@ export default function DashboardPage() {
               </thead>
               <tbody className="divide-y divide-slate-800/70">
                 {(data?.recentJobs || []).slice(0, 8).map((job) => {
-                  const st = getJobStatusMeta(
-                    progressMap[job.id]?.status || job.status
-                  );
+                  const view = resolveRealtimeJobView(job, progressMap[job.id]);
+                  const st = getJobStatusMeta(view.status);
                   return (
                     <tr key={job.id} className="hover:bg-slate-800/30">
                       <td className="py-3 pr-3">

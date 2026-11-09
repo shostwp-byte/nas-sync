@@ -988,4 +988,156 @@ test('5. [Wave 6 & 8 — A5, A11, A13, A14, O7, C1, S2, S10] Xóa triệt để 
   assert.doesNotThrow(() =>
     validateWormEndpointUrl('http://127.0.0.1:18080', 'WORM Loopback Test')
   );
+
+  // Kiểm thử hồi quy 1-Click Restore: Không bao giờ bị kẹt ở 96% trên lưới tiến trình sau khi hoàn tất
+  const { resolveRealtimeJobView } = await import('../src/lib/format');
+  const { executeRestoreJob } = await import('../src/lib/engine/restore-worker');
+
+  // 1) Kiểm tra resolveRealtimeJobView khi progressMap còn lưu trạng thái 96% RUNNING nhưng CSDL đã COMPLETED 100%
+  const resolvedCompleted = resolveRealtimeJobView(
+    {
+      status: 'COMPLETED',
+      progress_percent: 100,
+      current_phase: 'Khôi phục hoàn tất 100%',
+      current_domain: 'restore-check.vn',
+      total_size_bytes: 52_428_800,
+      delta_size_bytes: 0,
+      retry_count: 0,
+    },
+    {
+      jobId: 999,
+      serverId: 1,
+      hostname: 'vps-target',
+      status: 'RUNNING',
+      progressPercent: 96,
+      currentPhase: 'Đang tự động hiệu chỉnh cấu hình kết nối Web / Database...',
+      currentDomain: 'restore-check.vn',
+      speedBps: 1024,
+      etaSeconds: 5,
+      deltaSizeBytes: 0,
+      totalSizeBytes: 52_428_800,
+      retryCount: 0,
+    }
+  );
+  assert.equal(resolvedCompleted.status, 'COMPLETED');
+  assert.equal(resolvedCompleted.progressPercent, 100);
+  assert.equal(resolvedCompleted.currentPhase, 'Khôi phục hoàn tất 100%');
+  assert.equal(resolvedCompleted.speedBps, 0);
+
+  // 2) Chạy thực tế executeRestoreJob với autoPatchConfig = true (đi qua mốc 96%) và kiểm tra CSDL + Socket.IO event
+  const volRow = db
+    .prepare('SELECT id, mount_path FROM storage_volumes ORDER BY id ASC LIMIT 1')
+    .get() as { id: number; mount_path: string };
+  const mockSrvIns = db
+    .prepare(
+      `INSERT INTO servers (hostname, ip_address, ssh_port, ssh_user, panel_type, assigned_volume_id, is_mock, status)
+       VALUES ('mock-restore-srv', '198.51.100.120', 22, 'root', 'DIRECTADMIN', ?, 1, 'ONLINE')`
+    )
+    .run(volRow.id);
+  const mockSrvId = Number(mockSrvIns.lastInsertRowid);
+
+  const snapName = '2026-11-09_16-00-00';
+  const domainDir = path.join(
+    volRow.mount_path,
+    'mock-restore-srv',
+    snapName,
+    'home',
+    'domains',
+    'restore96.vn'
+  );
+  fs.mkdirSync(path.join(domainDir, 'public_html'), { recursive: true });
+  fs.mkdirSync(path.join(domainDir, 'databases'), { recursive: true });
+  fs.writeFileSync(
+    path.join(domainDir, 'public_html', 'index.php'),
+    '<?php echo "ok"; ?>\n'
+  );
+
+  const srcJobIns = db
+    .prepare(
+      `INSERT INTO backup_jobs (job_type, server_id, volume_id, snapshot_name, status, progress_percent, current_phase)
+       VALUES ('BACKUP', ?, ?, ?, 'COMPLETED', 100, 'Hoàn tất')`
+    )
+    .run(mockSrvId, volRow.id, snapName);
+  const srcJobId = Number(srcJobIns.lastInsertRowid);
+
+  const itemIns = db
+    .prepare(
+      `INSERT INTO backup_items
+       (job_id, server_id, volume_id, snapshot_name, domain_name, system_user, webroot_size_bytes, databases_list, verification_status)
+       VALUES (?, ?, ?, ?, 'restore96.vn', 'user96', 40960, '[]', 'PASSED')`
+    )
+    .run(srcJobId, mockSrvId, volRow.id, snapName);
+  const itemId = Number(itemIns.lastInsertRowid);
+
+  const capturedProgressEvents: Array<{ status: string; progressPercent: number; currentPhase: string }> = [];
+  const prevIo = globalThis.__nasSyncIo;
+  const mockEmit = (ev: string, data: unknown) => {
+    if (ev === 'job:progress' && data && typeof data === 'object') {
+      const p = data as {
+        jobId: number;
+        status: string;
+        progressPercent: number;
+        currentPhase: string;
+      };
+      capturedProgressEvents.push(p);
+    }
+  };
+  globalThis.__nasSyncIo = {
+    emit: mockEmit,
+    to() {
+      return { emit: mockEmit };
+    },
+  } as unknown as typeof globalThis.__nasSyncIo;
+
+  try {
+    const restoreOpts = {
+      sourceJobId: srcJobId,
+      backupItemId: itemId,
+      mode: 'FILES_ONLY' as const,
+      targetServerId: mockSrvId,
+      targetSystemUser: 'user96',
+      targetDomainName: 'restore96.vn',
+      autoPatchConfig: true,
+    };
+    const rstJobIns = db
+      .prepare(
+        `INSERT INTO backup_jobs
+         (job_type, server_id, target_server_id, volume_id, snapshot_name, status, progress_percent, current_phase, current_domain, restore_options)
+         VALUES ('RESTORE', ?, ?, ?, ?, 'QUEUED', 0, 'Đang chuẩn bị khôi phục...', 'restore96.vn', ?)`
+      )
+      .run(
+        mockSrvId,
+        mockSrvId,
+        volRow.id,
+        snapName,
+        JSON.stringify(restoreOpts)
+      );
+    const rstJobId = Number(rstJobIns.lastInsertRowid);
+
+    await executeRestoreJob(rstJobId);
+
+    const finishedJob = db
+      .prepare(
+        'SELECT status, progress_percent, current_phase, total_size_bytes FROM backup_jobs WHERE id = ?'
+      )
+      .get(rstJobId) as {
+      status: string;
+      progress_percent: number;
+      current_phase: string;
+      total_size_bytes: number;
+    };
+    assert.equal(finishedJob.status, 'COMPLETED');
+    assert.equal(finishedJob.progress_percent, 100);
+    assert.equal(finishedJob.current_phase, 'Khôi phục hoàn tất 100%');
+    assert.equal(finishedJob.total_size_bytes, 40960);
+
+    const lastProgress =
+      capturedProgressEvents[capturedProgressEvents.length - 1];
+    assert.ok(lastProgress, 'Phải phát sự kiện job:progress khi hoàn tất');
+    assert.equal(lastProgress.status, 'COMPLETED');
+    assert.equal(lastProgress.progressPercent, 100);
+    assert.equal(lastProgress.currentPhase, 'Khôi phục hoàn tất 100%');
+  } finally {
+    globalThis.__nasSyncIo = prevIo;
+  }
 });

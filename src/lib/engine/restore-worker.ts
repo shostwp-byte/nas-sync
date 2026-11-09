@@ -446,16 +446,29 @@ export async function executeRestoreJob(jobId: number): Promise<void> {
   } catch (preErr) {
     const errMsg = (preErr as Error).message || 'Dữ liệu đầu vào khôi phục không hợp lệ.';
     const cancelled = isJobCancelled(jobId);
+    const terminalStatus = cancelled ? 'CANCELLED' : 'FAILED';
+    const terminalPhase = cancelled
+      ? 'Đã hủy bởi quản trị viên'
+      : 'Khôi phục thất bại (Dữ liệu đầu vào)';
     db.prepare(
       `UPDATE backup_jobs
        SET status = ?, current_phase = ?, completed_at = datetime('now'), error_log = ?
        WHERE id = ?`
-    ).run(
-      cancelled ? 'CANCELLED' : 'FAILED',
-      cancelled ? 'Đã hủy bởi quản trị viên' : 'Khôi phục thất bại (Dữ liệu đầu vào)',
-      errMsg,
-      jobId
-    );
+    ).run(terminalStatus, terminalPhase, errMsg, jobId);
+    emitJobProgress({
+      jobId,
+      serverId: Number(job?.target_server_id || job?.server_id || 0),
+      hostname: '',
+      status: terminalStatus,
+      progressPercent: Number(job?.progress_percent || 0),
+      currentPhase: terminalPhase,
+      currentDomain: String(job?.current_domain || ''),
+      speedBps: 0,
+      etaSeconds: 0,
+      deltaSizeBytes: 0,
+      totalSizeBytes: Number(job?.total_size_bytes || 0),
+      retryCount: 0,
+    });
     if (!cancelled) {
       await createSystemAlert({
         severity: 'CRITICAL',
@@ -474,6 +487,27 @@ export async function executeRestoreJob(jobId: number): Promise<void> {
   const isCrossPanel =
     sourceServer.id !== targetServer.id ||
     sourceServer.panel_type !== targetServer.panel_type;
+
+  const selectedDbsForSize = payload.selectedDatabases?.length
+    ? item.databases_list.filter((d) =>
+        payload.selectedDatabases!.includes(d.name)
+      )
+    : item.databases_list;
+  const restoredDbSizeBytes =
+    payload.mode === 'FILES_ONLY'
+      ? 0
+      : selectedDbsForSize.reduce(
+          (acc, d) => acc + Math.max(0, Number(d.size_bytes || 0)),
+          0
+        );
+  const restoredWebSizeBytes =
+    payload.mode === 'DB_ONLY'
+      ? 0
+      : Math.max(0, Number(item.webroot_size_bytes || 0));
+  const restoredTotalBytes = restoredWebSizeBytes + restoredDbSizeBytes;
+  const effectiveTargetDomain =
+    (payload.targetDomainName || item.domain_name || '').trim() ||
+    item.domain_name;
 
   const logLines: string[] = [];
   const appendLog = (msg: string) => {
@@ -498,8 +532,14 @@ export async function executeRestoreJob(jobId: number): Promise<void> {
 
   const setStep = (pct: number, phase: string) => {
     db.prepare(
-      `UPDATE backup_jobs SET status = 'RUNNING', progress_percent = ?, current_phase = ?, current_domain = ? WHERE id = ?`
-    ).run(pct, phase, item.domain_name, jobId);
+      `UPDATE backup_jobs
+       SET status = 'RUNNING',
+           progress_percent = ?,
+           current_phase = ?,
+           current_domain = ?,
+           total_size_bytes = ?
+       WHERE id = ?`
+    ).run(pct, phase, effectiveTargetDomain, restoredTotalBytes, jobId);
     emitJobProgress({
       jobId,
       serverId: targetServer.id,
@@ -507,18 +547,23 @@ export async function executeRestoreJob(jobId: number): Promise<void> {
       status: 'RUNNING',
       progressPercent: pct,
       currentPhase: phase,
-      currentDomain: item.domain_name,
+      currentDomain: effectiveTargetDomain,
       speedBps: 0,
       etaSeconds: 0,
       deltaSizeBytes: 0,
-      totalSizeBytes: item.webroot_size_bytes,
+      totalSizeBytes: restoredTotalBytes,
       retryCount: 0,
     });
   };
 
   db.prepare(
-    `UPDATE backup_jobs SET status = 'RUNNING', started_at = COALESCE(started_at, datetime('now')) WHERE id = ?`
-  ).run(jobId);
+    `UPDATE backup_jobs
+     SET status = 'RUNNING',
+         current_domain = ?,
+         total_size_bytes = ?,
+         started_at = COALESCE(started_at, datetime('now'))
+     WHERE id = ?`
+  ).run(effectiveTargetDomain, restoredTotalBytes, jobId);
   emitJobUpdated(jobId);
 
   const releaseSnapshotPin = acquireSnapshotReadPin(
@@ -930,14 +975,35 @@ export async function executeRestoreJob(jobId: number): Promise<void> {
 
     db.prepare(
       `UPDATE backup_jobs
-       SET status = 'COMPLETED', progress_percent = 100, current_phase = 'Khôi phục hoàn tất 100%',
+       SET status = 'COMPLETED',
+           progress_percent = 100,
+           current_phase = 'Khôi phục hoàn tất 100%',
+           current_domain = ?,
+           total_size_bytes = ?,
+           speed_bps = 0,
+           eta_seconds = 0,
            completed_at = datetime('now')
        WHERE id = ?`
-    ).run(jobId);
+    ).run(targetDomain, restoredTotalBytes, jobId);
 
     appendLog(
       `🎉 Khôi phục ${targetDomain} sang ${targetServer.hostname} (${targetServer.panel_type}) hoàn tất 100%!`
     );
+
+    emitJobProgress({
+      jobId,
+      serverId: targetServer.id,
+      hostname: targetServer.hostname,
+      status: 'COMPLETED',
+      progressPercent: 100,
+      currentPhase: 'Khôi phục hoàn tất 100%',
+      currentDomain: targetDomain,
+      speedBps: 0,
+      etaSeconds: 0,
+      deltaSizeBytes: 0,
+      totalSizeBytes: restoredTotalBytes,
+      retryCount: 0,
+    });
 
     await createSystemAlert({
       severity: 'INFO',
@@ -953,21 +1019,38 @@ export async function executeRestoreJob(jobId: number): Promise<void> {
   } catch (err) {
     const cancelled = isJobCancelled(jobId);
     const errMsg = (err as Error).message;
+    const terminalStatus = cancelled ? 'CANCELLED' : 'FAILED';
+    const terminalPhase = cancelled
+      ? 'Đã hủy bởi quản trị viên'
+      : 'Khôi phục thất bại';
     appendLog(
       cancelled
         ? `⏹️ Phiên khôi phục đã bị hủy: ${errMsg}`
         : `❌ Khôi phục thất bại: ${errMsg}`
     );
+    const currentPctRow = db
+      .prepare('SELECT progress_percent FROM backup_jobs WHERE id = ?')
+      .get(jobId);
     db.prepare(
       `UPDATE backup_jobs
-       SET status = ?, current_phase = ?, completed_at = datetime('now'), error_log = ?
+       SET status = ?, current_phase = ?, speed_bps = 0, eta_seconds = 0, completed_at = datetime('now'), error_log = ?
        WHERE id = ?`
-    ).run(
-      cancelled ? 'CANCELLED' : 'FAILED',
-      cancelled ? 'Đã hủy bởi quản trị viên' : 'Khôi phục thất bại',
-      errMsg,
-      jobId
-    );
+    ).run(terminalStatus, terminalPhase, errMsg, jobId);
+
+    emitJobProgress({
+      jobId,
+      serverId: targetServer.id,
+      hostname: targetServer.hostname,
+      status: terminalStatus,
+      progressPercent: Number(currentPctRow?.progress_percent ?? 0),
+      currentPhase: terminalPhase,
+      currentDomain: effectiveTargetDomain,
+      speedBps: 0,
+      etaSeconds: 0,
+      deltaSizeBytes: 0,
+      totalSizeBytes: restoredTotalBytes,
+      retryCount: 0,
+    });
 
     if (!cancelled) {
       await createSystemAlert({

@@ -1044,18 +1044,46 @@ export async function enqueueRestoreOperation(
     sourceJobId: payload.sourceJobId || Number(item.job_id),
   };
 
+  let parsedDbs: Array<{ name?: string; size_bytes?: number }>;
+  try {
+    parsedDbs = JSON.parse(String(item.databases_list || '[]'));
+  } catch {
+    parsedDbs = [];
+  }
+  const selectedDbs = payload.selectedDatabases?.length
+    ? parsedDbs.filter(
+        (d) => d.name && payload.selectedDatabases!.includes(d.name)
+      )
+    : parsedDbs;
+  const dbSizeBytes =
+    payload.mode === 'FILES_ONLY'
+      ? 0
+      : selectedDbs.reduce(
+          (acc, d) => acc + Math.max(0, Number(d.size_bytes || 0)),
+          0
+        );
+  const webSizeBytes =
+    payload.mode === 'DB_ONLY'
+      ? 0
+      : Math.max(0, Number(item.webroot_size_bytes || 0));
+  const estimatedRestoreBytes = webSizeBytes + dbSizeBytes;
+  const targetDomainName =
+    (payload.targetDomainName || String(item.domain_name || '')).trim() ||
+    String(item.domain_name);
+
   const res = db
     .prepare(
       `INSERT INTO backup_jobs
-       (job_type, server_id, target_server_id, volume_id, snapshot_name, status, progress_percent, current_phase, current_domain, restore_options)
-       VALUES ('RESTORE', ?, ?, ?, ?, 'QUEUED', 0, 'Đang chuẩn bị khôi phục...', ?, ?)`
+       (job_type, server_id, target_server_id, volume_id, snapshot_name, status, progress_percent, current_phase, current_domain, total_size_bytes, restore_options)
+       VALUES ('RESTORE', ?, ?, ?, ?, 'QUEUED', 0, 'Đang chuẩn bị khôi phục...', ?, ?, ?)`
     )
     .run(
       Number(item.server_id),
       payload.targetServerId,
       Number(item.volume_id),
       String(item.snapshot_name),
-      String(item.domain_name),
+      targetDomainName,
+      estimatedRestoreBytes,
       JSON.stringify(enrichedPayload)
     );
 

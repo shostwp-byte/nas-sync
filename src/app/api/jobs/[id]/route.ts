@@ -109,9 +109,28 @@ export async function GET(
       return NextResponse.json({ error: 'Không tìm thấy Job.' }, { status: 404 });
     }
 
-    const rawItems = db
+    let rawItems = db
       .prepare('SELECT * FROM backup_items WHERE job_id = ? ORDER BY domain_name ASC')
       .all(Number(id));
+
+    if (rawItems.length === 0 && String(job.job_type) === 'RESTORE' && job.restore_options) {
+      try {
+        const parsedOpts = JSON.parse(String(job.restore_options)) as {
+          backupItemId?: number;
+          sourceJobId?: number;
+        };
+        if (parsedOpts.backupItemId) {
+          const singleItem = db
+            .prepare('SELECT * FROM backup_items WHERE id = ?')
+            .get(Number(parsedOpts.backupItemId));
+          if (singleItem) {
+            rawItems = [singleItem];
+          }
+        }
+      } catch {
+        // Ignore invalid restore_options JSON
+      }
+    }
 
     const items = rawItems.map((it) => ({
       ...it,

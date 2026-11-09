@@ -849,6 +849,12 @@ export async function executeBackupJob(
         db.prepare(`UPDATE servers SET status = 'ONLINE' WHERE id = ?`).run(
           server.id
         );
+        updateProgress({
+          status: 'INTERRUPTED',
+          currentPhase: 'Mất kết nối — Đang chờ tự động Resume...',
+          speedBps: 0,
+          etaSeconds: 0,
+        });
         emitJobUpdated(jobId);
         throw err;
       }
@@ -864,6 +870,8 @@ export async function executeBackupJob(
     }
 
     const finalStatus = isJobCancelled(jobId) ? 'CANCELLED' : 'FAILED';
+    const finalPhase =
+      finalStatus === 'CANCELLED' ? 'Đã hủy bởi người dùng' : 'Thất bại';
     const errMsg = (err as Error).message || 'Lỗi không xác định';
     appendLog(`❌ Phiên sao lưu dừng (${finalStatus}): ${errMsg}`);
 
@@ -872,12 +880,14 @@ export async function executeBackupJob(
        SET status = ?, current_phase = ?, speed_bps = 0, eta_seconds = 0,
            completed_at = datetime('now'), error_log = ?
        WHERE id = ?`
-    ).run(
-      finalStatus,
-      finalStatus === 'CANCELLED' ? 'Đã hủy bởi người dùng' : 'Thất bại',
-      errMsg,
-      jobId
-    );
+    ).run(finalStatus, finalPhase, errMsg, jobId);
+
+    updateProgress({
+      status: finalStatus,
+      currentPhase: finalPhase,
+      speedBps: 0,
+      etaSeconds: 0,
+    });
 
     // N6 Fix: Dọn dẹp thư mục .in_progress_<snapshot> khi job kết thúc ở trạng thái FAILED hoặc CANCELLED
     if (!snapshotCommitted) {
