@@ -1323,4 +1323,18 @@ define( 'DB_HOST', 'localhost:3306' );
     restoredWpContent.includes("define('DB_NAME', 'user96_mapped_db')"),
     'Tệp wp-config.php sau khôi phục phải được tự động cập nhật DB_NAME sang tên DB đích'
   );
+
+  // 5) Đảm bảo script Python trong aapanel.ts thoát đúng ký tự \\n trong template literal (không gây lỗi SyntaxError line 23)
+  const aapanelSrc = fs.readFileSync(
+    path.join(process.cwd(), 'src', 'lib', 'engine', 'adapters', 'aapanel.ts'),
+    'utf8'
+  );
+  assert.ok(
+    aapanelSrc.includes("return '\\\\n'.join(chunks)"),
+    'aapanel.ts phải dùng \\\\n bên trong template literal để Python nhận đúng chuỗi \\n'
+  );
+  assert.ok(
+    !aapanelSrc.includes("return '\\n'.join(chunks)"),
+    'aapanel.ts không được chứa \\n chưa thoát bên trong template literal'
+  );
 });

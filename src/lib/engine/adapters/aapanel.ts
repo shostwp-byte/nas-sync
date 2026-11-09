@@ -67,7 +67,7 @@ def read_webroot_cfg_blob(wroot):
                     chunks.append(f.read(16384))
         except Exception:
             pass
-    return '\n'.join(chunks)
+    return '\\n'.join(chunks)
 
 bindings = []
 try:

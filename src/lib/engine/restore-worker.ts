@@ -392,6 +392,7 @@ async function registerRestoredDatabaseInPanel(params: {
         `[Panel Mapping] Đã ánh xạ Database "${safeDb}" & User "${effectiveDbUser}" vào tài khoản cPanel "${targetUser}".`
       );
     } else if (targetServer.panel_type === 'AAPANEL' && isSafeDomain(targetDomain)) {
+      const pwdHex = Buffer.from(dbPassword ?? '', 'utf8').toString('hex');
       const pyScript = `
 import sqlite3, time
 conn = sqlite3.connect('/www/server/panel/data/default.db')
@@ -401,7 +402,7 @@ srow = cur.fetchone()
 pid = int(srow[0]) if srow and srow[0] else 0
 cur.execute("SELECT id, password FROM databases WHERE name=? LIMIT 1", (${JSON.stringify(safeDb)},))
 drow = cur.fetchone()
-pwd = ${JSON.stringify(dbPassword ?? '')}
+pwd = bytes.fromhex('${pwdHex}').decode('utf-8')
 if drow:
     if pwd:
         cur.execute("UPDATE databases SET username=?, password=?, pid=CASE WHEN ? > 0 THEN ? ELSE pid END WHERE id=?", (${JSON.stringify(effectiveDbUser)}, pwd, pid, pid, drow[0]))
