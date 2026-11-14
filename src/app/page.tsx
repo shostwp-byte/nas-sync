@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
 import {
   Activity,
@@ -109,6 +109,15 @@ export default function DashboardPage() {
   const [chartMode, setChartMode] = useState<'delta' | 'logical'>('delta');
   const [hoveredDayIdx, setHoveredDayIdx] = useState<number | null>(null);
   const [pinnedDayIdx, setPinnedDayIdx] = useState<number | null>(null);
+  const [isTerminalExpanded, setIsTerminalExpanded] = useState(false);
+  const terminalScrollRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const el = terminalScrollRef.current;
+    if (el) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }, [liveLogs]);
 
   const loadDashboard = useCallback(async () => {
     try {
@@ -1095,7 +1104,7 @@ export default function DashboardPage() {
       </div>
 
       {/* Live Progress & Live Terminal Console */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 items-start">
         {/* Active Progress */}
         <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-5 space-y-4">
           <div className="flex flex-wrap items-center justify-between gap-2">
@@ -1112,12 +1121,14 @@ export default function DashboardPage() {
           </div>
 
           {activeJobs.length === 0 ? (
-            <div className="py-10 px-4 text-center text-xs text-slate-500 border border-dashed border-slate-800 rounded-xl">
-              Hiện không có tiến trình nào đang chạy. Hãy nhấn nút{' '}
-              <strong className="text-slate-300">Sao lưu</strong> ở khung bên trên để xem trực tiếp thanh tiến trình & Live Terminal!
+            <div className="h-44 sm:h-48 px-4 flex items-center justify-center text-center text-xs text-slate-500 border border-dashed border-slate-800 rounded-xl">
+              <div>
+                Hiện không có tiến trình nào đang chạy. Hãy nhấn nút{' '}
+                <strong className="text-slate-300">Sao lưu</strong> ở khung bên trên để xem trực tiếp thanh tiến trình & Live Terminal!
+              </div>
             </div>
           ) : (
-            <div className="space-y-3">
+            <div className="space-y-3 max-h-56 overflow-y-auto pr-1">
               {activeJobs.map((j) => {
                 const view = resolveRealtimeJobView(j, progressMap[j.id]);
                 const pct = view.progressPercent;
@@ -1178,24 +1189,45 @@ export default function DashboardPage() {
         </div>
 
         {/* Live Terminal Stream */}
-        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-5 flex flex-col">
-          <div className="flex items-center justify-between gap-2 mb-3">
+        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-5 space-y-3 min-w-0">
+          <div className="flex items-center justify-between gap-2">
             <h3 className="text-sm font-semibold text-white flex items-center gap-2 min-w-0">
               <Terminal className="w-4 h-4 text-emerald-400 shrink-0" />
               <span className="truncate">
                 Live Worker Terminal Log (Rsync / SSH Stream / Sandbox)
               </span>
+              {liveLogs.length > 0 && (
+                <span className="px-1.5 py-0.5 rounded bg-slate-800 border border-slate-700 text-[10px] font-mono text-slate-300 shrink-0">
+                  {liveLogs.length} dòng
+                </span>
+              )}
             </h3>
-            <button
-              type="button"
-              onClick={clearLogs}
-              className="text-[11px] text-slate-400 hover:text-white shrink-0 whitespace-nowrap"
-            >
-              Xóa màn hình
-            </button>
+            <div className="flex items-center gap-2.5 shrink-0">
+              <button
+                type="button"
+                onClick={() => setIsTerminalExpanded((prev) => !prev)}
+                className="text-[11px] text-cyan-400 hover:text-cyan-300 whitespace-nowrap"
+              >
+                {isTerminalExpanded ? 'Thu gọn' : 'Mở rộng'}
+              </button>
+              <button
+                type="button"
+                onClick={clearLogs}
+                className="text-[11px] text-slate-400 hover:text-white whitespace-nowrap"
+              >
+                Xóa màn hình
+              </button>
+            </div>
           </div>
 
-          <div className="flex-1 bg-slate-950 border border-slate-800 rounded-xl p-3.5 font-mono text-xs h-56 overflow-y-auto space-y-1">
+          <div
+            ref={terminalScrollRef}
+            className={`bg-slate-950 border border-slate-800 rounded-xl p-3.5 font-mono text-xs overflow-y-auto overscroll-contain space-y-1 transition-all duration-200 ${
+              isTerminalExpanded
+                ? 'h-80 max-h-80'
+                : 'h-44 max-h-44 sm:h-48 sm:max-h-48'
+            }`}
+          >
             {liveLogs.length === 0 ? (
               <div className="text-slate-600 break-words">
                 nas-sync-worker@nas-core:~$ Đang lắng nghe luồng sự kiện thời gian thực từ Worker...
